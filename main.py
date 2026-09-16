@@ -2,8 +2,19 @@ from agent import agent_loop
 from config import WORKDIR
 from hooks import trigger_hooks
 from tools import TOOLS
+from tools.skill import discover
 
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use bash to solve tasks. Act, don't explain."
+
+# 清单必须常驻:模型不知道有哪些技能,就没法去调 skill 工具,只能瞎猜名字。
+# 正文不进来,由 skill 工具按需取 —— 全量注入等于把"按需加载"退回成"全部常驻",
+# 那正是做技能要解决的问题。
+SKILLS = "\n".join(f"- {name}: {desc}" for name, desc in discover())
+if SKILLS:
+	SYSTEM += (
+		"\n\nSkills are reusable procedures. When a task matches one, load it "
+		"with the skill tool and follow it:\n" + SKILLS
+	)
 
 MODEL = "deepseek-flash"
 
