@@ -59,17 +59,32 @@ def final_text(response) -> str:
 	return "".join(b.text for b in response.content if b.type == "text")
 
 
-def agent_loop(messages: list, system: str, tools: list, model: str) -> str:
+def agent_loop(messages: list, system: str, tools: list, model: str,
+               max_rounds: int) -> str:
 	"""跑一轮完整的 agent 循环,返回最后的文本回复。
 
-	只负责机制。提示词、工具集、模型都从外面传进来 —— 它不知道
-	调用它的是主 agent 还是子 agent。
+	只负责机制。提示词、工具集、模型、轮数上限都从外面传进来 ——
+	它不知道调用它的是主 agent 还是子 agent。
+
+	max_rounds 数的是 API 调用次数:一轮 = 一次请求 + 它要的那些工具。
+	这是唯一的兜底 —— 模型陷入循环、或者子 agent 不返回时,主 agent
+	会一直卡着,所以上限不是可选项。
 	"""
 	handlers = {t.name: t.handler for t in tools}
 	wire = [t.to_wire() for t in tools]
 	rounds_since_todo = 0
+	rounds = 0
 
 	while True:
+		# 在循环顶部查,不在底部。此处 messages 必定停在一个完整回合上
+		# (首轮,或上一条是带 tool_result 的 user 消息)。
+		# 若在工具执行完、tool_result 还没回填的位置退出,messages 里会
+		# 留下没有结果的 tool_use,用户下次提问直接 400。
+		if rounds >= max_rounds:
+			print(f"\033[31m[round limit {max_rounds} reached]\033[0m")
+			return f"Stopped: round limit of {max_rounds} reached, task incomplete."
+		rounds += 1
+
 		try:
 			response = call_api(
 				model=model,

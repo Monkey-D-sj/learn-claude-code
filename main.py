@@ -1,5 +1,5 @@
 from agent import agent_loop
-from config import WORKDIR
+from config import MAX_ROUNDS, WORKDIR
 from hooks import trigger_hooks
 from tools import TOOLS
 from tools.skill import discover
@@ -39,7 +39,8 @@ if __name__ == "__main__":
 		trigger_hooks("UserPromptSubmit", query)
 		history.append({"role": "user", "content": query})
 		try:
-			print(agent_loop(history, system=SYSTEM, tools=TOOLS, model=MODEL))
+			print(agent_loop(history, system=SYSTEM, tools=TOOLS, model=MODEL,
+			                 max_rounds=MAX_ROUNDS))
 		except Exception as e:
 			# 兜底:任何异常都不该把 history 一起带走
 			print(f"\033[31mError: {type(e).__name__}: {e}\033[0m")

@@ -1,5 +1,5 @@
 from agent import agent_loop
-from config import WORKDIR
+from config import MAX_ROUNDS, WORKDIR
 from tools.base import ToolDesc
 
 SYSTEM = (
@@ -31,6 +31,7 @@ def run_task(prompt: str) -> str:
 		system=SYSTEM,
 		tools=sub_tools,
 		model=MODEL,
+		max_rounds=MAX_ROUNDS,
 	)
 
 
