@@ -5,6 +5,7 @@ import anthropic
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
+from context import ContextCompactor
 from hooks import trigger_hooks
 
 load_dotenv()
@@ -58,6 +59,7 @@ def final_text(response) -> str:
 	"""最后一条回复里的文本部分(跳过 thinking 块)。"""
 	return "".join(b.text for b in response.content if b.type == "text")
 
+context_compactor = ContextCompactor()
 
 def agent_loop(messages: list, system: str, tools: list, model: str,
                max_rounds: int) -> str:
@@ -84,7 +86,9 @@ def agent_loop(messages: list, system: str, tools: list, model: str,
 			print(f"\033[31m[round limit {max_rounds} reached]\033[0m")
 			return f"Stopped: round limit of {max_rounds} reached, task incomplete."
 		rounds += 1
-
+		
+		messages = context_compactor.prepare(messages)
+		
 		try:
 			response = call_api(
 				model=model,
