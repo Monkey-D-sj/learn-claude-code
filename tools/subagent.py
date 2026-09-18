@@ -1,6 +1,7 @@
 from agent import agent_loop, client
 from config import MAX_ROUNDS, TOOL_RESULTS_DIR, TRANSCRIPT_DIR, WORKDIR
 from context import ContextCompactor
+from emit import terminal_emit
 from tools.base import ToolDesc
 
 SYSTEM = (
@@ -19,7 +20,12 @@ MODEL = "deepseek-flash"
 
 # 子 agent 建自己那个压缩器 —— 就是为了它的 model 能跟主 agent 不一样。
 # 这也是它不能是模块级单例的原因。
-COMPACTOR = ContextCompactor(client, MODEL, TRANSCRIPT_DIR, TOOL_RESULTS_DIR)
+#
+# emit 走终端,不走调用它的那个前端:子 agent 的定位就是把过程藏起来,
+# 只回一句结论(这正是它省上下文的方式)。它的中间步骤在浏览器里也看不见,
+# 跟终端一致 —— 要让它可见,得让工具的 handler 也能拿到 emit,那是另一件事。
+COMPACTOR = ContextCompactor(client, MODEL, TRANSCRIPT_DIR, TOOL_RESULTS_DIR,
+                             terminal_emit)
 
 
 def run_task(prompt: str) -> str:
@@ -39,6 +45,7 @@ def run_task(prompt: str) -> str:
 		model=MODEL,
 		max_rounds=MAX_ROUNDS,
 		compactor=COMPACTOR,
+		emit=terminal_emit,
 	)
 
 

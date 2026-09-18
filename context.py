@@ -131,14 +131,20 @@ class ContextCompactor:
 	MIN_POINTER_CHARS = 120
 
 	def __init__(self,llm_client, model: str, transcript_dir: Path,
-	             tool_results_dir: Path):
+	             tool_results_dir: Path, emit):
 		# client/model 是给第 4 层(摘要)用的。model 必须在每次调用时
 		# 才对 —— 主 agent 和子 agent 用的不是同一个,所以这个对象不能
 		# 建成模块级单例。
+		#
+		# emit 也在这儿,不在 prepare() 的参数里:压缩的日志散在 snip /
+		# micro / fit / budget / compact 五个方法深处,一路当参数传下去
+		# 太吵。代价是它跟着对象走 —— 一个压缩器只能对着一块屏幕说话。
+		# 单会话够用(main.py 和 server.py 各建自己那个)。
 		self.client = llm_client
 		self.model = model
 		self.transcript_dir = transcript_dir
 		self.tool_results_dir = tool_results_dir
+		self.emit = emit
 
 	@staticmethod
 	def estimate_chars(messages: list) -> int:
@@ -205,8 +211,8 @@ class ContextCompactor:
 		# 只有真落了盘才打。门槛等于上下文预算,所以一批装得下就不出声 ——
 		# 正常回合大多如此,出声说明这一批确实大。
 		if persisted:
-			print(f"\033[90m[budget] {persisted} 个结果落盘, "
-			      f"{before} -> {total} 字符\033[0m")
+			self.emit({"kind": "note", "source": "budget",
+			           "text": f"{persisted} 个结果落盘, {before} -> {total} 字符"})
 		return messages
 	
 	
@@ -398,8 +404,9 @@ class ContextCompactor:
 		marker = {"role": "user", "content":
 		          f"[{tail_start - head_end} messages archived at "
 		          f"{_display(transcript_path)}]"}
-		print(f"\033[90m[snip] {tail_start - head_end} messages archived "
-		      f"-> {transcript_path.name}\033[0m")
+		self.emit({"kind": "note", "source": "snip",
+		           "text": f"{tail_start - head_end} messages archived "
+		                   f"-> {transcript_path.name}"})
 		return [*messages[:head_end], marker, *messages[tail_start:]]
 
 	@staticmethod
@@ -466,7 +473,8 @@ class ContextCompactor:
 			changed += 1
 
 		if changed:
-			print(f"\033[90m[micro] {changed} 个旧结果 -> 指针\033[0m")
+			self.emit({"kind": "note", "source": "micro",
+			           "text": f"{changed} 个旧结果 -> 指针"})
 		return messages
 
 	def fit_tool_results(self, messages: list, target_chars: int) -> list:
@@ -501,8 +509,9 @@ class ContextCompactor:
 				changed += 1
 
 		if changed:
-			print(f"\033[90m[fit] {changed} 个结果缩到 {self.FIT_PREVIEW_HEAD}"
-			      f"+{self.FIT_PREVIEW_TAIL} 预览\033[0m")
+			self.emit({"kind": "note", "source": "fit",
+			           "text": f"{changed} 个结果缩到 {self.FIT_PREVIEW_HEAD}"
+			                   f"+{self.FIT_PREVIEW_TAIL} 预览"})
 		return messages
 
 	def summary_input(self, messages: list) -> str:
@@ -541,6 +550,7 @@ class ContextCompactor:
 		"""
 		response = call_api(
 			self.client,
+			self.emit,
 			model=self.model,
 			system=(
 				"Summarize the supplied coding-agent conversation as factual state. "
@@ -595,7 +605,8 @@ class ContextCompactor:
 		"""
 		transcript = self.write_transcript(messages)
 		summary = self.summarize_history(messages)
-		print(f"\033[90m[compact] 全量摘要,原文 -> {transcript.name}\033[0m")
+		self.emit({"kind": "note", "source": "compact",
+		           "text": f"全量摘要,原文 -> {transcript.name}"})
 		return [self.summary_message("Compacted", active_request, summary, transcript)]
 
 	# 每轮预压缩

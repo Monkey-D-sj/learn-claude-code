@@ -24,7 +24,7 @@ MAX_ATTEMPTS = 3
 BASE_DELAY = 1.0
 
 
-def call_api(llm_client, **kwargs):
+def call_api(llm_client, emit, **kwargs):
 	"""调一次 Messages API,可重试的失败按指数退避重试。
 
 	重试:连接错误、超时、429、5xx
@@ -56,8 +56,11 @@ def call_api(llm_client, **kwargs):
 		if not retryable or attempt == MAX_ATTEMPTS:
 			raise err
 		wait = BASE_DELAY * 2 ** (attempt - 1)
-		print(f"\033[90m[retry {attempt}/{MAX_ATTEMPTS - 1}] "
-		      f"{type(err).__name__}, {wait:.0f}s 后重试\033[0m")
+		# emit 是命名参数,不会被 **kwargs 带走(它写在 **kwargs 前面,
+		# 所以能截住)。写成 call_api(client, **{"emit": ...}) 就会被当成
+		# messages.create 的参数发出去。
+		emit({"kind": "note", "source": f"retry {attempt}/{MAX_ATTEMPTS - 1}",
+		      "text": f"{type(err).__name__}, {wait:.0f}s 后重试"})
 		time.sleep(wait)
 
 
@@ -65,8 +68,27 @@ def final_text(response) -> str:
 	"""最后一条回复里的文本部分(跳过 thinking 块)。"""
 	return "".join(b.text for b in response.content if b.type == "text")
 
+
+# 工具结果往事件里塞多少。bash 的门槛是 400000 字符,原样发出去一条命令
+# 就能把页面冲垮。
+#
+# 截在发事件这一侧,不留给前端:让前端各自截的话,那 40 万字符已经先过
+# 了一遍网络,而且两个前端还得各写一份。
+#
+# 4000 落在"够看清在干什么"和"不淹没屏幕"之间 —— 报错、汇总、开头几行
+# 都在里面了。要看全文本来也不该从这儿看:模型自己拿到的也是落盘预览,
+# 路径就在那儿。
+EVENT_RESULT_CHARS = 4000
+
+
+def clip_for_event(output: str) -> str:
+	if len(output) <= EVENT_RESULT_CHARS:
+		return output
+	return (f"{output[:EVENT_RESULT_CHARS]}\n"
+	        f"... [display truncated: {len(output)} chars total]")
+
 def agent_loop(messages: list, active_request: str, system: str, tools: list,
-               model: str, max_rounds: int, compactor) -> str:
+               model: str, max_rounds: int, compactor, emit) -> str:
 	"""跑一轮完整的 agent 循环,返回最后的文本回复。
 
 	只负责机制。提示词、工具集、模型、轮数上限、压缩器都从外面传进来 ——
@@ -82,6 +104,14 @@ def agent_loop(messages: list, active_request: str, system: str, tools: list,
 	active_request 是当前这条指令的原文,原样交给压缩器。压缩到最后一档
 	会把整段 messages 换成一条摘要,那条摘要里只有它 —— 不从外面传进来,
 	当前任务就跟着一起被总结掉了。
+
+	emit 是"往哪块屏幕说话"。它只发这个循环自己的事:哪个工具在跑、
+	跑出什么、重试、上限。工具的日志、hook 的日志不归它管 —— 那些是
+	诊断信息,不是"agent 干了什么"。
+
+	它不发 reply:最后的文本仍然是返回值。这样调用方那句
+	print(agent_loop(...)) 一个字不用改,而且"返回什么"和"显示什么"
+	不会分家。
 	"""
 	handlers = {t.name: t.handler for t in tools}
 	wire = [t.to_wire() for t in tools]
@@ -94,7 +124,8 @@ def agent_loop(messages: list, active_request: str, system: str, tools: list,
 		# 若在工具执行完、tool_result 还没回填的位置退出,messages 里会
 		# 留下没有结果的 tool_use,用户下次提问直接 400。
 		if rounds >= max_rounds:
-			print(f"\033[31m[round limit {max_rounds} reached]\033[0m")
+			emit({"kind": "note", "source": f"round limit {max_rounds} reached",
+			      "text": ""})
 			return f"Stopped: round limit of {max_rounds} reached, task incomplete."
 		rounds += 1
 		
@@ -117,6 +148,7 @@ def agent_loop(messages: list, active_request: str, system: str, tools: list,
 		try:
 			response = call_api(
 				client,
+				emit,
 				model=model,
 				messages=messages,
 				system=system,
@@ -146,7 +178,10 @@ def agent_loop(messages: list, active_request: str, system: str, tools: list,
 		results = []
 		used_todo = False
 		for block in tool_calls:
-			print(f"\033[33m$ {block.name} {block.input}\033[0m")
+			# 调用和结果分两次发,前端才能知道"这条结果属于哪次调用"。
+			# 被 hook 拦下来的那次也有结果(拦截理由),所以 tool_result
+			# 在每条路径上都要发,不然页面上会留一个没有下文的调用。
+			emit({"kind": "tool_call", "name": block.name, "input": block.input})
 			blocked = trigger_hooks("PreToolUse", block)
 			if blocked:
 				results.append({
@@ -154,6 +189,8 @@ def agent_loop(messages: list, active_request: str, system: str, tools: list,
 					"tool_use_id": block.id,
 					"content": str(blocked),
 				})
+				emit({"kind": "tool_result", "name": block.name,
+				      "output": clip_for_event(str(blocked))})
 				continue
 
 			handler = handlers.get(block.name)
@@ -171,6 +208,8 @@ def agent_loop(messages: list, active_request: str, system: str, tools: list,
 				"tool_use_id": block.id,
 				"content": output,
 			})
+			emit({"kind": "tool_result", "name": block.name,
+			      "output": clip_for_event(output)})
 
 		rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
 		if rounds_since_todo >= 3:
