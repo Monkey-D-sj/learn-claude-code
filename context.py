@@ -110,6 +110,19 @@ class ContextCompactor:
 	SNIP_MAX_MESSAGES = 50
 	SNIP_HEAD_MESSAGES = 3
 
+	# 第 3 层的预览长度,比第 1 层更短 —— 走到这儿说明常规手段已经用完了。
+	# 两个加起来保持 1000,跟原版的 preview_chars=1000 一个量级。
+	FIT_PREVIEW_HEAD = 800
+	FIT_PREVIEW_TAIL = 200
+
+	# 第 3 层压到上限的百分之多少就停。留出余量,免得下一轮工具结果一进来
+	# 又立刻超线、每轮都压。
+	COMPACT_TARGET_RATIO = 0.8
+
+	# 短于这个长度的旧结果不换成指针 —— 指针本身就要这么长,换过去可能
+	# 反而更长。指针大致是 "[Earlier tool result saved at <绝对路径>]"。
+	MIN_POINTER_CHARS = 120
+
 	def __init__(self,llm_client, model: str, transcript_dir: Path,
 	             tool_results_dir: Path):
 		# client/model 是给第 3 层(摘要)准备的,现在还没用上。
@@ -120,12 +133,27 @@ class ContextCompactor:
 		self.transcript_dir = transcript_dir
 		self.tool_results_dir = tool_results_dir
 
+	@staticmethod
+	def estimate_chars(messages: list) -> int:
+		"""整段上下文的字符数,拿去跟 CONTEXT_CHAR_LIMIT 比。
+
+		用 json.dumps 而不是把每块的文本长度加起来:消息里除了正文还有
+		工具名、参数、id,那些也占位置。
+
+		default 走 _json_default 而不是 str —— pydantic 对象的 repr 会把长度
+		撑起来(实测同一个消息:真实 JSON 87,repr 估成 140)。估高了就会
+		白压几轮,而且压完还是"超",看起来像没生效。
+
+		注意它每次都全量序列化一遍,而调用方是在循环里比的 —— 这是原版
+		就有的 O(n²),上下文很大的时候会拖慢 prepare。
+		"""
+		return len(json.dumps(messages, default=_json_default, ensure_ascii=False))
+
 	def tool_result_budget(self, messages: list, max_chars: int | None = None) -> list:
 		"""第 1 层:一批 tool_result 太大,就把最大的几个落盘。
 
 		只看 messages[-1],所以它管的是"最新这一批",不是整段上下文 ——
-		老的 tool_result 永远不回收,上下文仍然会一批一批地涨。
-		真正兜住增长要靠 CONTEXT_CHAR_LIMIT,那条线还没接。
+		老的 tool_result 不归它收,靠第 3 层的 micro/fit。
 
 		原地改 blocks 再返回同一个 list,不构造新列表。
 		"""
@@ -176,28 +204,41 @@ class ContextCompactor:
 	def persisted_output_path(self, output: str) -> Path | None:
 		"""这段内容如果已经是"落过盘的标记",把原文件路径捞回来。
 
-		没有它,同一段内容被压第二次就会套娃:第二次存进去的是第一次
-		的预览,预览里再套预览。
+		两种标记都认:
+		  <persisted-output>...Full output: <path>...</persisted-output>
+		      落盘时写的,带预览
+		  [Earlier tool result saved at <path>]
+		      第 3 层压缩留下的,只有一行
+
+		没有它,同一段内容被压第二次就会套娃。更糟的是 save_output 的文件名
+		就是 tool_use_id —— 重复保存会**盖掉原文件**,磁盘上只剩一段指向
+		自己的标记,而且不报错。
 
 		标记里的路径是不可信输入 —— 它进了上下文,模型可以改它,别的
 		内容也能伪造它。所以要验:必须真在 tool_results_dir 里,而且是
 		个存在的文件。
 		"""
-		if not output.startswith("<persisted-output>\n"):
+		earlier = "[Earlier tool result saved at "
+		if output.startswith(earlier) and output.endswith("]"):
+			candidate = output.removeprefix(earlier).removesuffix("]").strip()
+		elif output.startswith("<persisted-output>\n"):
+			line = next((line for line in output.splitlines()
+			             if line.startswith("Full output: ")), None)
+			if line is None:
+				return None
+			candidate = line.removeprefix("Full output: ").strip()
+		else:
 			return None
-		line = next((line for line in output.splitlines()
-		             if line.startswith("Full output: ")), None)
-		if line is None:
-			return None
-		candidate = Path(line.removeprefix("Full output: ").strip())
+
+		path = Path(candidate)
 		try:
-			candidate = candidate.resolve()
+			path = path.resolve()
 		except OSError:
 			return None
-		if (not candidate.is_relative_to(self.tool_results_dir.resolve())
-		        or not candidate.is_file()):
+		if (not path.is_relative_to(self.tool_results_dir.resolve())
+		        or not path.is_file()):
 			return None
-		return candidate
+		return path
 
 	def persisted_preview(self, tool_use_id: str, output: str,
 	                      head_chars: int = PREVIEW_HEAD,
@@ -330,9 +371,112 @@ class ContextCompactor:
 		      f"-> {transcript_path.name}\033[0m")
 		return [*messages[:head_end], marker, *messages[tail_start:]]
 
+	@staticmethod
+	def unseen_tool_result_positions(messages: list) -> set[tuple[int, int]]:
+		"""模型还没见过的 tool_result 的位置,用 (消息下标, 块下标) 表示。
+
+		最后一条 assistant 之后的全是"刚跑出来、还没发出去"的。压它们等于
+		把这一轮刚拿到的东西抽走 —— 模型下一步就没得看了,只能重新跑一遍。
+		"""
+		last_assistant = next(
+			(index for index in range(len(messages) - 1, -1, -1)
+			 if messages[index].get("role") == "assistant"),
+			-1,
+		)
+		return {
+			(message_index, block_index)
+			for message_index in range(last_assistant + 1, len(messages))
+			if messages[message_index].get("role") == "user"
+			and isinstance(messages[message_index].get("content"), list)
+			for block_index, block in enumerate(messages[message_index]["content"])
+			if _block_type(block) == "tool_result"
+		}
+
+	def micro_compact(self, messages: list,
+	                  target_chars: int | None = None) -> list:
+		"""第 3 层前半:把旧工具结果换成一行指针。
+
+		跟 fit_tool_results 的分工:这个只留一行路径、不保留览,但守住
+		"最近几个"和"模型还没看过的"不动;fit 是连预览一起缩、不挑新旧。
+
+		原地改,返回同一个 list。
+		"""
+		results = [
+			(message_index, block_index, block)
+			for message_index, message in enumerate(messages)
+			if message.get("role") == "user" and isinstance(message.get("content"), list)
+			for block_index, block in enumerate(message["content"])
+			if _block_type(block) == "tool_result"
+		]
+		unseen = self.unseen_tool_result_positions(messages)
+		consumed = [entry for entry in results if entry[:2] not in unseen]
+
+		# 不能用 consumed[:-self.KEEP_RECENT_RESULTS]:KEEP_RECENT_RESULTS 归零时
+		# [:-0] 是空列表,一条都不压 —— 常量改小反而整个失效。用显式端点写,
+		# 0 才是"全压"的意思。
+		stale = consumed[: len(consumed) - self.KEEP_RECENT_RESULTS]
+		changed = 0
+		for _, _, block in stale:
+			if target_chars is not None and self.estimate_chars(messages) <= target_chars:
+				break
+			content = str(block.get("content", ""))
+			# 已经比指针还短了,换过去是反向操作
+			if len(content) <= self.MIN_POINTER_CHARS:
+				continue
+			saved_path = self.persisted_output_path(content)
+			if saved_path is None:
+				try:
+					saved_path = self.save_output(
+						block.get("tool_use_id", "unknown"), content)
+				except OSError:
+					# 存不下来就留着原文,不能换成指向空气的指针
+					continue
+			block["content"] = f"[Earlier tool result saved at {_display(saved_path)}]"
+			changed += 1
+
+		if changed:
+			print(f"\033[90m[micro] {changed} 个旧结果 -> 指针\033[0m")
+		return messages
+
+	def fit_tool_results(self, messages: list, target_chars: int) -> list:
+		"""第 3 层后半:还是超,就扫全部历史,把结果连预览一起缩。
+
+		不挑新旧、不设单块门槛 —— 目标只有一个,降到 target 以下。所以它
+		是摘要之前最后一道能"不丢信息"的手段(内容还是在盘上)。
+
+		原地改,返回同一个 list。
+		"""
+		results = [
+			block
+			for message in messages
+			if message.get("role") == "user" and isinstance(message.get("content"), list)
+			for block in message["content"]
+			if _block_type(block) == "tool_result"
+		]
+		changed = 0
+		for block in sorted(results,
+		                    key=lambda item: len(str(item.get("content", ""))),
+		                    reverse=True):
+			if self.estimate_chars(messages) <= target_chars:
+				break
+			output = str(block.get("content", ""))
+			# 已经落过盘的块会拿回原文件重新取预览,不会套娃、也不会盖掉原文件
+			replacement = self.persisted_preview(
+				block.get("tool_use_id", "unknown"), output,
+				head_chars=self.FIT_PREVIEW_HEAD, tail_chars=self.FIT_PREVIEW_TAIL)
+			# 已经是指针的块可能比这段预览还短,别反向撑大
+			if len(replacement) < len(output):
+				block["content"] = replacement
+				changed += 1
+
+		if changed:
+			print(f"\033[90m[fit] {changed} 个结果缩到 {self.FIT_PREVIEW_HEAD}"
+			      f"+{self.FIT_PREVIEW_TAIL} 预览\033[0m")
+		return messages
+
 	# 每轮预压缩
 	def prepare(self, messages: list) -> list:
-		"""agent_loop 每轮发送前调一次。
+		"""agent_loop 每轮发送前调一次。四档阶梯,一档不够就下一档。
 
 		调用点在循环顶部、call_api 之前 —— 那里上一轮的工具结果已经
 		追加进 messages 但还没发出去,压掉才省得下钱。发送之后再压,
@@ -344,10 +488,24 @@ class ContextCompactor:
 
 		**返回值可能是新列表**(snip_compact 就是),调用方要写回自己
 		那份,不是接过来改名。
+
+		四档的代价递增:落盘和 snip 不调模型;micro/fit 也不调,但要写盘;
+		最后的摘要调模型、不可逆,而且会毁掉整个 prompt cache 前缀。
 		"""
-		# 工具压缩
+		# 第 1 层:单轮一批太大 —— 把最大的几个落盘
 		messages = self.tool_result_budget(messages)
-		# 中段归档。放在落盘之后:先把大结果落下来,再看还剩多少条要丢。
+		# 第 2 层:条数太多 —— 中段归档,只留头尾
 		messages = self.snip_compact(messages)
+
+		# 第 3 层:字符数还是超。目标是压到上限的八成,留点余量,免得下一轮
+		# 工具结果一进来又立刻超线、每轮都压一遍。
+		if self.estimate_chars(messages) > self.CONTEXT_CHAR_LIMIT:
+			target = int(self.CONTEXT_CHAR_LIMIT * self.COMPACT_TARGET_RATIO)
+			messages = self.micro_compact(messages, target)
+			if self.estimate_chars(messages) > self.CONTEXT_CHAR_LIMIT:
+				messages = self.fit_tool_results(messages, target)
+
+		# 还超的话原版会走 compact_history(摘要)。那一档还没移植 ——
+		# 所以现在前三档压不下来就是压不下来,没有兜底。
 		return messages
 	
