@@ -359,7 +359,14 @@ form.addEventListener("submit", async (e) => {
       body: JSON.stringify({ query }),
     });
   } catch (err) {
-    add(el("div", "error", "连不上后端: " + err));
+    // fetch 在网络层失败时只给一句 "Failed to fetch",不说为什么 ——
+    // 后端没起、预检被拒、端口写错,长得一模一样。所以把"试的是哪个
+    // 地址"和"怎么办"一起写出来,否则这句错误没法自助。
+    add(el("div", "error",
+      "连不上后端 " + (API || location.origin) + "。\n" +
+      "  后端起了吗?在仓库目录跑:  .venv\\Scripts\\python.exe server.py\n" +
+      "  起了的话,直接开 http://localhost:8765/ —— 同源,不用跨域\n" +
+      "  (" + err + ")"));
     setBusy(false);
     return;
   }
