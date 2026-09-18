@@ -239,6 +239,14 @@
 </form>
 
 <script>
+// 后端在哪儿。页面由后端自己发出来的时候(8765)走相对路径就行;从别处打开
+// —— 比如 IDE 的内置预览服务(63342)—— 相对路径会打到那个服务上,那边
+// 没有 /ask,于是 404。所以按端口判断一下,不是后端发的就显式指过来。
+//
+// 改后端端口的话,server.py 的 PORT 和这行要一起改。
+const BACKEND = "http://127.0.0.1:8765";
+const API = location.port === "8765" ? "" : BACKEND;
+
 const stream = document.getElementById("stream");
 const log = document.getElementById("log");
 const head = document.getElementById("head");
@@ -341,7 +349,15 @@ form.addEventListener("submit", async (e) => {
 
   let res;
   try {
-    res = await fetch("/ask", { method: "POST", body: query });
+    // 必须发 application/json:这个 Content-Type 不在 CORS 的白名单里,
+    // 浏览器因此必须先发预检。后端只对同机来源回 Allow-Origin,所以
+    // 别的网页发来的请求会被浏览器掐在预检那一步,根本到不了后端。
+    // 换成 text/plain 就退化成"简单请求",绕过预检直接开跑。
+    res = await fetch(API + "/ask", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query }),
+    });
   } catch (err) {
     add(el("div", "error", "连不上后端: " + err));
     setBusy(false);

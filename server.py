@@ -5,8 +5,10 @@
 
 只有两个端点:
 
-    GET  /      页面
-    POST /ask   请求体是那句问话,响应是一条 NDJSON 流(一行一个 JSON)
+    GET  /        页面
+    POST /ask     请求体是 JSON {"query": "..."},响应是一条 NDJSON 流
+                  (一行一个 JSON)
+    OPTIONS /ask  预检。跨源那道门就架在这儿,见 do_OPTIONS
 
 **为什么不用 SSE(EventSource):** 它只能发 GET,查询就得塞进 URL。
 改成 fetch() 读响应流,格式走 NDJSON —— 解析是几行 JS,还省掉 `data:`
@@ -43,6 +45,21 @@ HISTORY: list = []
 BUSY = threading.Lock()
 
 
+def is_local_origin(origin: str) -> bool:
+	"""只放行同机来源。
+
+	**不能回 "\*"**:回了的话,你浏览器里随便开着的哪个网页都能 POST 过来
+	指挥这个 agent 跑 bash,而且还能把结果读走。这个 agent 手里是真 shell,
+	不能对任意网页开门。
+
+	顺带说清楚一件事:CORS 只管"能不能读响应"。跨源的简单请求(POST +
+	text/plain)不管有没有这个头,请求本身都会发出去、命令都会跑。所以要
+	真挡住,得让请求**必须过预检** —— 见 do_OPTIONS 和页面那边的
+	Content-Type: application/json。
+	"""
+	return origin.startswith(("http://localhost:", "http://127.0.0.1:"))
+
+
 def ndjson_emit(wfile):
 	"""造一个把事件写进响应流的 emit。
 
@@ -57,6 +74,29 @@ def ndjson_emit(wfile):
 
 
 class Handler(BaseHTTPRequestHandler):
+	def _cors(self):
+		"""同机来源就回一个 Allow-Origin,别的什么都不回。"""
+		origin = self.headers.get("Origin")
+		if origin and is_local_origin(origin):
+			self.send_header("Access-Control-Allow-Origin", origin)
+
+	def do_OPTIONS(self):
+		"""预检。这是道真门,不是走过场。
+
+		页面从 IDE 的预览服务(另一个源)发请求时,浏览器先发这个。坏页面
+		发来的预检带着它自己的 Origin,而 _cors() 不会回 Allow-Origin ——
+		预检不过,后面那个 POST 根本不会发出去。
+
+		前提是页面必须**触发**预检,也就是不能被当成简单请求。所以页面那边
+		发的是 application/json,不是 text/plain。
+		"""
+		self.send_response(204)
+		self._cors()
+		self.send_header("Access-Control-Allow-Methods", "POST")
+		self.send_header("Access-Control-Allow-Headers", "content-type")
+		self.send_header("Access-Control-Max-Age", "600")
+		self.end_headers()
+
 	def do_GET(self):
 		if self.path != "/":
 			self.send_error(404)
@@ -76,12 +116,19 @@ class Handler(BaseHTTPRequestHandler):
 			return
 
 		length = int(self.headers.get("Content-Length", 0))
-		raw = self.rfile.read(length)
+		raw = self.rfile.read(length) if length else b""
+		# 走 JSON 而不是裸文本,是为了强制预检 —— 见 do_OPTIONS。
+		try:
+			query = str(json.loads(raw or b"{}").get("query", ""))
+		except (ValueError, AttributeError):
+			self.send_error(400, "body must be JSON: {\"query\": \"...\"}")
+			return
+
 		# 跟 main.py 同样的洗法:stdin 也好、socket 也好,坏字节凑不成
 		# 合法序列时会被 surrogateescape 兜成孤代理项,那东西编码不进
 		# API 请求体,会在 SDK 内部炸成 UnicodeEncodeError(不是 APIError,
 		# 捕不到)。
-		query = raw.decode("utf-8", "replace").strip()
+		query = query.encode("utf-8", "replace").decode("utf-8").strip()
 
 		if not BUSY.acquire(blocking=False):
 			self.send_error(409, "a turn is already running")
@@ -94,6 +141,7 @@ class Handler(BaseHTTPRequestHandler):
 			self.send_response(200)
 			self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
 			self.send_header("Cache-Control", "no-store")
+			self._cors()
 			self.end_headers()
 
 			emit = ndjson_emit(self.wfile)
