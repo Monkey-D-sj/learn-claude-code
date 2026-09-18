@@ -59,6 +59,7 @@ if __name__ == "__main__":
 		history.append({"role": "user", "content": query})
 		try:
 			print(agent_loop(history,
+			                 active_request=query,
 			                 system=SYSTEM,
 			                 tools=TOOLS,
 			                 model=MODEL,

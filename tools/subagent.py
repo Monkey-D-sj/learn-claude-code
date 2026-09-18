@@ -33,6 +33,7 @@ def run_task(prompt: str) -> str:
 	print("\n\033[35m[Subagent started]\033[0m")
 	return agent_loop(
 		[{"role": "user", "content": prompt}],
+		active_request=prompt,
 		system=SYSTEM,
 		tools=sub_tools,
 		model=MODEL,

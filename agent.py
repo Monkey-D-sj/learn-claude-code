@@ -58,8 +58,8 @@ def final_text(response) -> str:
 	"""最后一条回复里的文本部分(跳过 thinking 块)。"""
 	return "".join(b.text for b in response.content if b.type == "text")
 
-def agent_loop(messages: list, system: str, tools: list, model: str,
-               max_rounds: int, compactor) -> str:
+def agent_loop(messages: list, active_request: str, system: str, tools: list,
+               model: str, max_rounds: int, compactor) -> str:
 	"""跑一轮完整的 agent 循环,返回最后的文本回复。
 
 	只负责机制。提示词、工具集、模型、轮数上限、压缩器都从外面传进来 ——
@@ -71,6 +71,10 @@ def agent_loop(messages: list, system: str, tools: list, model: str,
 
 	compactor 也必须注入,不能在这儿建:它带着一个 model,而主 agent 和
 	子 agent 用的不是同一个。模块级单例给不了两个对的。
+
+	active_request 是当前这条指令的原文,原样交给压缩器。压缩到最后一档
+	会把整段 messages 换成一条摘要,那条摘要里只有它 —— 不从外面传进来,
+	当前任务就跟着一起被总结掉了。
 	"""
 	handlers = {t.name: t.handler for t in tools}
 	wire = [t.to_wire() for t in tools]
@@ -101,7 +105,7 @@ def agent_loop(messages: list, system: str, tools: list, model: str,
 		# 下轮提问时整段工作凭空消失,而且不报错(连续两条 user 是合法的)。
 		#
 		# 切片赋值改的是原对象的内容,prepare 返回同一个还是新的都对。
-		messages[:] = compactor.prepare(messages)
+		messages[:] = compactor.prepare(messages, active_request)
 		
 		try:
 			response = call_api(
