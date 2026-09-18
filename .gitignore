@@ -14,3 +14,7 @@ wheels/
 
 # IDE
 .idea/
+
+# 压缩的产物:完整对话存档 / 落盘的工具结果
+.transcripts/
+.task_outputs/

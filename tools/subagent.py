@@ -1,5 +1,6 @@
-from agent import agent_loop
-from config import MAX_ROUNDS, WORKDIR
+from agent import agent_loop, client
+from config import MAX_ROUNDS, TOOL_RESULTS_DIR, TRANSCRIPT_DIR, WORKDIR
+from context import ContextCompactor
 from tools.base import ToolDesc
 
 SYSTEM = (
@@ -15,6 +16,10 @@ SYSTEM = (
 # 子 agent 不必用跟主 agent 一样的模型。探索类任务换成更便宜的,
 # 主 agent 留着做决策 —— 改这一行即可。
 MODEL = "deepseek-flash"
+
+# 子 agent 建自己那个压缩器 —— 就是为了它的 model 能跟主 agent 不一样。
+# 这也是它不能是模块级单例的原因。
+COMPACTOR = ContextCompactor(client, MODEL, TRANSCRIPT_DIR, TOOL_RESULTS_DIR)
 
 
 def run_task(prompt: str) -> str:
@@ -32,6 +37,7 @@ def run_task(prompt: str) -> str:
 		tools=sub_tools,
 		model=MODEL,
 		max_rounds=MAX_ROUNDS,
+		compactor=COMPACTOR,
 	)
 
 

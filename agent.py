@@ -5,7 +5,6 @@ import anthropic
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
-from context import ContextCompactor
 from hooks import trigger_hooks
 
 load_dotenv()
@@ -59,18 +58,19 @@ def final_text(response) -> str:
 	"""最后一条回复里的文本部分(跳过 thinking 块)。"""
 	return "".join(b.text for b in response.content if b.type == "text")
 
-context_compactor = ContextCompactor()
-
 def agent_loop(messages: list, system: str, tools: list, model: str,
-               max_rounds: int) -> str:
+               max_rounds: int, compactor) -> str:
 	"""跑一轮完整的 agent 循环,返回最后的文本回复。
 
-	只负责机制。提示词、工具集、模型、轮数上限都从外面传进来 ——
+	只负责机制。提示词、工具集、模型、轮数上限、压缩器都从外面传进来 ——
 	它不知道调用它的是主 agent 还是子 agent。
 
 	max_rounds 数的是 API 调用次数:一轮 = 一次请求 + 它要的那些工具。
 	这是唯一的兜底 —— 模型陷入循环、或者子 agent 不返回时,主 agent
 	会一直卡着,所以上限不是可选项。
+
+	compactor 也必须注入,不能在这儿建:它带着一个 model,而主 agent 和
+	子 agent 用的不是同一个。模块级单例给不了两个对的。
 	"""
 	handlers = {t.name: t.handler for t in tools}
 	wire = [t.to_wire() for t in tools]
@@ -87,7 +87,16 @@ def agent_loop(messages: list, system: str, tools: list, model: str,
 			return f"Stopped: round limit of {max_rounds} reached, task incomplete."
 		rounds += 1
 		
-		messages = context_compactor.prepare(messages)
+		# 发送前压缩。必须赶在 call_api 之前:上一轮的工具结果已经追加
+		# 进来但还没发出去,这时压掉才省得下钱;发完之后再压,钱已经花过。
+		# 位置也只能在这儿 —— 此处 messages 停在完整回合上,切在 tool_use
+		# 和它的 tool_result 之间下次请求直接 400。
+		#
+		# 用 messages = ... 现在没坏事,但靠的是巧合:prepare 恰好原地改
+		# 再返回同一个 list。哪天它改成构造新列表(签名 -> list 就在邀请
+		# 这么写),调用方的 history 会悄悄指向旧 list,整个回合丢失且不报错。
+		# 写成 messages[:] = ... 两种实现都安全。
+		messages = compactor.prepare(messages)
 		
 		try:
 			response = call_api(
