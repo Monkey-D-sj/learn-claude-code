@@ -1,3 +1,6 @@
+import json
+import re
+import uuid
 from pathlib import Path
 
 
@@ -33,6 +36,28 @@ def _preview(text: str, head: int, tail: int) -> str:
 	return "\n".join(
 		part for part in (start, f"... [omitted {omitted} chars] ...", end) if part
 	)
+
+
+def _block_type(block):
+	"""取一个 content block 的 type。
+
+	同一个字段两副形状:assistant 消息里是 SDK 的 pydantic 对象
+	(response.content 直接塞进去的),user 消息里是我们自己拼的 dict。
+	两边都得认。
+	"""
+	return block.get("type") if isinstance(block, dict) else getattr(block, "type", None)
+
+
+def _json_default(obj):
+	"""json.dumps 的兜底:把 pydantic 块转成 dict。
+
+	不这么做的话会走 str(),存档里存的是
+	ToolUseBlock(id='...', name='bash', ...) 这样的 repr —— 能看,
+	但还原不回来,那份存档就不是真的存档了。
+	"""
+	if hasattr(obj, "model_dump"):
+		return obj.model_dump()
+	return str(obj)
 
 
 class ContextCompactor:
@@ -79,6 +104,11 @@ class ContextCompactor:
 	# 异常),再往上翻收益掉得很快。
 	PREVIEW_HEAD = 2000
 	PREVIEW_TAIL = 300
+
+	# snip 之后保留多少条消息。头部那几条(任务本身 + 第一个回合)是固定的,
+	# 剩下的都给尾部。
+	SNIP_MAX_MESSAGES = 50
+	SNIP_HEAD_MESSAGES = 3
 
 	def __init__(self,llm_client, model: str, transcript_dir: Path,
 	             tool_results_dir: Path):
@@ -203,10 +233,106 @@ class ContextCompactor:
 		if len(output) <= self.LARGE_RESULT_CHAR_LIMIT:
 			return output
 		return self.persisted_preview(tool_use_id, output)
-	
+
+	@staticmethod
+	def has_tool_use(message: dict) -> bool:
+		"""这条消息里有没有 tool_use —— 也就是后面必须跟着 tool_result。"""
+		content = message.get("content")
+		return (message.get("role") == "assistant"
+		        and isinstance(content, list)
+		        and any(_block_type(block) == "tool_use" for block in content))
+
+	@staticmethod
+	def is_tool_result(message: dict) -> bool:
+		content = message.get("content")
+		return (message.get("role") == "user"
+		        and isinstance(content, list)
+		        and any(_block_type(block) == "tool_result" for block in content))
+
+	def write_transcript(self, messages: list) -> Path:
+		"""把当前全部消息存成 jsonl,返回路径。
+
+		用 "x" 模式开:同名不覆盖,也不会悄悄续写一个已存在的文件。
+		文件名带 uuid,所以实际上不会撞。
+		"""
+		self.transcript_dir.mkdir(parents=True, exist_ok=True)
+		path = self.transcript_dir / f"transcript_{uuid.uuid4().hex}.jsonl"
+		with path.open("x", encoding="utf-8") as transcript:
+			for message in messages:
+				transcript.write(json.dumps(message, default=_json_default,
+				                            ensure_ascii=False) + "\n")
+		return path
+
+	def is_archive_marker(self, message: dict) -> bool:
+		"""这条是不是"中段已归档"的标记。
+
+		标记里的路径来自上下文,是不可信输入 —— 验过真在 transcript_dir
+		里、而且文件确实存在,才认它是标记。
+		"""
+		content = message.get("content")
+		match = (re.fullmatch(r"\[\d+ messages archived at (.+)\]", content)
+		         if isinstance(content, str) else None)
+		if not match:
+			return False
+		path = Path(match.group(1))
+		try:
+			path = path.resolve()
+		except OSError:
+			return False
+		return (path.is_relative_to(self.transcript_dir.resolve())
+		        and path.is_file())
+
+	def snip_compact(self, messages: list,
+	                 max_messages: int = SNIP_MAX_MESSAGES) -> list:
+		"""第 2 层:消息条数太多,把中段归档,只留头尾。
+
+		不调模型、不动内容,只是丢 —— 所以既不花 token 也不毁摘要质量。
+		比第 3 层可靠:丢掉的原文在 transcript 里,随时能翻回来。
+
+		**返回新列表**,不是在原地改。调用方必须写回自己那份
+		(agent.py 那句是 messages[:] = ...),否则调用方的 history
+		会停在旧列表上,整个回合静默消失。
+		"""
+		if len(messages) <= max_messages:
+			return messages
+
+		# 头部固定留前几条:任务本身和最开始的上下文,丢了就不知道在干嘛
+		head_end = self.SNIP_HEAD_MESSAGES
+		tail_start = len(messages) - (max_messages - head_end - 1)
+
+		# 头尾都必须停在"完整回合"的边界上:切在 assistant 的 tool_use 和
+		# 它的 tool_result 之间,下次请求直接 400 —— 跟 MAX_ROUNDS 的检查点
+		# 是同一个约束。
+		#
+		# 头这边最多前进一条:一个 assistant 的 tool_use 无论几个,结果都塞进
+		# 紧跟的那一条 user 消息(agent.py 的循环就是这么拼的),不存在连着
+		# 两条 tool_result 要跳。写成 while 是白写 —— 结构保证它只跑一轮。
+		if self.has_tool_use(messages[head_end - 1]):
+			if head_end < tail_start and self.is_tool_result(messages[head_end]):
+				head_end += 1
+		if (tail_start > 0 and self.is_tool_result(messages[tail_start])
+		        and self.has_tool_use(messages[tail_start - 1])):
+			tail_start -= 1
+
+		if head_end >= tail_start:
+			return messages
+
+		middle = messages[head_end:tail_start]
+		# 中段已经只剩一条归档标记了,再切就是原地打转
+		if len(middle) == 1 and self.is_archive_marker(middle[0]):
+			return messages
+
+		transcript_path = self.write_transcript(messages)
+		marker = {"role": "user", "content":
+		          f"[{tail_start - head_end} messages archived at "
+		          f"{_display(transcript_path)}]"}
+		print(f"\033[90m[snip] {tail_start - head_end} messages archived "
+		      f"-> {transcript_path.name}\033[0m")
+		return [*messages[:head_end], marker, *messages[tail_start:]]
+
 	# 每轮预压缩
 	def prepare(self, messages: list) -> list:
-		"""agent_loop 每轮发送前调一次,返回就地改过的同一个 list。
+		"""agent_loop 每轮发送前调一次。
 
 		调用点在循环顶部、call_api 之前 —— 那里上一轮的工具结果已经
 		追加进 messages 但还没发出去,压掉才省得下钱。发送之后再压,
@@ -215,10 +341,13 @@ class ContextCompactor:
 		也只能在那儿压:此处 messages 必定停在一个完整回合上。切在
 		assistant 带 tool_use、它的 tool_result 还没回填的位置,下次
 		请求直接 400 —— 跟 MAX_ROUNDS 的检查点是同一个约束。
+
+		**返回值可能是新列表**(snip_compact 就是),调用方要写回自己
+		那份,不是接过来改名。
 		"""
 		# 工具压缩
 		messages = self.tool_result_budget(messages)
-
-
+		# 中段归档。放在落盘之后:先把大结果落下来,再看还剩多少条要丢。
+		messages = self.snip_compact(messages)
 		return messages
 	

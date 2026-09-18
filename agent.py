@@ -92,11 +92,16 @@ def agent_loop(messages: list, system: str, tools: list, model: str,
 		# 位置也只能在这儿 —— 此处 messages 停在完整回合上,切在 tool_use
 		# 和它的 tool_result 之间下次请求直接 400。
 		#
-		# 用 messages = ... 现在没坏事,但靠的是巧合:prepare 恰好原地改
-		# 再返回同一个 list。哪天它改成构造新列表(签名 -> list 就在邀请
-		# 这么写),调用方的 history 会悄悄指向旧 list,整个回合丢失且不报错。
-		# 写成 messages[:] = ... 两种实现都安全。
-		messages = compactor.prepare(messages)
+		# 切片赋值,不能用 messages = ...。
+		#
+		# messages 是调用方传进来的那个 list 对象(main.py 里的 history),
+		# 而 prepare 内部会构造新列表返回 —— snip_compact / compact_history
+		# 都是。写成 = 的话本地名指向了新列表,调用方那份还停在旧的上面:
+		# 这一回合的 assistant 回复和工具结果全写进了新列表,调用方看不见,
+		# 下轮提问时整段工作凭空消失,而且不报错(连续两条 user 是合法的)。
+		#
+		# 切片赋值改的是原对象的内容,prepare 返回同一个还是新的都对。
+		messages[:] = compactor.prepare(messages)
 		
 		try:
 			response = call_api(
