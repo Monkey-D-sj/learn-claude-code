@@ -24,11 +24,18 @@ MAX_ATTEMPTS = 3
 BASE_DELAY = 1.0
 
 
-def call_api(**kwargs):
+def call_api(llm_client, **kwargs):
 	"""调一次 Messages API,可重试的失败按指数退避重试。
 
 	重试:连接错误、超时、429、5xx
 	不重试:其他 4xx —— 401/400 这类重试一百遍还是同样结果,只是浪费时间。
+
+	client 是参数不是全局:压缩器(context.py)也要走这条路,而它拿的是
+	构造函数注进来的那个 client。写死用模块级那个的话,压缩器注进来的
+	就静默失效了 —— 改了不生效、不报错。
+
+	这是全项目唯一的重试出口。谁要直连 client.messages.create,就绕过了
+	这里所有的退避策略,包括摘要那次调用。
 
 	except 的顺序要紧:RateLimitError 是 APIStatusError 的子类,
 	写在它后面就永远轮不到,429 会被误当成 5xx。
@@ -38,7 +45,7 @@ def call_api(**kwargs):
 	"""
 	for attempt in range(1, MAX_ATTEMPTS + 1):
 		try:
-			return client.messages.create(**kwargs)
+			return llm_client.messages.create(**kwargs)
 		except anthropic.RateLimitError as exc:
 			err, retryable = exc, True
 		except anthropic.APIStatusError as exc:
@@ -109,6 +116,7 @@ def agent_loop(messages: list, active_request: str, system: str, tools: list,
 		
 		try:
 			response = call_api(
+				client,
 				model=model,
 				messages=messages,
 				system=system,

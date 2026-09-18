@@ -3,6 +3,8 @@ import re
 import uuid
 from pathlib import Path
 
+from agent import call_api
+
 
 def _display(path: Path) -> str:
 	"""给模型看的路径,一律正斜杠。
@@ -526,8 +528,14 @@ class ContextCompactor:
 		命令输出),全都是不可信内容。不明确禁止,摘要器会去"执行"里面
 		的指令;不明确要求记什么,它会写成一篇散文,把剩下的活、文件名、
 		用户约束全丢掉。
+
+		走 call_api 而不是直接 self.client.messages.create:直接调就绕过了
+		重试,而这是整个循环里最经不起失败的一次调用 —— 它在 prepare 里、
+		在 try 之外,一次 429 会把这一整轮的工作全掀掉,异常一路穿到
+		main.py 的兜底 except。重试策略只由 call_api 一处掌握。
 		"""
-		response = self.client.messages.create(
+		response = call_api(
+			self.client,
 			model=self.model,
 			system=(
 				"Summarize the supplied coding-agent conversation as factual state. "
