@@ -64,6 +64,35 @@ def call_api(llm_client, emit, **kwargs):
 		time.sleep(wait)
 
 
+def error_chain(err, limit: int = 3) -> str:
+	"""把异常链上有信息量的几层串成一行,供报错用。
+
+	SDK 的外层永远是固定措辞 —— APIConnectionError 只会说 "Connection
+	error.",一个字都不多。真正的原因挂在链的下一层:
+
+	    ConnectTimeout   网络慢,或 TLS 握手超时
+	    ConnectError     连不上,或 TLS 被中间人截断
+	    SSLError         证书不对
+	    gaierror         DNS 解析不了
+
+	这几种的处置方式完全不同,外层消息却长得一模一样。不挖出来,这个报错
+	就没法自助 —— 只能靠猜,或者手工再挖一遍。
+
+	跳过跟上一层一字不差的:httpx2 和 httpcore2 会把同一个底层错误各包
+	一遍,原文完全相同,连打两遍只是让人多读一行。
+
+	limit 是上限:链可以很深,而报错不该长到看不清。
+	"""
+	parts, seen, cause = [], str(err), err.__cause__
+	while cause is not None and len(parts) < limit:
+		text = str(cause) or type(cause).__name__
+		if text != seen:
+			parts.append(f"{type(cause).__name__}: {text}")
+			seen = text
+		cause = cause.__cause__
+	return " <- ".join(parts)
+
+
 def final_text(response) -> str:
 	"""最后一条回复里的文本部分(跳过 thinking 块)。"""
 	return "".join(b.text for b in response.content if b.type == "text")
@@ -88,7 +117,7 @@ def clip_for_event(output: str) -> str:
 	        f"... [display truncated: {len(output)} chars total]")
 
 def agent_loop(messages: list, active_request: str, system: str, tools: list,
-               model: str, max_rounds: int, compactor, emit) -> str:
+               model: str, max_rounds: int, compactor, emit, ask) -> str:
 	"""跑一轮完整的 agent 循环,返回最后的文本回复。
 
 	只负责机制。提示词、工具集、模型、轮数上限、压缩器都从外面传进来 ——
@@ -112,6 +141,11 @@ def agent_loop(messages: list, active_request: str, system: str, tools: list,
 	它不发 reply:最后的文本仍然是返回值。这样调用方那句
 	print(agent_loop(...)) 一个字不用改,而且"返回什么"和"显示什么"
 	不会分家。
+
+	ask 是"拿不准的时候问谁",签名 ask(question: str) -> bool。跟 emit 一样
+	必须注入:终端能 input(),浏览器不能 —— 写死一个全局的话,两个前端里
+	总有一个会在运行时卡住(浏览器那个没有 stdin)。它只被 permission_hook
+	用,子 agent 传的是"一律拒绝",理由见 tools/subagent.py。
 	"""
 	handlers = {t.name: t.handler for t in tools}
 	wire = [t.to_wire() for t in tools]
@@ -158,7 +192,13 @@ def agent_loop(messages: list, active_request: str, system: str, tools: list,
 		except anthropic.APIError as e:
 			# 重试耗尽或不可重试:作为文本交回去,不让它掀翻整个会话。
 			# 调用方(REPL / 子 agent)拿到的是一个字符串,不是异常。
-			return f"Error: API call failed: {type(e).__name__}: {e}"
+			#
+			# 根因必须带上 —— 光看外层那句话是分不出诊的,见 error_chain。
+			detail = f"{type(e).__name__}: {e}"
+			chain = error_chain(e)
+			if chain:
+				detail += f" <- {chain}"
+			return f"Error: API call failed: {detail}"
 		messages.append({
 			"role": "assistant", "content": response.content
 		})
@@ -182,7 +222,7 @@ def agent_loop(messages: list, active_request: str, system: str, tools: list,
 			# 被 hook 拦下来的那次也有结果(拦截理由),所以 tool_result
 			# 在每条路径上都要发,不然页面上会留一个没有下文的调用。
 			emit({"kind": "tool_call", "name": block.name, "input": block.input})
-			blocked = trigger_hooks("PreToolUse", block)
+			blocked = trigger_hooks("PreToolUse", block, ask)
 			if blocked:
 				results.append({
 					"type": "tool_result",

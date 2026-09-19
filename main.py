@@ -1,13 +1,19 @@
 from agent import agent_loop
 from app import MODEL, SYSTEM, make_compactor
 from config import MAX_ROUNDS
-from emit import terminal_emit
+from emit import terminal_ask, terminal_emit
 from hooks import trigger_hooks
-from tools import TOOLS
+from tools import build_tools
+from tools.todo import TodoManager
 
 # 终端这个前端:事件打在这儿,压缩器的日志也打在这儿。
 # 浏览器那个前端在 server.py,它建自己那个压缩器。
 COMPACTOR = make_compactor(terminal_emit)
+
+# 终端一个进程只有一个 agent,所以任务清单也是进程一份。
+# 浏览器那个前端不是 —— 那边是每个会话一份,见 server.py。
+TODO = TodoManager()
+TOOLS = build_tools(TODO)
 
 if __name__ == "__main__":
 	print("s01: Agent Loop")
@@ -37,6 +43,7 @@ if __name__ == "__main__":
 			                 model=MODEL,
 			                 max_rounds=MAX_ROUNDS,
 			                 compactor=COMPACTOR,
+			                 ask=terminal_ask,
 			                 emit=terminal_emit))
 		except Exception as e:
 			# 兜底:任何异常都不该把 history 一起带走

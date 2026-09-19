@@ -7,7 +7,10 @@ def context_inject_hook(query: str) -> str | None:
 	return None   # return None = no modification, let prompt through
 
 
-def log_hook(block):
+def log_hook(block, ask):
+	# ask 收下不用:PreToolUse 的 hook 都拿同一组参数,而这里只需要 block。
+	# 写成 (block, ask) 而不是加默认值,是为了让签名跟 permission_hook 一致
+	# —— trigger_hooks 按事件分发,同事件的回调签名必须对齐。
 	print(f"[HOOK] {block.name}(...)")
 
 

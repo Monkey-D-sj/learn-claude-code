@@ -28,13 +28,34 @@ COMPACTOR = ContextCompactor(client, MODEL, TRANSCRIPT_DIR, TOOL_RESULTS_DIR,
                              terminal_emit)
 
 
+def _deny_all(question: str) -> bool:
+	"""子 agent 的确认器:一律拒绝。
+
+	不能把父 agent 的确认器传下来,有两个理由,任一都足够:
+
+	  1. 子 agent 的定位就是"没人能回答问题"(见上面 SYSTEM),给它开一个
+	     交互通道等于把自己那句设定推翻;
+	  2. 它跑在调用它的那个前端的线程里。父 agent 在浏览器里时,这儿要是
+	     走终端的 input(),卡住的是 server.py 的 HTTP 线程 —— 而那个会话
+	     的那把锁还攥着,页面那边只会看到一直转圈。
+
+	所以越界的调用直接拒掉,理由(字符串)交回模型,让它自己绕路。
+	"""
+	return False
+
+
 def run_task(prompt: str) -> str:
 	# 延迟导入:子 agent 要"所有工具",而本模块由 tools/__init__ 加载,
-	# 模块级 from tools import TOOLS 会拿到半初始化的包。
-	from tools import TOOLS
+	# 模块级 from tools import build_tools 会拿到半初始化的包。
+	from tools import build_tools
+	from tools.todo import TodoManager
 
+	# 每次派活现造一个任务清单:子 agent 就是一个全新的上下文窗口
+	# (下面那句 agent_loop 也只喂一条 prompt),它的任务不该跟主 agent 的
+	# 混在一个列表里 —— 这正是 todo 那个工厂存在的理由。
+	#
 	# 排除自己,否则子 agent 可以无限套娃。
-	sub_tools = [t for t in TOOLS if t.name != "task"]
+	sub_tools = [t for t in build_tools(TodoManager()) if t.name != "task"]
 
 	print("\n\033[35m[Subagent started]\033[0m")
 	return agent_loop(
@@ -45,6 +66,7 @@ def run_task(prompt: str) -> str:
 		model=MODEL,
 		max_rounds=MAX_ROUNDS,
 		compactor=COMPACTOR,
+		ask=_deny_all,
 		emit=terminal_emit,
 	)
 

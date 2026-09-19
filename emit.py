@@ -1,7 +1,11 @@
 """终端渲染器:把一个事件打成终端能看的样子。
 
-它是"终端这个前端"的渲染函数,跟 server.py 里那个"推给浏览器"的 emit
+它是"终端这个前端"的展示层,跟 server.py 里那个"推给浏览器"的 emit
 是一对 —— 两边拿到的是同一批事件,各自决定怎么显示。
+
+展示层有两件事:把事件画出来(terminal_emit),和拿不准的时候问人
+(terminal_ask)。后者也是前端的活 —— 浏览器那边问的是网页,不是终端,
+所以 agent_loop 把它当参数收,而不是在 hook 里写死。
 
 放在单独一个模块里,是因为有两个地方要用它:main.py 的 REPL,和子
 agent。子 agent 的循环不往上抛事件(它的定位就是把过程藏起来,只回
@@ -37,3 +41,18 @@ def terminal_emit(event: dict) -> None:
 
 	elif kind == "reply":
 		print(event["text"])
+
+
+def terminal_ask(question: str) -> bool:
+	"""终端这个前端的确认器。返回值 = 放不放行。
+
+	EOFError 必须当成拒绝,不能当成同意,也不能让它抛出去:stdin 被重定向
+	或关掉时(管道、后台跑、某些 IDE)input() 直接 EOF —— 那条路径上如果
+	默认放行,"把 stdin 关掉"就成了提权手段。
+	"""
+	try:
+		reply = input(f"\033[33m{question}\033[0m\n   Allow? [y/N] ")
+	except (EOFError, KeyboardInterrupt):
+		print()
+		return False
+	return reply.strip().lower() in ("y", "yes")

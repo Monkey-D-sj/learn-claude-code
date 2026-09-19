@@ -18,3 +18,8 @@ wheels/
 # 压缩的产物:完整对话存档 / 落盘的工具结果
 .transcripts/
 .task_outputs/
+
+# 会话库。带 * 是有意的:WAL 模式下 -wal/-shm 是同一份数据的一部分,
+# 只 ignore 主文件的话,某次 git add -A 会把 -wal 单独提上去 —— 毫无意义
+# 而且误导。反过来说,删 -wal 等于丢数据。
+sessions.db*
