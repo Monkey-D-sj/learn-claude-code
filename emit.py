@@ -21,11 +21,16 @@ RESET = "\033[0m"
 
 
 def terminal_emit(event: dict) -> None:
-	"""把事件打到终端。四种 kind,跟 agent_loop / ContextCompactor 发的一致。"""
+	"""把事件打到终端。五种 kind,跟 agent_loop / ContextCompactor 发的一致。"""
 	kind = event.get("kind")
 
 	if kind == "tool_call":
 		print(f"{YELLOW}$ {event['name']} {event['input']}{RESET}")
+
+	elif kind == "thinking":
+		# 推理:斜体 + 灰。跟工具输出(也是灰)靠斜体分开,跟正文靠灰分开 ——
+		# 它是过程,不是结论。终端不认斜体的话就退化成灰,也能接受。
+		print(f"\033[3m{GRAY}{event['text']}{RESET}")
 
 	elif kind == "tool_result":
 		# 也上色,不然它跟模型最后的回复在终端里分不出来 —— 一堆输出

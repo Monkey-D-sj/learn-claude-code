@@ -203,6 +203,27 @@ def agent_loop(messages: list, active_request: str, system: str, tools: list,
 			"role": "assistant", "content": response.content
 		})
 
+		# 推理内容往外发一份。
+		#
+		# 它本来就存在 messages 里(thinking 块),但那是给模型自己下一轮看的
+		# —— 事件流里没有任何一种携带它,所以页面上看不见、重放里也没有。
+		#
+		# 位置在这儿:推理发生在这一轮的工具调用和回复**之前**。放这个位置,
+		# 事件流的顺序才跟真实发生的顺序一致,页面重放出来也就是那个顺序。
+		#
+		# 发的是截断版,跟工具输出同一笔账(clip_for_event):推理可以几千字,
+		# 而这条要落库、要重放、要塞进 DOM。完整的那份在 messages 里,
+		# 一个字不少 —— 库里存的两份东西本来就各有各的完整度。
+		#
+		# signature 不发:那是签名,只在发回 API 时有用(在 messages 里),
+		# 给页面看没有意义。
+		#
+		# 空的不发:模型有时会返回空的 thinking 块(实测最后一轮就会有),
+		# 发出去页面上就多一个点开什么都没有的折叠块。
+		for block in response.content:
+			if block.type == "thinking" and block.thinking.strip():
+				emit({"kind": "thinking", "text": clip_for_event(block.thinking)})
+
 		tool_calls = [
 			block for block in response.content if block.type == "tool_use"
 		]

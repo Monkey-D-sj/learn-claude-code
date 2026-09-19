@@ -237,6 +237,43 @@
     overflow: auto;
   }
 
+  /* ---- 推理过程 ----
+     跟工具输出同一套折叠结构(点标题展开),但压得更暗、加斜体:它是
+     "过程",不该跟模型的结论抢注意力。默认收起也是同一个道理。 */
+  details.think { margin-bottom: 10px; }
+  details.think > summary {
+    list-style: none;
+    cursor: pointer;
+    font: 12.5px/1.6 var(--mono);
+    font-style: italic;
+    color: var(--faint);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  details.think > summary::-webkit-details-marker { display: none; }
+  details.think > summary::before {
+    content: "▸";
+    display: inline-block;
+    width: 13px;
+    font-style: normal;
+  }
+  details.think[open] > summary::before { content: "▾"; }
+  details.think > summary:hover { color: var(--dim); }
+  details.think > pre {
+    margin: 8px 0 10px;
+    padding: 10px 12px;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    font: 12.5px/1.65 var(--mono);
+    color: var(--faint);
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 420px;
+    overflow: auto;
+  }
+
   /* ---- 模型的回复 ----
      段落不再用 white-space: pre-wrap —— 换行现在由解析器发成 <br>,
      两个一起上会变成双倍行距。 */
@@ -301,6 +338,26 @@
     font: 12.5px/1.5 var(--mono);
     color: #c8d3e0;
   }
+  /* ---- 表格 ----
+     外面那层 .tw 是可横向滚动的壳:宽表不该把整个页面撑出一条横向滚动条。 */
+  .reply .tw { overflow-x: auto; margin: 0 0 12px; }
+  .reply table {
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+  .reply th, .reply td {
+    border: 1px solid var(--line);
+    padding: 6px 11px;
+    vertical-align: top;
+    word-break: break-word;
+  }
+  .reply th {
+    background: var(--surface);
+    color: #e6ebf2;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+
   .reply strong { color: #e6ebf2; font-weight: 600; }
   .reply em { color: #c8d3e0; }
 
@@ -649,8 +706,8 @@ async function removeSession(sid) {
 // 而页面跟后端同源 —— 那段 JS 反过来能 POST /answer 替你把权限批了。
 // 造节点这条路上,"注入"在结构上就不可能,连转义函数都不需要。
 //
-// 不管的:表格、图片、内联 HTML(故意的,理由见上)、setext 标题、
-// 引用式链接、脚注。够用就行,不够再加。
+// 不管的:图片、内联 HTML(故意的,理由见上)、setext 标题、引用式链接、
+// 脚注。够用就行,不够再加。
 
 // 这一组是"块的起手式"。dispatch 和 startsBlock 必须用同一组 —— 两处改岔了
 // 就是一个吃不到行的死循环,见下面段落那段。
@@ -660,9 +717,33 @@ const HEADING = /^(#{1,6})\s+(.*)$/;
 const QUOTE   = /^\s*>/;
 const ITEM    = /^(\s*)([-*+]|\d{1,3}[.)])\s+(.*)$/;
 
-function startsBlock(line) {
+function splitRow(line) {
+  let s = line.trim();
+  if (s.startsWith("|")) s = s.slice(1);
+  if (s.endsWith("|")) s = s.slice(0, -1);
+  return s.split("|").map((cell) => cell.trim());
+}
+
+// 分隔行:每个格子都是 --- 、:--- 、---: 或 :---: ,只管对齐和划线。
+function isSeparatorRow(line) {
+  return splitRow(line).every((cell) => /^:?-+:?$/.test(cell));
+}
+
+// 表格跟上面几个块不一样:它得**看下一行**才知道自己是不是表格。
+//
+// 判据是两个一起用:这一行有竖线,且下一行是分隔行,**且两边格子数一样**
+// (GFM 本来就这么要求)。只认竖线的话,正文里一句 "a | b" 会变成表格;
+// 只认"下一行是分隔行"的话,"---" 只是一条分割线。
+function startsTable(lines, i) {
+  if (i + 1 >= lines.length || !lines[i].includes("|")) return false;
+  return isSeparatorRow(lines[i + 1]) &&
+         splitRow(lines[i]).length === splitRow(lines[i + 1]).length;
+}
+
+function startsBlock(lines, i) {
+  const line = lines[i];
   return FENCE.test(line) || RULE.test(line) || HEADING.test(line) ||
-         QUOTE.test(line) || ITEM.test(line);
+         QUOTE.test(line) || ITEM.test(line) || startsTable(lines, i);
 }
 
 // 行内。分支顺序就是优先级:行内代码排最前,否则 `a**b**c` 里的星号会被
@@ -776,6 +857,52 @@ function renderList(lines, i, parent) {
   return i;
 }
 
+function renderTable(lines, i, parent) {
+  const head = splitRow(lines[i]);
+  // 对齐来自分隔行:`:---` 左、`---:` 右、`:---:` 居中、`---` 不管。
+  const aligns = splitRow(lines[i + 1]).map((cell) => {
+    if (cell.startsWith(":") && cell.endsWith(":")) return "center";
+    if (cell.endsWith(":")) return "right";
+    if (cell.startsWith(":")) return "left";
+    return "";
+  });
+  i += 2;
+
+  // 表体吃到"不再是表格行"为止。**按表头的列数补齐/截断**:模型偶尔会多写
+  // 或少写一格,不管的话这一行会把整张表撑歪(HTML 会自己补 td,但补出来的
+  // 位置跟对齐都是错的)。
+  const rows = [];
+  while (i < lines.length && lines[i].trim() && lines[i].includes("|")) {
+    const cells = splitRow(lines[i++]);
+    rows.push(head.map((_, c) => cells[c] || ""));
+  }
+
+  const table = document.createElement("table");
+  const hrow = table.createTHead().insertRow();
+  head.forEach((text, c) => {
+    const th = document.createElement("th");
+    th.style.textAlign = aligns[c] || "";
+    inline(text, th);
+    hrow.appendChild(th);
+  });
+  const tbody = table.createTBody();
+  for (const cells of rows) {
+    const tr = tbody.insertRow();
+    cells.forEach((text, c) => {
+      const td = document.createElement("td");
+      td.style.textAlign = aligns[c] || "";
+      inline(text, td);
+      tr.appendChild(td);
+    });
+  }
+
+  // 包一层可横向滚动的壳:宽表不该把整个页面撑出一条横向滚动条。
+  const wrap = el("div", "tw");
+  wrap.appendChild(table);
+  parent.appendChild(wrap);
+  return i;
+}
+
 function renderReply(text) {
   const wrap = el("div", "reply");
   // 先去掉 \r:回复里可能带 CRLF(模型读进来的 Windows 文件内容就会)。
@@ -825,6 +952,11 @@ function renderReply(text) {
       continue;
     }
 
+    if (startsTable(lines, i)) {
+      i = renderTable(lines, i, wrap);
+      continue;
+    }
+
     if (ITEM.test(line)) {
       i = renderList(lines, i, wrap);
       continue;
@@ -834,7 +966,7 @@ function renderReply(text) {
     // 的换行通常是有意的(路径、步骤一行一个),并掉反而难读。
     const p = el("p", null, "");
     let first = true;
-    while (i < lines.length && lines[i].trim() && !startsBlock(lines[i])) {
+    while (i < lines.length && lines[i].trim() && !startsBlock(lines, i)) {
       if (!first) p.appendChild(el("br"));
       inline(lines[i++], p);
       first = false;
@@ -904,6 +1036,21 @@ function renderAsk(ev) {
   return box;
 }
 
+// 推理过程。默认收起:它是过程不是结论,跟工具输出同一档 —— 想知道就
+// 展开,不想知道就别占着屏幕。标题给一小段预览,不用展开也能看出它在
+// 想什么。
+function renderThinking(ev) {
+  const d = document.createElement("details");
+  d.className = "think";
+  // filter 掉空行再取前两行:推理里常有空行,不过滤的话预览会留下
+  // 一个孤零零的分隔符("第一行 / ")。
+  const head = ev.text.trim().split("\n").filter((l) => l.trim())
+                     .slice(0, 2).join(" / ").slice(0, 140);
+  d.appendChild(el("summary", null, head || "推理过程"));
+  d.appendChild(el("pre", null, ev.text));
+  return d;
+}
+
 function render(ev) {
   if (ev.kind === "you") {
     // 用户那句话也是服务端发的一条事件,不再在提交时自己画 —— 否则重放
@@ -913,6 +1060,9 @@ function render(ev) {
     stream.appendChild(turn);
     add(el("div", "you", ev.text));
     refreshSessionsSoon();   // 这一轮开始了:侧栏那个点该亮起来
+
+  } else if (ev.kind === "thinking") {
+    add(renderThinking(ev));
 
   } else if (ev.kind === "tool_call") {
     call = el("div", "call");
