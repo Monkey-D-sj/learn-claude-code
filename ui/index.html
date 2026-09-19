@@ -124,8 +124,12 @@
     #side { width: 150px; }
   }
 
-  /* ---- 顶栏 ---- */
-  header {
+  /* ---- 顶栏 ----
+     选择器写 #head 而不是裸的 header:这一组说的是**顶上那条**,而页面里
+     还有别的 <header>(每轮的抬头、旧版记录那块的小标题)。裸标签选择器
+     会把它们一起染成一条 46px 高、带下边框的横条 —— 而且不报错,只是
+     画出来不对。 */
+  #head {
     flex: none;
     display: flex;
     align-items: center;
@@ -137,16 +141,16 @@
     font-size: 12.5px;
     color: var(--dim);
   }
-  header .dot {
+  #head .dot {
     width: 7px; height: 7px; border-radius: 50%;
     background: var(--faint);
     transition: background .2s;
   }
-  header.busy .dot { background: var(--tool); animation: pulse 1.1s ease-in-out infinite; }
-  header.waiting .dot { background: var(--you); animation: none; }
+  #head.busy .dot { background: var(--tool); animation: pulse 1.1s ease-in-out infinite; }
+  #head.waiting .dot { background: var(--you); animation: none; }
   @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .25 } }
-  header .name { color: var(--fg); font-weight: 600; letter-spacing: .2px; }
-  header .spacer { flex: 1; }
+  #head .name { color: var(--fg); font-weight: 600; letter-spacing: .2px; }
+  #head .spacer { flex: 1; }
 
   /* ---- 日志 ---- */
   #log {
@@ -165,6 +169,38 @@
 
   .turn { margin-bottom: 26px; }
   .turn + .turn { padding-top: 22px; border-top: 1px solid var(--line); }
+
+  /* 一轮的抬头:轮号 + 终态。
+     状态颜色跟着 data-status 走 —— 写三个类名的话,服务端将来多一个
+     状态(比如 cancelled)就得回来改样式,而漏掉的表现是"没颜色",
+     不报错。 */
+  .thead {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    margin-bottom: 10px;
+    font: 12px/1.6 var(--mono);
+    color: var(--faint);
+  }
+  .thead .no { color: var(--dim); }
+  .turn[data-status="running"] .thead .state { color: var(--tool); }
+  .turn[data-status="failed"]  .thead .state { color: var(--err); }
+
+  /* 旧版记录:轮次落库之前的那些会话。它们只有事件流,没有轮号可编,
+     所以整块单独放着,跟新记录一眼分得开。 */
+  .legacy {
+    margin-bottom: 26px;
+    padding: 16px 18px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: var(--surface);
+  }
+  .legacy .lhead {
+    font: 12px/1.6 var(--mono);
+    color: var(--faint);
+    margin-bottom: 16px;
+  }
+  .legacy .turn:last-child { margin-bottom: 0; }
 
   /* ---- 你说的话 ---- */
   .you {
@@ -501,6 +537,8 @@ let lastSeq = 0;         // 这个会话已经画到哪条事件 —— 库给�
 let ownsStream = false;  // 本页是不是那一轮直播流的持有者
 let poller = null;       // 轮询定时器
 let composerOn = null;   // 输入框上一刻的状态,用来只在"重新可用"时抢焦点
+let TURNS = new Map();   // turn_id -> 那一轮的 <section>,已经画在屏幕上的
+let SINK = null;         // 新容器挂哪:null = stream;重放旧版记录时是那块区域
 
 function el(tag, cls, text) {
   const node = document.createElement(tag);
@@ -518,6 +556,190 @@ function follow() {
 function add(node, target) {
   (target || turn || stream).appendChild(node);
   follow();
+}
+
+// ---- 轮次 ----
+//
+// 屏幕上一条轮次就是一个 <section class="turn">,里面是抬头(轮号 + 状态)
+// 加这一轮的内容。三种来源都往同一个盒子里放,靠 turn_id 认:
+//
+//   直播流    这一轮正在跑,事件一条条来
+//   轮询      页面上没有那条 POST 流时(刷新过、或者轮是别的标签页起的)
+//   轮次接口  切会话/刷新时,一次性把这一轮已有的消息全读出来
+//
+// 只有第三个是从库里重建的,前两个是过程。两者靠事件游标 cursor 划清界限,
+// 见 loadTurns。
+
+const STATE_TEXT = { running: "运行中", completed: "完成", failed: "失败" };
+
+function turnBox(id, no) {
+  let box = TURNS.get(id);
+  if (box) return box;
+  box = el("section", "turn");
+  const head = el("header", "thead");
+  head.appendChild(el("span", "no", no == null ? "一轮" : "第 " + no + " 轮"));
+  head.appendChild(el("span", "state"));
+  box.appendChild(head);
+  TURNS.set(id, box);
+  stream.appendChild(box);
+  // 先按"运行中"摆上。直播那一路到这儿就是对的(事件来的时候这一轮确实
+  // 在跑);从轮次接口读出来的那一路紧接着会用库里的真状态盖掉它。
+  setState(id, "running");
+  return box;
+}
+
+function setState(id, status, error) {
+  const box = TURNS.get(id);
+  if (!box) return;
+  box.dataset.status = status;
+  const label = box.querySelector(".thead .state");
+  if (label) {
+    label.textContent = STATE_TEXT[status] || status;
+    label.title = error || "";
+  }
+}
+
+// 没有 turn_id 的那些事件(旧版记录)走这条路:每次 you 现开一个容器,
+// 跟以前一样。它们进了 SINK 指定的那块区域,不是直接挂在正文流上。
+function newSection() {
+  const section = el("section", "turn");
+  (SINK || stream).appendChild(section);
+  return section;
+}
+
+// 旧版记录:这一版之前留下的会话没有轮次,只有一串事件。它们照旧走
+// 重放那条路 —— 那会儿没有 turn_messages 可读,不重放就什么都看不见。
+//
+// 不编号:那时候的"轮"没有落过库,编出来的号是假的。
+async function loadLegacy(sid) {
+  let events;
+  try {
+    const r = await fetch(API + "/session/" + sid + "/events?since=0&legacy=1");
+    if (!r.ok) return;
+    events = (await r.json()).events;
+  } catch { return; }
+  if (!events.length) return;
+
+  const box = el("section", "legacy");
+  box.appendChild(el("header", "lhead", "旧版记录(轮次落库之前)"));
+  stream.appendChild(box);
+
+  SINK = box;
+  turn = null;
+  call = null;
+  // 空白屏上的一次性全量重放,不会重复,不用过 renderIfNew 那层去重
+  for (const ev of events) render(ev);
+  SINK = null;
+
+  // 游标推到这批旧事件之后。不推的话,万一接下来 loadTurns 没拿到数据
+  // (它负责把游标设成服务端给的那个),catchUp 会从 0 重拉一遍 —— 于是
+  // 同一批旧记录被画两遍:一遍在这块区域里,一遍散在正文流上。
+  lastSeq = Math.max(lastSeq, ...events.map((e) => e.seq || 0));
+}
+
+// 切会话/刷新时重建轮次。画的是 turn_messages(原始消息),不是事件重放 ——
+// 两边都画就得写一套"这条事件对应哪条消息"的去重规则,而那种规则迟早会漏。
+async function loadTurns(sid) {
+  let data;
+  try {
+    const r = await fetch(API + "/session/" + sid + "/turns");
+    if (!r.ok) return;
+    data = await r.json();
+  } catch { return; }
+
+  for (const t of data.turns) renderTurn(t);
+
+  // cursor 是"截到哪条事件为止",跟上面那份 turns 读自同一个快照。
+  // 设成它,后面的直播和轮询就只画新事件 —— 已经画过的不再画一遍。
+  lastSeq = data.cursor || 0;
+
+  // 挂起中的确认单独补:它不是一条消息,库里没有,而游标已经越过它了 ——
+  // 不补这一下,刷新之后页面上没有那个按钮,而 agent 那头正挂在那儿等
+  // 300 秒超时。别的直播事件都能从消息重建,或者丢了也无所谓。
+  for (const ask of data.pending || []) {
+    if (ask.turn_id) turn = turnBox(ask.turn_id, null);
+    add(renderAsk(ask));
+  }
+}
+
+function blocksOf(content) {
+  if (typeof content === "string") return [{ type: "text", text: content }];
+  return Array.isArray(content) ? content : [];
+}
+
+function blockText(content) {
+  return blocksOf(content).map((b) => b.text || b.content || "").join("");
+}
+
+// 折叠着的那些块(工具输出、推理)都拿它当摘要 —— 两三行、一百来字,
+// 不展开也知道里面是什么。
+function headline(text) {
+  return String(text).trim().split("\n").filter((l) => l.trim())
+               .slice(0, 2).join(" / ").slice(0, 140);
+}
+
+function renderTurn(t) {
+  const box = turnBox(t.id, t.turn_no);
+  setState(t.id, t.status, t.error_message);
+
+  // 一条 assistant 消息里可以有好几个 tool_use,结果散在后面那条消息里。
+  // 拿 tool_use_id 找回去:名字和参数在调用那头,输出在结果那头。
+  const calls = new Map();
+  for (const m of t.messages) renderMessage(box, m, calls);
+
+  if (t.status === "failed" && t.error_message) {
+    box.appendChild(el("div", "error", t.error_message));
+  }
+  follow();
+}
+
+function renderMessage(box, m, calls) {
+  // 用户说的话按原文显示,不过 markdown —— 他打的是什么就是什么。
+  if (m.kind === "user_input") {
+    box.appendChild(el("div", "you", String(m.content)));
+    return;
+  }
+  // Stop hook 塞回来的话、每隔三轮的 todo 提醒、一次权限确认的结果。
+  // 都是协议里的东西、不是对话内容 —— 一行旁注,别跟回复混在一起。
+  // 不额外加前缀:每条自己就带了来路("［permission］ ..." 那种)。
+  if (m.kind === "control") {
+    box.appendChild(el("div", "note", headline(blockText(m.content))));
+    return;
+  }
+
+  for (const b of blocksOf(m.content)) {
+    switch (b.type) {
+      case "text":
+        if (b.text) box.appendChild(renderReply(b.text));
+        break;
+      case "thinking":
+        // 库里的块叫 thinking,而 renderThinking 收的是事件(text)。转一道
+        // 就行 —— 而且从这儿来的这份是**完整**的,直播那条是截断版。
+        if ((b.thinking || "").trim()) box.appendChild(renderThinking({ text: b.thinking }));
+        break;
+      case "tool_use": {
+        const call = el("div", "call");
+        const row = el("div", "tool");
+        row.appendChild(el("span", "name", b.name));
+        row.appendChild(el("span", "args", JSON.stringify(b.input)));
+        call.appendChild(row);
+        calls.set(b.id, call);
+        box.appendChild(call);
+        break;
+      }
+      case "tool_result": {
+        const out = blockText(b.content);
+        const d = document.createElement("details");
+        d.className = "result";
+        d.appendChild(el("summary", null, headline(out) || "(没有输出)"));
+        d.appendChild(el("pre", null, out));
+        // 找不到对应的调用就挂在轮上,别丢 —— 丢了的后果是这条输出
+        // 在页面上消失,而它在这一轮的记录里明明是在的。
+        (calls.get(b.tool_use_id) || box).appendChild(d);
+        break;
+      }
+    }
+  }
 }
 
 // ---- 会话 ----
@@ -641,6 +863,8 @@ function blankScreen() {
   turn = null;
   call = null;
   lastSeq = 0;
+  TURNS = new Map();            // 屏幕清空了,那些盒子的引用也跟着作废
+  SINK = null;
 }
 
 async function switchTo(sid) {
@@ -649,6 +873,10 @@ async function switchTo(sid) {
   stopPolling();
   blankScreen();
   paintSessions();              // 选中态立刻生效,不等网络
+  // 顺序要的:旧版记录先画,轮次后画 —— 它们本来就是"旧的在上、新的
+  // 在下",而 DOM 里谁先挂进去谁在上面。
+  await loadLegacy(sid);
+  await loadTurns(sid);
   await catchUp();
   refreshSessions();
 }
@@ -1042,22 +1270,27 @@ function renderAsk(ev) {
 function renderThinking(ev) {
   const d = document.createElement("details");
   d.className = "think";
-  // filter 掉空行再取前两行:推理里常有空行,不过滤的话预览会留下
-  // 一个孤零零的分隔符("第一行 / ")。
-  const head = ev.text.trim().split("\n").filter((l) => l.trim())
-                     .slice(0, 2).join(" / ").slice(0, 140);
-  d.appendChild(el("summary", null, head || "推理过程"));
+  // 摘要走 headline:它会先滤掉空行再取前两行。不滤的话,推理里那些
+  // 空行会让预览留下一个孤零零的分隔符("第一行 / ")。
+  d.appendChild(el("summary", null, headline(ev.text) || "推理过程"));
   d.appendChild(el("pre", null, ev.text));
   return d;
 }
 
 function render(ev) {
+  // 先归位,再画。带 turn_id 的按 id 找容器 —— 轮询可能从半截接上,那时
+  // 屏幕上连这一轮的盒子都还没有,得现建;没有 turn_id 的是旧版记录,
+  // 沿用老画法。
+  if (ev.turn_id) turn = turnBox(ev.turn_id, ev.turn_no);
+  else if (!turn) turn = newSection();
+
   if (ev.kind === "you") {
     // 用户那句话也是服务端发的一条事件,不再在提交时自己画 —— 否则重放
     // 出来的会是一串"没有问题的回答":那句问题从来没有进过事件流。
-    // 每条 you 开启新一轮(它跟 tool_call/reply 共用 turn 这个游标)。
-    turn = el("section", "turn");
-    stream.appendChild(turn);
+    // 每条 you 开启新一轮(它跟 tool_call/reply 共用 turn 这个游标)——
+    // 这句只对旧版记录成立,新记录上面已经按 id 归好位了。
+    if (!ev.turn_id) turn = newSection();
+    call = null;
     add(el("div", "you", ev.text));
     refreshSessionsSoon();   // 这一轮开始了:侧栏那个点该亮起来
 
@@ -1073,10 +1306,9 @@ function render(ev) {
     add(call);
 
   } else if (ev.kind === "tool_result") {
-    const head = ev.output.trim().split("\n").slice(0, 2).join(" / ").slice(0, 140);
     const d = document.createElement("details");
     d.className = "result";
-    d.appendChild(el("summary", null, head || "(没有输出)"));
+    d.appendChild(el("summary", null, headline(ev.output) || "(没有输出)"));
     d.appendChild(el("pre", null, ev.output));
     add(d, call);
     call = null;
@@ -1090,6 +1322,9 @@ function render(ev) {
 
   } else if (ev.kind === "reply") {
     add(renderReply(ev.text));
+    // 终态跟 reply 一起发过来(见 server.py 的 _run_turn)。标在轮号
+    // 旁边 —— 不标的话,一轮跑完屏幕上那个"运行中"要等到下次刷新才变。
+    if (ev.turn_id && ev.status) setState(ev.turn_id, ev.status);
 
   } else {
     // 认不出来的也显示,别默默吞掉 —— 将来加了新 kind,页面上至少

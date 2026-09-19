@@ -147,8 +147,8 @@ class ContextCompactor:
 		self.emit = emit
 
 	@staticmethod
-	def estimate_chars(messages: list) -> int:
-		"""整段上下文的字符数,拿去跟 CONTEXT_CHAR_LIMIT 比。
+	def fingerprint(messages: list) -> str:
+		"""整段上下文序列化成一坨。两个用途:量长度、比压前压后是不是同一份。
 
 		用 json.dumps 而不是把每块的文本长度加起来:消息里除了正文还有
 		工具名、参数、id,那些也占位置。
@@ -158,9 +158,16 @@ class ContextCompactor:
 		白压几轮,而且压完还是"超",看起来像没生效。
 
 		注意它每次都全量序列化一遍,而调用方是在循环里比的 —— 这是原版
-		就有的 O(n²),上下文很大的时候会拖慢 prepare。
+		就有的 O(n²),上下文很大的时候会拖慢 prepare。比指纹那一次
+		(prepare 里,带 checkpoint 时)又多加两份,量级一样,换来的是不用
+		去猜"这一档到底改了没有"。
 		"""
-		return len(json.dumps(messages, default=_json_default, ensure_ascii=False))
+		return json.dumps(messages, default=_json_default, ensure_ascii=False)
+
+	@classmethod
+	def estimate_chars(cls, messages: list) -> int:
+		"""整段上下文的字符数,拿去跟 CONTEXT_CHAR_LIMIT 比。"""
+		return len(cls.fingerprint(messages))
 
 	def tool_result_budget(self, messages: list, max_chars: int | None = None) -> list:
 		"""第 1 层:一批 tool_result 太大,就把最大的几个落盘。
@@ -610,7 +617,7 @@ class ContextCompactor:
 		return [self.summary_message("Compacted", active_request, summary, transcript)]
 
 	# 每轮预压缩
-	def prepare(self, messages: list, active_request: str) -> list:
+	def prepare(self, messages: list, active_request: str, checkpoint=None) -> list:
 		"""agent_loop 每轮发送前调一次。四档阶梯,一档不够就下一档。
 
 		调用点在循环顶部、call_api 之前 —— 那里上一轮的工具结果已经
@@ -630,7 +637,16 @@ class ContextCompactor:
 
 		四档的代价递增:落盘和 snip 不调模型;micro/fit 也不调,但要写盘;
 		最后的摘要调模型、不可逆,而且会毁掉整个 prompt cache 前缀。
+
+		checkpoint 可选:这一次真压过了就回调一次,参数是**当前这份**
+		messages —— 也就是活的那个列表对象,调用方必须立刻序列化落库,不能
+		留着,循环接着还会往它上面追加。所谓"真压过了"是拿压前压后的
+		fingerprint 比出来的,不是猜的:四档各自改没改只有它们自己知道,
+		加起来要数五处,将来加第六档就会漏一处,而漏掉的表现是"检查点少
+		存了几次",不报错。所以判断只写在下面这一处。
 		"""
+		before = self.fingerprint(messages) if checkpoint is not None else None
+
 		# 第 1 层:单轮一批太大 —— 把最大的几个落盘
 		messages = self.tool_result_budget(messages)
 		# 第 2 层:条数太多 —— 中段归档,只留头尾
@@ -649,5 +665,10 @@ class ContextCompactor:
 			# 累积到超线时,只有这儿接得住。
 			if self.estimate_chars(messages) > self.CONTEXT_CHAR_LIMIT:
 				messages = self.compact_history(messages, active_request)
+
+		# 位置在这儿是有讲究的:此刻 messages 停在完整回合的边界上(压缩就是
+		# 为了"发请求之前把它改小",所以只能切在那儿),正是能存检查点的位置。
+		if checkpoint is not None and self.fingerprint(messages) != before:
+			checkpoint(messages)
 		return messages
 	

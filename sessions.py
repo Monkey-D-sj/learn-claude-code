@@ -1,7 +1,18 @@
-"""会话库:SQLite 里三张表。
+"""会话库:SQLite 里几张表。
 
 本机自用,一个进程一个文件。这个模块只干"存取",不懂 agent —— 谁在
 什么时候调它,是 server.py 的事。
+
+现在有五个活着的对象:
+
+	sessions          会话本身
+	turns             一轮执行,状态机只有 running -> completed / failed
+	turn_messages     这一轮的原始消息,只追加、不修改
+	session_contexts  交给模型的那份工作上下文,整体重写
+	events            页面重放的流水账,只追加
+
+另有一张 messages:它的上下文职责已经交给 session_contexts,现在只是
+迁移前的备份,没人读也没人写(见 _MIGRATION_2)。
 
 三条贯穿全文件的规矩,每条都有理由:
 
@@ -18,25 +29,31 @@
 	会缺一段;进程被杀时队列里那截正好丢掉,丢的恰好是要保的东西。
 
 	代价是并发的正确性从"靠 SQLite 内部"变成"靠我们这把锁" —— 那把锁就
-	摆在文件里,看得到。它**只圈单条语句(毫秒级)**,序列化一律在锁外做完;
+	摆在文件里,看得到。它**只圈事务(毫秒级)**,序列化一律在锁外做完;
 	它绝不圈住 agent 循环,那是每会话一把锁的事,见 server.py。
 
-**二、messages 是镜像,events 是日志。**
-	messages 每轮**整体重写**。压缩器(context.py)随时可能把整个列表换成
-	别的形状 —— 中段归档、整体换摘要 —— 所以"往尾巴追加"这个模型在这里
-	根本不成立。真去按轮开始时的下标切片追加的话,压缩之后那个下标就失效
-	了,而且失效方式是静默的:切片可能切成空的,整轮凭空消失,不报错。
-	整体重写的代价有界:压缩器把消息压在 SNIP_MAX_MESSAGES 条以内。
+**二、turn_messages 是日志,session_contexts 是镜像。**
+	turn_messages 只追加、永不修改:它是"这一轮到底发生过什么"的原始
+	记录,一轮跑完再回头改它就等于篡改事实。
 
-	events 只追加、永不修改。它是页面重放的来源,重放出来必须跟当时屏幕上
-	发生过的一致 —— 所以库里存的就是发出去的那一份(包括工具输出那 4000
-	字符的截断,见 agent.py 的 clip_for_event)。库里存一份比页面更完整的
-	版本,只会让重放跟你记忆里那次对话对不上。
+	session_contexts 每轮**整体重写**。压缩器(context.py)随时可能把整个
+	列表换成别的形状 —— 中段归档、整体换摘要 —— 所以"往尾巴追加"这个
+	模型在这里根本不成立。真去按轮开始时的下标切片追加的话,压缩之后那个
+	下标就失效了,而且失效方式是静默的:切片可能切成空的,整轮凭空消失,
+	不报错。整体重写的代价有界:压缩器把消息压在 SNIP_MAX_MESSAGES 条以内。
 
-**三、热路径上的方法从不起异常。**
-	append_event / touch / append_message 的调用方是 emit 包装,而 emit 是
-	agent 循环调的 —— 那里没有 try,一条事件写不进去不该掀翻一整轮。
-	写不进去就返回 None,页面那边只是少一个用来去重的 seq。
+	两者是**分开**的,这正是这一版新增的东西:压缩只改镜像,日志一个字
+	不动。以前 messages 一张表兼职两件事,压一次原始记录就没了。
+
+	events 同样只追加、永不修改。它是页面重放的来源,重放出来必须跟当时
+	屏幕上发生过的一致 —— 所以库里存的就是发出去的那一份(包括工具输出
+	那 4000 字符的截断,见 agent.py 的 clip_for_event)。库里存一份比页面
+	更完整的版本,只会让重放跟你记忆里那次对话对不上。
+
+**三、方法分两档:读路径和轮末写路径会抛,热路径从不起异常。**
+	append_turn_message / append_event 的调用方是 record 和 emit 包装,而
+	它是 agent 循环调的 —— 那里没有 try,一条消息写不进去不该掀翻一整轮。
+	写不进去就返回 None 或打一行日志,页面上少一条而已。
 
 	读历史和轮末重写相反:那两个**要抛**。拿一份错误的上下文去跑一轮,
 	比停下来糟得多 —— 前者会拿着空历史去改用户的仓库。分档的理由跟
@@ -60,7 +77,7 @@ from pathlib import Path
 # bash 仍然删得掉(permission_hook 也拦不住,不该指望它拦),这个接受。
 DB_PATH = Path(__file__).resolve().parent / "sessions.db"
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # 每条一个语句,不写成一个大字符串走 executescript。
 # 理由:executescript 在遇到已挂起的事务时会先隐式 COMMIT —— 那会把
@@ -102,8 +119,102 @@ _MIGRATION_1 = (
 	"CREATE INDEX events_session ON events(session_id, id)",
 )
 
+
+def _backfill_contexts(conn) -> None:
+	"""把旧 messages 快照搬进 session_contexts。
+
+	旧 messages 存的本来就是"这一段对话的上下文"—— 每轮整体重写,id 顺序
+	就是当时的消息顺序。所以按 id 读出来原样就是一串合法 messages_json,
+	不用重建、也不能重建:它可能已经被压过,原文找不回来了。
+
+	version 固定 1:没有历史版本可继承。last_compacted_at 留空 —— 旧快照
+	压没压过无从判断,编不出一个时间。留空的意思是"不知道",不是"没压过",
+	将来别拿它当"这个会话没压过"用。
+	"""
+	grouped: dict[str, list] = {}
+	latest: dict[str, float] = {}
+	for session_id, message, created_at in conn.execute(
+			"SELECT session_id, message, created_at FROM messages"
+			" ORDER BY session_id, id"):
+		grouped.setdefault(session_id, []).append(json.loads(message))
+		latest[session_id] = max(latest.get(session_id, 0.0), created_at)
+
+	# 遍历 sessions 而不是上面那个分组:一条消息都没有的会话**也要**有一行。
+	# 少了的话 load_context 读不到行,会当成"这个会话没有上下文"—— 而
+	# "空上下文"和"迁移漏了"在那边长得一模一样。
+	for session_id, updated_at in conn.execute("SELECT id, updated_at FROM sessions"):
+		conn.execute(
+			"INSERT INTO session_contexts (session_id, messages_json, version,"
+			" updated_at, last_compacted_at) VALUES (?, ?, 1, ?, NULL)",
+			(session_id, json.dumps(grouped.get(session_id, []), ensure_ascii=False),
+			 latest.get(session_id, updated_at)))
+
+
+_MIGRATION_2 = (
+	# 一轮执行。状态机这一版只有三条边,CHECK 里就写这三种。
+	#
+	# created_at 兼作开始时间:创建即执行,没有排队阶段。以后有了 queued
+	# 再加 started_at 区分"收到"和"开始",那时这两个时间才不是一回事。
+	#
+	# turn_no 由本模块在一个事务里发号(见 begin_turn),UNIQUE 是兜底 ——
+	# 发号逻辑将来被改坏,至少不会静默地出现两个第 3 轮。
+	"""
+	CREATE TABLE turns (
+		id            TEXT PRIMARY KEY,
+		session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+		turn_no       INTEGER NOT NULL CHECK (turn_no > 0),
+		status        TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed')),
+		created_at    REAL NOT NULL,
+		updated_at    REAL NOT NULL,
+		finished_at   REAL,
+		error_message TEXT,
+		UNIQUE (session_id, turn_no),
+		CHECK ((status =  'running' AND finished_at IS NULL)
+		    OR (status <> 'running' AND finished_at IS NOT NULL))
+	)
+	""",
+
+	# 这一轮的原始消息。kind 是业务语义,role 是模型协议语义 —— Anthropic
+	# 协议里工具结果的 role 也是 user,所以**不能**只看 role 判断那条是不是
+	# 用户说的话。tool_use_id 留在 content_json 的内容块里,这一版不另建
+	# 工具执行表。
+	#
+	# content_json 里放的是该条消息在协议里的 content 原样:用户输入和
+	# control 是字符串,其余是内容块数组。
+	"""
+	CREATE TABLE turn_messages (
+		id           INTEGER PRIMARY KEY,
+		turn_id      TEXT NOT NULL REFERENCES turns(id) ON DELETE CASCADE,
+		message_no   INTEGER NOT NULL CHECK (message_no > 0),
+		kind         TEXT NOT NULL CHECK (kind IN (
+			'user_input', 'assistant_response', 'tool_result', 'control')),
+		role         TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+		content_json TEXT NOT NULL,
+		created_at   REAL NOT NULL,
+		UNIQUE (turn_id, message_no)
+	)
+	""",
+
+	# 一个会话一份,不是每次压缩一条历史。它保存的是"当前有效的模型上下文",
+	# 包括还没压过的那种 —— 想知道压没压过看 last_compacted_at,不是数行数。
+	#
+	# version 是快照版本(每存一次加一),不是压缩次数。
+	"""
+	CREATE TABLE session_contexts (
+		session_id        TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+		messages_json     TEXT NOT NULL,
+		version           INTEGER NOT NULL CHECK (version > 0),
+		updated_at        REAL NOT NULL,
+		last_compacted_at REAL
+	)
+	""",
+
+	_backfill_contexts,
+)
+
 # 下标 = 目标版本 - 1。加一次改动就往后接一个,并把 SCHEMA_VERSION 加一。
-MIGRATIONS = (_MIGRATION_1,)
+# 每一项里既可以是 SQL 字符串,也可以是拿 conn 的函数(要搬数据的那种)。
+MIGRATIONS = (_MIGRATION_1, _MIGRATION_2)
 
 
 def _block_json(obj):
@@ -135,8 +246,8 @@ class SessionStore:
 		# 默认(deferred)模式下,sqlite3 会在第一条 DML 时**隐式开一个事务**
 		# 并一直挂着,直到有人 commit()。而这里要的是"每条事件立刻落盘" ——
 		# 那个隐式事务会把整轮的写入全圈在里面,此刻 Ctrl+C 就丢光一整轮,
-		# 而且不报错。自动提交下这个状态根本不存在;需要原子性的两处
-		# (建库、轮末重写)显式 BEGIN IMMEDIATE。
+		# 而且不报错。自动提交下这个状态根本不存在;需要原子性的几处显式
+		# BEGIN IMMEDIATE。
 		#
 		# timeout=5.0 就是 busy_timeout:单连接只挡得住本进程,你用 sqlite3
 		# 命令行翻库、或者手滑起了第二个 server,都会撞上写锁。不加的话
@@ -176,8 +287,13 @@ class SessionStore:
 		for target in range(version + 1, SCHEMA_VERSION + 1):
 			conn.execute("BEGIN IMMEDIATE")
 			try:
-				for statement in MIGRATIONS[target - 1]:
-					conn.execute(statement)
+				for step in MIGRATIONS[target - 1]:
+					# 迁移里除了 DDL 还有要搬数据的,那种写成一个拿 conn 的
+					# 函数。仍然逐条执行、仍然不用 executescript,理由见上面。
+					if callable(step):
+						step(conn)
+					else:
+						conn.execute(step)
 				# PRAGMA 不能带参数占位符;target 是我们自己 range 出来的整数。
 				conn.execute(f"PRAGMA user_version = {target}")
 				conn.execute("COMMIT")
@@ -194,12 +310,29 @@ class SessionStore:
 		return row is not None
 
 	def create_session(self) -> dict:
+		"""建会话,连它的空上下文一起。
+
+		两件事一个事务:只有会话行、没有上下文行的话,load_context 读到
+		空,而"新会话还没聊过"和"上下文那一行丢了"就分不出来 —— 后者会
+		让旧历史静默消失,所以宁可在建的时候就把它钉死。
+		"""
 		now = time.time()
 		sid = uuid.uuid4().hex
 		with self._lock:
-			self._conn.execute(
-				"INSERT INTO sessions (id, title, created_at, updated_at)"
-				" VALUES (?, ?, ?, ?)", (sid, "", now, now))
+			conn = self._conn
+			conn.execute("BEGIN IMMEDIATE")
+			try:
+				conn.execute(
+					"INSERT INTO sessions (id, title, created_at, updated_at)"
+					" VALUES (?, ?, ?, ?)", (sid, "", now, now))
+				conn.execute(
+					"INSERT INTO session_contexts (session_id, messages_json,"
+					" version, updated_at, last_compacted_at)"
+					" VALUES (?, '[]', 1, ?, NULL)", (sid, now))
+				conn.execute("COMMIT")
+			except BaseException:
+				conn.execute("ROLLBACK")
+				raise
 		return {"id": sid, "title": "", "updated_at": now}
 
 	def list_sessions(self) -> list[dict]:
@@ -216,34 +349,67 @@ class SessionStore:
 		return [{"id": row[0], "title": row[1], "updated_at": row[2]}
 		        for row in rows]
 
-	def load_messages(self, sid: str) -> list:
-		"""这一轮的起点。读回来的是纯 dict —— assistant 的 content 也一样,
-		它原来是 SDK 的 pydantic 对象,落库时被 _block_json 转成了 dict。
+	def load_context(self, sid: str) -> list:
+		"""这一轮的起点:交给模型的那份工作上下文。
+
+		读回来的是纯 dict —— assistant 的 content 也一样,它原来是 SDK 的
+		pydantic 对象,落库时被 _block_json 转成了 dict。
 		"""
 		with self._lock:
-			rows = self._conn.execute(
-				"SELECT message FROM messages WHERE session_id = ? ORDER BY id",
-				(sid,)).fetchall()
-		return [json.loads(row[0]) for row in rows]
+			row = self._conn.execute(
+				"SELECT messages_json FROM session_contexts WHERE session_id = ?",
+				(sid,)).fetchone()
+		return json.loads(row[0]) if row else []
 
-	def replace_messages(self, sid: str, messages: list) -> None:
-		"""整体重写,不追加。理由见模块开头第二条。"""
-		now = time.time()
-		# 序列化(可能上百条、几毫秒)在锁外做完,锁里只放语句。
-		rows = [(sid, json.dumps(message, ensure_ascii=False, default=_block_json), now)
-		        for message in messages]
+	def list_turns(self, sid: str) -> dict:
+		"""这一页要的东西:会话里每一轮,连同它自己的原始消息。
+
+		三条 SELECT 放在一个读事务里,为的是那个 cursor。cursor 是"截到哪条
+		事件为止"的分界:页面拿它当起点,只画之后的新事件,而 turn_messages
+		里能画的东西恰好覆盖到它 —— 前提是三条读的是**同一个快照**。分开读
+		的话,中间落进来的那条消息会既不在 turns 里(读早了)、又因为 seq 太
+		小被跳过(读晚了),页面上凭空少一条工具结果。
+
+		另外约定:消息是先落库、再发事件(agent.py 里 record 在 emit 前面)。
+		所以 cursor 划到的事件,它对应的消息一定已经在 turn_messages 里了。
+		"""
 		with self._lock:
 			conn = self._conn
-			conn.execute("BEGIN IMMEDIATE")
+			conn.execute("BEGIN")
 			try:
-				conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
-				conn.executemany(
-					"INSERT INTO messages (session_id, message, created_at)"
-					" VALUES (?, ?, ?)", rows)
+				turns = conn.execute(
+					"SELECT id, turn_no, status, created_at, updated_at,"
+					" finished_at, error_message FROM turns"
+					" WHERE session_id = ? ORDER BY turn_no", (sid,)).fetchall()
+				messages = conn.execute(
+					"SELECT m.turn_id, m.message_no, m.kind, m.role,"
+					" m.content_json, m.created_at"
+					" FROM turn_messages m JOIN turns t ON t.id = m.turn_id"
+					" WHERE t.session_id = ? ORDER BY t.turn_no, m.message_no",
+					(sid,)).fetchall()
+				cursor = conn.execute(
+					"SELECT COALESCE(MAX(id), 0) FROM events WHERE session_id = ?",
+					(sid,)).fetchone()[0]
 				conn.execute("COMMIT")
 			except BaseException:
 				conn.execute("ROLLBACK")
 				raise
+
+		by_turn: dict[str, list] = {}
+		for turn_id, no, kind, role, content, created_at in messages:
+			by_turn.setdefault(turn_id, []).append({
+				"message_no": no, "kind": kind, "role": role,
+				"content": json.loads(content), "created_at": created_at,
+			})
+
+		return {
+			"turns": [{
+				"id": row[0], "turn_no": row[1], "status": row[2],
+				"created_at": row[3], "updated_at": row[4], "finished_at": row[5],
+				"error_message": row[6], "messages": by_turn.get(row[0], []),
+			} for row in turns],
+			"cursor": cursor,
+		}
 
 	def events_since(self, sid: str, since: int) -> list[tuple[int, dict]]:
 		"""取游标之后的事件,按 id 升序。返回 (id, event),id 就是新游标。"""
@@ -254,47 +420,163 @@ class SessionStore:
 		return [(row[0], json.loads(row[1])) for row in rows]
 
 	def delete_session(self, sid: str) -> None:
-		"""连带 messages / events 一起删 —— 靠 schema 里的 ON DELETE CASCADE,
-		而它要求连接上开着 PRAGMA foreign_keys(在 _migrate 里设了)。"""
+		"""连带 turns / turn_messages / session_contexts / events 一起删 ——
+		靠 schema 里的 ON DELETE CASCADE,而它要求连接上开着 PRAGMA
+		foreign_keys(在 _migrate 里设了)。
+
+		这里要小心的是 turn_messages:它只引用 turns,不直接引用 sessions,
+		所以删会话能不能删掉它是**间接**的(sessions -> turns -> turn_messages
+		两级)。少一级 CASCADE 就会留下一堆孤儿消息,而且不报错。
+		"""
 		with self._lock:
 			self._conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
 
-	# ---- 热路径:从不起异常 ----
+	def begin_turn(self, sid: str, query: str) -> dict:
+		"""开一轮:发一个 turn_no、建 running 的 Turn、存用户那条 Message、
+		把会话排到列表最前。四件事一个短事务。
 
-	def touch(self, sid: str, query: str) -> None:
-		"""把会话排到列表最前,首轮顺手补上 title。
+		发号必须在这个事务里:先查后插分成两个事务的话,两个请求可能拿到
+		同一个号,而 UNIQUE 只会让其中一个报错 —— 报错的那一刻用户的东西
+		已经丢了一半。BEGIN IMMEDIATE 一上来就拿写锁,查号到插入之间没有
+		别人能插进来。
 
-		一条 UPDATE 干两件事:CASE 由数据库保证原子。写成"先读 title、
-		判空、再写"就有竞态(两个请求同时判空),而这里没有值得为它加锁
-		的理由。
+		不另存"最近一条 title 是不是空的"状态:CASE 由数据库保证原子。
+		写成"先读 title、判空、再写"就有竞态(两个请求同时判空),而这里
+		没有值得为它加锁的理由。
 
 		title 不调模型:那是一次 API 调用、卡在关键路径上,为的是一个**已经
 		摆在眼前**的字符串。存 40 字,侧栏用 CSS 自己截。
+
+		这里**会抛**,而且调用点在发响应头之前 —— 写不进库就不该回 200,
+		否则页面上那一轮看着开跑了,库里一条记录都没有。
 		"""
+		now = time.time()
+		turn_id = uuid.uuid4().hex
 		title = " ".join(query.split())[:40]
-		try:
-			with self._lock:
-				self._conn.execute(
+		with self._lock:
+			conn = self._conn
+			conn.execute("BEGIN IMMEDIATE")
+			try:
+				turn_no = conn.execute(
+					"SELECT COALESCE(MAX(turn_no), 0) + 1 FROM turns"
+					" WHERE session_id = ?", (sid,)).fetchone()[0]
+				conn.execute(
+					"INSERT INTO turns (id, session_id, turn_no, status,"
+					" created_at, updated_at, finished_at, error_message)"
+					" VALUES (?, ?, ?, 'running', ?, ?, NULL, NULL)",
+					(turn_id, sid, turn_no, now, now))
+				# message_no=1 是用户那条。后面由 record 回调从 2 接着发。
+				conn.execute(
+					"INSERT INTO turn_messages (turn_id, message_no, kind, role,"
+					" content_json, created_at) VALUES (?, 1, 'user_input',"
+					" 'user', ?, ?)",
+					(turn_id, json.dumps(query, ensure_ascii=False), now))
+				conn.execute(
 					"UPDATE sessions SET updated_at = ?,"
 					" title = CASE WHEN title = '' THEN ? ELSE title END"
-					" WHERE id = ?", (time.time(), title, sid))
-		except sqlite3.Error as e:
-			print(f"[sessions] touch 没写成: {type(e).__name__}: {e}")
+					" WHERE id = ?", (now, title, sid))
+				conn.execute("COMMIT")
+			except BaseException:
+				conn.execute("ROLLBACK")
+				raise
+		return {"id": turn_id, "turn_no": turn_no, "status": "running"}
 
-	def append_message(self, sid: str, message: dict) -> None:
-		"""轮开始时把用户那条补上。
+	def save_context(self, sid: str, messages: list, compacted: bool = False) -> None:
+		"""中途存一个上下文检查点。压缩之后存,是给"这一轮跑到一半进程没了"
+		留的:那时下次读到的至少是压过的那份,不是压之前那份发不出去的。
 
-		它到轮末会被 replace_messages 一起重写掉,所以留着它只有一个目的:
-		进程在这一轮中途死掉时,至少还看得见用户问的是什么。
+		它**不是**本轮的唯一一次保存 —— 轮末还有一次(finish_turn),那次
+		才是权威的。所以调用方在这上面栽了不必掀翻整轮,见 server.py。
+		"""
+		now = time.time()
+		text = json.dumps(messages, ensure_ascii=False, default=_block_json)
+		with self._lock:
+			conn = self._conn
+			conn.execute("BEGIN IMMEDIATE")
+			try:
+				self._put_context(conn, sid, text, now, compacted)
+				conn.execute("COMMIT")
+			except BaseException:
+				conn.execute("ROLLBACK")
+				raise
+
+	def finish_turn(self, sid: str, turn_id: str, status: str,
+	                error_message: str | None, messages: list) -> None:
+		"""一轮收尾:最终 Context 和 Turn 终态**同一个事务**。
+
+		分两次写就有一个真实的窗口:本轮已经 completed,而库里那份上下文
+		还停在开轮时读到的样子 —— 用户接着问下一轮,模型拿到的历史里少了
+		刚跑完的这一整轮,而且不报错。
+
+		error_message 只在失败时有值:正常跑完那条路径传 None,别传空字符串
+		—— "没有错误原因"和"错误原因是空"在页面上是两回事。
+		"""
+		now = time.time()
+		text = json.dumps(messages, ensure_ascii=False, default=_block_json)
+		with self._lock:
+			conn = self._conn
+			conn.execute("BEGIN IMMEDIATE")
+			try:
+				# 轮末这一次不带 compacted:本轮压过的话,检查点那一次已经
+				# 把 last_compacted_at 写上了,这里再写一遍只会把它推后。
+				self._put_context(conn, sid, text, now, compacted=False)
+				# 条件更新:只有还在 running 的才收尾。这一版只有一个写者
+				# (攥着会话锁的那条线程),正常跑不到 0 行;真跑到了说明
+				# 有人已经把它写成终态 —— 那声张一声,别静默盖掉。
+				changed = conn.execute(
+					"UPDATE turns SET status = ?, finished_at = ?, updated_at = ?,"
+					" error_message = ? WHERE id = ? AND status = 'running'",
+					(status, now, now, error_message, turn_id)).rowcount
+				conn.execute("COMMIT")
+			except BaseException:
+				conn.execute("ROLLBACK")
+				raise
+		if not changed:
+			print(f"[sessions] turn {turn_id} 收尾时已经不是 running,状态没改")
+
+	@staticmethod
+	def _put_context(conn, sid: str, text: str, now: float, compacted: bool) -> None:
+		"""写工作上下文,version 加一。
+
+		用 upsert 而不是 UPDATE:UPDATE 打空行不报错,而这个文件里最怕的
+		就是"静默什么都没发生"。建会话时已经插过一行(version=1),这儿
+		正常走 conflict 那一支;真走 insert 那一支说明那一行没了,补上比
+		丢掉强。
+
+		last_compacted_at 走 COALESCE:没压过就保留上一次压的时间。直接写
+		NULL 的话,轮末这次保存会把"三分钟前压过"这个事实抹掉。
+		"""
+		conn.execute(
+			"INSERT INTO session_contexts (session_id, messages_json, version,"
+			" updated_at, last_compacted_at) VALUES (?, ?, 1, ?, ?)"
+			" ON CONFLICT(session_id) DO UPDATE SET"
+			"   messages_json = excluded.messages_json,"
+			"   version = session_contexts.version + 1,"
+			"   updated_at = excluded.updated_at,"
+			"   last_compacted_at = COALESCE(excluded.last_compacted_at,"
+			"                                session_contexts.last_compacted_at)",
+			(sid, text, now, now if compacted else None))
+
+	# ---- 热路径:从不起异常 ----
+
+	def append_turn_message(self, turn_id: str, message_no: int, kind: str,
+	                        role: str, content) -> None:
+		"""记一条原始消息。调用方是 record 回调,而它是 agent 循环调的 ——
+		那里没有 try,一条消息写不进去不该掀翻一整轮。
+
+		message_no 由调用方发(它是内存里数的),所以失败会留下一个空号。
+		允许空号:UNIQUE 只管不重复,而且这一版明确不重编号 —— 补号意味着
+		去改已经落库的邻居,那是另一回事。
 		"""
 		try:
-			text = json.dumps(message, ensure_ascii=False, default=_block_json)
+			text = json.dumps(content, ensure_ascii=False, default=_block_json)
 			with self._lock:
 				self._conn.execute(
-					"INSERT INTO messages (session_id, message, created_at)"
-					" VALUES (?, ?, ?)", (sid, text, time.time()))
+					"INSERT INTO turn_messages (turn_id, message_no, kind, role,"
+					" content_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+					(turn_id, message_no, kind, role, text, time.time()))
 		except Exception as e:
-			print(f"[sessions] 用户消息没落库: {type(e).__name__}: {e}")
+			print(f"[sessions] 轮次消息没落库: {type(e).__name__}: {e}")
 
 	def append_event(self, sid: str, event: dict) -> int | None:
 		"""落库一条事件,返回它的游标。写不进去返回 None,**不抛**。

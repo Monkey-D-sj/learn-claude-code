@@ -1,5 +1,6 @@
 import os
 import time
+from dataclasses import dataclass
 
 import anthropic
 from anthropic import Anthropic
@@ -98,6 +99,28 @@ def final_text(response) -> str:
 	return "".join(b.text for b in response.content if b.type == "text")
 
 
+@dataclass(frozen=True)
+class TurnOutcome:
+	"""一轮的结构化结果。
+
+	为什么不是直接返回一个字符串:调用方要拿它决定这一轮在库里记成
+	completed 还是 failed,而"失败"以前是靠**看返回的文本是不是以 Error
+	开头**判断的 —— 模型自己完全可能回一句以 Error 开头的话,那时正常
+	结束的一轮会被记成失败。这是"用字符串兼职状态",迟早要还。
+
+	status   "completed" / "failed",跟 turns.status 的取值一一对应
+	text     最后的文本回复,照旧是要显示给用户的那一句
+	error    失败原因;completed 时是 None(不是空字符串)
+	"""
+	status: str
+	text: str
+	error: str | None = None
+
+
+def _drop(kind: str, role: str, content) -> None:
+	"""没给 record 时的占位。终端前端和子 agent 没有会话库可记。"""
+
+
 # 工具结果往事件里塞多少。bash 的门槛是 400000 字符,原样发出去一条命令
 # 就能把页面冲垮。
 #
@@ -117,8 +140,9 @@ def clip_for_event(output: str) -> str:
 	        f"... [display truncated: {len(output)} chars total]")
 
 def agent_loop(messages: list, active_request: str, system: str, tools: list,
-               model: str, max_rounds: int, compactor, emit, ask) -> str:
-	"""跑一轮完整的 agent 循环,返回最后的文本回复。
+               model: str, max_rounds: int, compactor, emit, ask,
+               record=_drop, checkpoint=None) -> TurnOutcome:
+	"""跑一轮完整的 agent 循环,返回这一轮的结果(TurnOutcome)。
 
 	只负责机制。提示词、工具集、模型、轮数上限、压缩器都从外面传进来 ——
 	它不知道调用它的是主 agent 还是子 agent。
@@ -138,14 +162,25 @@ def agent_loop(messages: list, active_request: str, system: str, tools: list,
 	跑出什么、重试、上限。工具的日志、hook 的日志不归它管 —— 那些是
 	诊断信息,不是"agent 干了什么"。
 
-	它不发 reply:最后的文本仍然是返回值。这样调用方那句
-	print(agent_loop(...)) 一个字不用改,而且"返回什么"和"显示什么"
-	不会分家。
+	它不发 reply:最后的文本仍然是返回值里的一项。这样"返回什么"和
+	"显示什么"不会分家 —— 调用方拿 outcome.text 去显示,拿 outcome.status
+	去记终态,两者出自同一次判断。
 
 	ask 是"拿不准的时候问谁",签名 ask(question: str) -> bool。跟 emit 一样
 	必须注入:终端能 input(),浏览器不能 —— 写死一个全局的话,两个前端里
 	总有一个会在运行时卡住(浏览器那个没有 stdin)。它只被 permission_hook
 	用,子 agent 传的是"一律拒绝",理由见 tools/subagent.py。
+
+	record 是"这一轮产生了什么",签名 record(kind, role, content)。
+	只发给库的那一份,跟 emit 是两回事:emit 是**给屏幕看的**,会截断、
+	会漏掉没有 seq 的;record 是**存档**,一字不改。所以别想从 events
+	反推原始消息 —— 截断过的东西推不回去。默认是个空函数,终端和子 agent
+	不用记。
+
+	每一次 record 都安排在对应的 emit **前面**。这不是顺手:页面读轮次时
+	拿事件游标当分界(turns 接口返回的那个 cursor),反过来的话,卡在
+	两者中间的那次读会既没有这条消息、又已经跳过了它的事件 —— 页面上
+	凭空少一条工具结果,而且刷新也补不回来。
 	"""
 	handlers = {t.name: t.handler for t in tools}
 	wire = [t.to_wire() for t in tools]
@@ -160,7 +195,10 @@ def agent_loop(messages: list, active_request: str, system: str, tools: list,
 		if rounds >= max_rounds:
 			emit({"kind": "note", "source": f"round limit {max_rounds} reached",
 			      "text": ""})
-			return f"Stopped: round limit of {max_rounds} reached, task incomplete."
+			return TurnOutcome(
+				"failed",
+				f"Stopped: round limit of {max_rounds} reached, task incomplete.",
+				f"round limit of {max_rounds} reached")
 		rounds += 1
 		
 		# 发送前压缩。必须赶在 call_api 之前:上一轮的工具结果已经追加
@@ -177,8 +215,8 @@ def agent_loop(messages: list, active_request: str, system: str, tools: list,
 		# 下轮提问时整段工作凭空消失,而且不报错(连续两条 user 是合法的)。
 		#
 		# 切片赋值改的是原对象的内容,prepare 返回同一个还是新的都对。
-		messages[:] = compactor.prepare(messages, active_request)
-		
+		messages[:] = compactor.prepare(messages, active_request, checkpoint)
+
 		try:
 			response = call_api(
 				client,
@@ -190,18 +228,23 @@ def agent_loop(messages: list, active_request: str, system: str, tools: list,
 				max_tokens=8000,
 			)
 		except anthropic.APIError as e:
-			# 重试耗尽或不可重试:作为文本交回去,不让它掀翻整个会话。
-			# 调用方(REPL / 子 agent)拿到的是一个字符串,不是异常。
+			# 重试耗尽或不可重试:作为结果交回去,不让它掀翻整个会话。
+			# 调用方(REPL / 子 agent)拿到的是一个 TurnOutcome,不是异常。
 			#
 			# 根因必须带上 —— 光看外层那句话是分不出诊的,见 error_chain。
 			detail = f"{type(e).__name__}: {e}"
 			chain = error_chain(e)
 			if chain:
 				detail += f" <- {chain}"
-			return f"Error: API call failed: {detail}"
+			return TurnOutcome("failed", f"Error: API call failed: {detail}",
+			                   detail)
 		messages.append({
 			"role": "assistant", "content": response.content
 		})
+		# 完整响应一到就记。包括最后那条纯文本的回复 —— 它是"这一轮模型
+		# 说过的话"里最该留下的那一句,漏了它这一轮在库里就只剩工具。
+		# 只记这一次:轮末收尾不再补一条,否则同一句话会出现两遍。
+		record("assistant_response", "assistant", response.content)
 
 		# 推理内容往外发一份。
 		#
@@ -231,10 +274,13 @@ def agent_loop(messages: list, active_request: str, system: str, tools: list,
 		if not tool_calls:
 			force = trigger_hooks("Stop", messages)
 			if force:
-				# hook returned a message → inject it and continue
+				# hook 要它接着干:这不是"这一轮结束了",而是又塞了一条
+				# 用户消息进去。所以记的是 control,而且不返回 —— 返回了
+				# 这一轮就会以 completed 收尾,而它其实还没干完。
 				messages.append({"role": "user", "content": force})
+				record("control", "user", force)
 				continue
-			return final_text(response)
+			return TurnOutcome("completed", final_text(response))
 
 		results = []
 		used_todo = False
@@ -245,39 +291,37 @@ def agent_loop(messages: list, active_request: str, system: str, tools: list,
 			emit({"kind": "tool_call", "name": block.name, "input": block.input})
 			blocked = trigger_hooks("PreToolUse", block, ask)
 			if blocked:
-				results.append({
-					"type": "tool_result",
-					"tool_use_id": block.id,
-					"content": str(blocked),
-				})
-				emit({"kind": "tool_result", "name": block.name,
-				      "output": clip_for_event(str(blocked))})
-				continue
+				output = str(blocked)
+			else:
+				handler = handlers.get(block.name)
+				try:
+					output = handler(**block.input) if handler else f"error: unknown tool {block.name!r}"
+				except Exception as e:
+					output = f"Error: {type(e).__name__}: {e}"
+				trigger_hooks("PostToolUse", block, output)
+				used_todo = used_todo or block.name == "todo_write"
 
-			handler = handlers.get(block.name)
-			try:
-				output = handler(**block.input) if handler else f"error: unknown tool {block.name!r}"
-			except Exception as e:
-				output = f"Error: {type(e).__name__}: {e}"
-			trigger_hooks("PostToolUse", block, output)
-
-			if block.name == "todo_write":
-				used_todo = True
-
-			results.append({
+			# 两条路(被拦 / 跑完)在这儿合流,是为了让"记一条工具结果"
+			# 只写一处。写三处的话,将来加第四条路(比如超时)时漏掉一处
+			# 是不报错的:页面上少一条结果,而上下文里那条还在。
+			result = {
 				"type": "tool_result",
 				"tool_use_id": block.id,
 				"content": output,
-			})
+			}
+			results.append(result)
+			record("tool_result", "user", [result])
 			emit({"kind": "tool_result", "name": block.name,
 			      "output": clip_for_event(output)})
 
 		rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
 		if rounds_since_todo >= 3:
-			results.append({
+			reminder = {
 				"type": "text",
 				"text": "<reminder>Update your todos.</reminder>"
-			})
+			}
+			results.append(reminder)
+			record("control", "user", [reminder])
 			rounds_since_todo = 0
 
 		# Feed tool results back, loop continues

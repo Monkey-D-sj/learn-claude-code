@@ -58,7 +58,7 @@ def run_task(prompt: str) -> str:
 	sub_tools = [t for t in build_tools(TodoManager()) if t.name != "task"]
 
 	print("\n\033[35m[Subagent started]\033[0m")
-	return agent_loop(
+	outcome = agent_loop(
 		[{"role": "user", "content": prompt}],
 		active_request=prompt,
 		system=SYSTEM,
@@ -69,6 +69,13 @@ def run_task(prompt: str) -> str:
 		ask=_deny_all,
 		emit=terminal_emit,
 	)
+	# 工具 handler 只能回字符串,所以 TurnOutcome 到这儿要摊平。失败必须
+	# 说出来:主 agent 看不到子 agent 的中间过程,它唯一的信息源就是这段
+	# 返回文本。"跑了一半就停下"和"干完了"给出的结论长得一样的话,主 agent
+	# 会拿着一个半成品当结果往下做。
+	if outcome.status == "failed":
+		return f"[subagent failed: {outcome.error}]\n{outcome.text}"
+	return outcome.text
 
 
 task = ToolDesc(

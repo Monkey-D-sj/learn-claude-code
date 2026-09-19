@@ -4,11 +4,14 @@
 进程重启;每个会话一把锁,所以几个会话可以同时跑,也可以切走、切回来
 接着看。
 
-七个端点:
+八个端点:
 
     GET  /                        页面
     GET  /sessions                会话列表(带上"在跑"和"在等你确认")
-    GET  /session/<id>/events     重放。?since=<游标> 增量拉,省略即全量
+    GET  /session/<id>/turns      轮次 + 每轮的原始消息,外加事件游标 cursor ——
+                                  刷新页面时重建轮次展示走这条,不走事件重放
+    GET  /session/<id>/events     重放。?since=<游标> 增量拉,省略即全量;
+                                  ?legacy=1 只要没有 turn_id 的那些(旧版记录)
     POST /session                 建会话
     POST /session/<id>/delete     删会话
     POST /ask                     请求体是 JSON {"session": "...", "query": "..."},
@@ -30,10 +33,17 @@ flush",所以不需要队列、不需要第二个线程。一个请求一个线�
 由连接关闭来标记,浏览器那边读到 EOF 就是本轮结束。发 Content-Length
 就得先把整轮跑完才知道长度,那就没有流了。
 
-**两张表的分工**(细节见 sessions.py):events 是流水账,重放页面用的,
-写进去就不再改;messages 是快照,每轮整体重写,因为压缩器会把它换成
-别的形状。**页面上看到的那一份就是 events 里存的那一份** —— 重放出来
-必须跟你记忆里那次对话一致,所以库里不存"更完整"的版本。
+**几张表的分工**(细节见 sessions.py):events 是流水账,重放页面用的,
+写进去就不再改;turn_messages 是这一轮的原始消息,只追加;而
+session_contexts 是给模型的那份工作上下文,每轮整体重写 —— 压缩器随时
+会把它换成别的形状。**页面上看到的那一份就是 events 里存的那一份** ——
+重放出来必须跟你记忆里那次对话一致,所以库里不存"更完整"的版本。
+
+**一轮的生命周期**(`_run_turn`):开轮时建 Turn + 存用户那条(一个短事务),
+跑的过程中 record 回调逐条记原始消息、emit 逐条落事件,收尾时把最终
+上下文和 Turn 终态**放在同一个事务**里 —— 分两次写的话,先完成、后存
+上下文中间那个窗口里,下一轮会读到少了一整轮的历史,而且不报错。
+数据库事务一律不包住模型请求和工具执行。
 
 **两把锁,别搞混:**
 
@@ -47,11 +57,12 @@ flush",所以不需要队列、不需要第二个线程。一个请求一个线�
 import json
 import threading
 import uuid
+from itertools import count
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from agent import agent_loop
+from agent import TurnOutcome, agent_loop
 from app import MODEL, SYSTEM, make_compactor
 from config import MAX_ROUNDS
 from context import ContextCompactor
@@ -187,22 +198,42 @@ def emit_quietly(emit, event: dict) -> bool:
 		return False
 
 
-def recording_emit(sid: str, emit):
-	"""先落库,再进流。事件带上库给的游标 seq。
+def recording_emit(sid: str, emit, turn: dict):
+	"""先落库,再进流。事件带上库给的游标 seq,以及它属于哪一轮。
 
 	seq 是给页面去重用的:同一条事件可能从两条路到达(直播流、切回来时的
 	重放或轮询),两边各画一次就会重复。有了只增的 seq,页面一条规则
 	(画过的不再画)就管住了,不用在两边各写一套状态机。
 
+	turn_id/turn_no 是给页面**分组**用的:这一轮的内容要落进同一个轮次
+	容器。turn_no 也一起带上,是因为轮询可能先收到这一轮的第二条事件 ——
+	页面那时得能凭空把容器建出来,而容器的标题就是轮号。
+
 	**不原地改**传进来的那个 event:那是替调用方改数据。谁下次重用同一个
 	dict,就会带上上一次的 seq。
 	"""
 	def wrapped(event: dict) -> None:
+		event = {**event, "turn_id": turn["id"], "turn_no": turn["turn_no"]}
 		seq = STORE.append_event(sid, event)
 		if seq is not None:
 			event = {**event, "seq": seq}
 		emit(event)
 	return wrapped
+
+
+def make_recorder(turn_id: str):
+	"""造一个"记一条原始消息"的回调,交给 agent 循环。
+
+	turn_id 由服务端绑死在这儿,循环那头只管说"产生了什么" —— 它不知道
+	自己在哪个会话、第几轮,也不该知道。
+
+	message_no 从 2 开始:1 是用户那条,建轮的时候已经写进去了(begin_turn)。
+	号是内存里数的,写失败会留下空号 —— 允许,这一版明确不重编号。
+	"""
+	counter = count(2)
+	def record(kind: str, role: str, content) -> None:
+		STORE.append_turn_message(turn_id, next(counter), kind, role, content)
+	return record
 
 
 def quiet(emit):
@@ -234,35 +265,45 @@ ASK_TIMEOUT = 300.0
 # 而人的回答从另一条连接(POST /answer)进来 —— 两条线程之间没有别的
 # 交汇点。Event 负责"停",allow 负责"答案"。
 #
-# 槽里记着 session 只是为了 /sessions 能报出"哪个会话在等你确认"。
+# 槽里记着 session 只是为了 /sessions 能报出"哪个会话在等你确认",
+# 记 question/turn_id 是为了 /turns 能把它补回去(见 _get_turns)。
 # 认槽始终只看 rid —— 它就是那张能力凭证,/answer 不需要知道会话。
 PENDING: dict[str, dict] = {}
 
 
-def make_ask(emit, sid: str):
+def make_ask(emit, sid: str, turn_id: str, record):
 	"""造一个把问题推给浏览器、然后挂起等回答的确认器。
 
 	和 emit 一样按请求建:它绑在那条响应流上,而流是每请求一条。这也正好
 	对应"一轮只有一个确认在飞"——同一轮里工具是顺序跑的。
 
 	超时和断连都算拒绝,不放行:否则"关掉页面"就成了提权手段。
+
+	record 是记原始消息的那个回调。确认本身不是消息,但**这个决定要记**:
+	不记的话,刷新之后这一轮的记录里就完全看不出"它当时问过你、你是怎么
+	答的",而这恰恰是回头看时最想知道的一件事(比如那个要读仓库外面文件
+	的调用,你到底放没放行)。
 	"""
 	def ask(question: str) -> bool:
 		rid = uuid.uuid4().hex
-		slot = {"event": threading.Event(), "allow": False, "session": sid}
+		slot = {"event": threading.Event(), "allow": False, "session": sid,
+		        "question": question, "turn_id": turn_id}
 		PENDING[rid] = slot
 		try:
 			if not emit_quietly(emit, {"kind": "ask", "id": rid,
 			                           "question": question}):
-				return False          # 流已经断了,没人能回答
-			if not slot["event"].wait(ASK_TIMEOUT):
+				verdict = "流已经断了,没人能回答,按拒绝处理"
+			elif not slot["event"].wait(ASK_TIMEOUT):
 				emit_quietly(emit, {"kind": "note", "source": "permission",
 				                    "text": f"no answer in {ASK_TIMEOUT:.0f}s, denied"})
-				return False
-			return slot["allow"]
+				verdict = f"等满 {ASK_TIMEOUT:.0f}s 没人回答,按拒绝处理"
+			else:
+				verdict = "已允许" if slot["allow"] else "已拒绝"
 		finally:
 			# 无论哪条路径出去都要清,不然 PENDING 会一直涨。
 			PENDING.pop(rid, None)
+		record("control", "user", f"[permission] {question} → {verdict}")
+		return slot["allow"]
 	return ask
 
 
@@ -334,6 +375,8 @@ class Handler(BaseHTTPRequestHandler):
 			self._get_sessions()
 		elif len(parts) == 3 and parts[0] == "session" and parts[2] == "events":
 			self._get_events(parts[1], query)
+		elif len(parts) == 3 and parts[0] == "session" and parts[2] == "turns":
+			self._get_turns(parts[1])
 		else:
 			self.send_error(404)
 
@@ -359,6 +402,37 @@ class Handler(BaseHTTPRequestHandler):
 			for row in STORE.list_sessions()
 		]})
 
+	def _get_turns(self, sid: str):
+		"""这一页要的东西:每一轮,连同它自己的原始消息。
+
+		刷新之后轮次展示走这条,不走事件重放 —— 事件是过程(工具在跑、
+		重试、旁注),而轮次要的是"问的是什么、答的是什么、调了什么工具",
+		那些在 turn_messages 里是完整的。两边都画一遍就得写一套去重规则,
+		而这种规则迟早会漏。
+
+		返回里带一个 cursor:它是"截到哪条事件为止"。页面拿它当起点,只画
+		之后的新事件,于是刷新前后不会重画同一批东西。
+		"""
+		if not STORE.session_exists(sid):
+			self.send_error(404, "no such session")
+			return
+		payload = STORE.list_turns(sid)
+		payload["running"] = is_running(sid)
+		# 挂起中的确认要一起给。它是**唯一**没法从库里重建的东西:ask 不是
+		# 一条消息,库里没有它,而页面拿到的 cursor 已经越过它那条事件了 ——
+		# 不补这一下,刷新之后页面上就没有那个按钮,而 agent 那头正挂在
+		# 上面等满 300 秒然后按拒绝往下走。
+		#
+		# 别的直播事件都不用补:thinking / tool_call / 工具输出都能在
+		# turn_messages 里找到,旁注(retry、压缩)丢了也不影响读。
+		with REGISTRY:
+			payload["pending"] = [
+				{"kind": "ask", "id": rid, "question": slot["question"],
+				 "turn_id": slot["turn_id"]}
+				for rid, slot in list(PENDING.items()) if slot["session"] == sid
+			]
+		self._send_json(payload)
+
 	def _get_events(self, sid: str, query: dict):
 		"""重放。库里的 events 就是页面当时渲染过的那一份,一条条喂回去即可。"""
 		if not STORE.session_exists(sid):
@@ -375,8 +449,18 @@ class Handler(BaseHTTPRequestHandler):
 			self.send_error(400, "since must be a non-negative integer")
 			return
 
+		# 旧版记录 = 这一版之前留下的、不带 turn_id 的事件。它们只能靠重放
+		# 画出来(那会儿还没有 turn_messages 可读),而新的事件都由轮次
+		# 接口负责,重放一遍就是重复。
+		#
+		# 在服务端筛而不是把全部事件推给页面让它自己挑:这个参数的存在
+		# 意味着页面本来就不该看见那些。
+		legacy_only = query.get("legacy", ["0"])[0] == "1"
+
 		events = []
 		for seq, stored in STORE.events_since(sid, since):
+			if legacy_only and stored.get("turn_id"):
+				continue
 			event = {**stored, "seq": seq}
 			if event.get("kind") == "ask":
 				# 这条确认**可能还活着**:切走再切回来时那一轮还在跑,
@@ -484,17 +568,22 @@ class Handler(BaseHTTPRequestHandler):
 			lock.release()
 
 	def _run_turn(self, sid: str, query: str):
-		"""跑一轮。全程攥着这个会话的锁(由 _post_ask 拿着并负责释放)。"""
-		# 读历史放在发响应头之前:读不出来还能回一个干净的状态码,而不是
-		# 已经 200 了才发现手里没有上下文。
+		"""跑一轮。全程攥着这个会话的锁(由 _post_ask 拿着并负责释放)。
+
+		整段的顺序是:读上下文 + 开轮(都在发响应头之前)、跑循环、收尾。
+		两头那两个数据库动作是短的,中间跑模型和工具的那段一个事务都不开。
+		"""
+		# 读历史 + 开轮放在发响应头之前:这两件事任一失败还能回一个干净的
+		# 状态码,而不是已经 200 了才发现手里没有上下文、库里也没有这一轮。
 		#
 		# 每轮都从库里读,不在内存里留一份。看着像浪费(几十毫秒),其实是
 		# 拿它换掉"内存那份和库里那份什么时候会不一致"这个问题 —— 而那个
 		# 问题一旦存在,答案就是"在你想不到的时候"。顺带,重启存活是免费的。
 		try:
-			history = STORE.load_messages(sid)
+			history = STORE.load_context(sid)
+			turn = STORE.begin_turn(sid, query)
 		except Exception as e:
-			self.send_error(500, f"cannot load session: {e}")
+			self.send_error(500, f"cannot start turn: {type(e).__name__}: {e}")
 			return
 
 		self.send_response(200)
@@ -506,47 +595,76 @@ class Handler(BaseHTTPRequestHandler):
 		raw = ndjson_emit(self.wfile)
 		# emit 落库 + 进流;交给循环的那份是安静版(页面走了也不掀翻这一轮)。
 		# make_ask 拿的必须是不安静的那份,理由见 quiet() 的注释。
-		emit = recording_emit(sid, raw)
+		emit = recording_emit(sid, raw, turn)
 		silent = quiet(emit)
+		record = make_recorder(turn["id"])
 
-		trigger_hooks("UserPromptSubmit", query)
-		history.append({"role": "user", "content": query})
-
-		# 用户这条和 title 先落地:会话立刻出现在侧栏里,而且这一轮就算
-		# 中途崩了,至少留着"问的是什么"。轮末会被整体重写覆盖掉。
-		STORE.touch(sid, query)
-		STORE.append_message(sid, history[-1])
-		emit({"kind": "you", "text": query})
-
+		# 兜底那份:正常路径下会被覆盖。事先摆一个失败,是为了万一控制流
+		# 以预料之外的方式跳出去,收尾时手里也有个说得通的终态,而不是
+		# NameError —— 那会让这一轮永远停在 running。
+		outcome = TurnOutcome("failed", "", "这一轮没有跑完")
 		try:
-			reply = agent_loop(history,
-			                   active_request=query,
-			                   system=SYSTEM,
-			                   tools=build_tools(todo_for(sid)),
-			                   model=MODEL,
-			                   max_rounds=MAX_ROUNDS,
-			                   compactor=make_compactor(silent),
-			                   ask=make_ask(emit, sid),
-			                   emit=silent)
-			emit_quietly(emit, {"kind": "reply", "text": reply})
+			trigger_hooks("UserPromptSubmit", query)
+			# 用户那条 begin_turn 已经写进 turn_messages 了(它是开轮那个
+			# 短事务的一部分);这里只把它接到要发给模型的上下文尾巴上。
+			history.append({"role": "user", "content": query})
+			# 这一条走安静版:页面正好在这时关掉的话,不安静的那版会抛
+			# OSError,把整轮带走 —— 而"切走了照跑"要的正好相反。
+			emit_quietly(emit, {"kind": "you", "text": query})
+
+			outcome = agent_loop(history,
+			                     active_request=query,
+			                     system=SYSTEM,
+			                     tools=build_tools(todo_for(sid)),
+			                     model=MODEL,
+			                     max_rounds=MAX_ROUNDS,
+			                     compactor=make_compactor(silent),
+			                     ask=make_ask(emit, sid, turn["id"], record),
+			                     emit=silent,
+			                     record=record,
+			                     checkpoint=lambda messages: self._checkpoint(sid, messages, emit))
 		except Exception as e:
 			# 兜底:异常不该把 history 一起带走,也不该让流断在半截
-			# 而没有下文 —— 前端会一直转圈。
-			emit_quietly(emit, {"kind": "reply",
-			                    "text": f"Error: {type(e).__name__}: {e}"})
+			# 而没有下文 —— 前端会一直转圈。这一轮记 failed。
+			outcome = TurnOutcome("failed", f"Error: {type(e).__name__}: {e}",
+			                      f"{type(e).__name__}: {e}")
 		finally:
 			dropped = trim_dangling_tool_use(history)
 			if dropped:
 				emit_quietly(emit, {"kind": "note", "source": "round",
 				                    "text": f"这一轮被打断,{dropped} 条没有结果的消息没有存"})
 			try:
-				STORE.replace_messages(sid, history)
+				# 最终上下文和 Turn 终态同一个事务。分两次写的话,中间那个
+				# 窗口里下一轮会读到少了一整轮的历史,而且不报错。
+				STORE.finish_turn(sid, turn["id"], outcome.status, outcome.error,
+				                  history)
 			except Exception as e:
 				# 这一轮没存上,用户必须知道(刷新会退回上一轮)。流可能已经
 				# 断了,所以走 emit_quietly —— 库里那条 note 照样落得下。
 				emit_quietly(emit, {"kind": "note", "source": "store",
 				                    "text": f"这一轮的上下文没存上(刷新会退回上一轮): "
 				                            f"{type(e).__name__}: {e}"})
+
+		# reply 排在收尾**之后**发。反过来的话,页面收到 reply 时库里的
+		# status 还是 running,而它的游标已经越过这条事件 —— 刷新也补不
+		# 回来,那一轮会一直显示"运行中"。
+		emit_quietly(emit, {"kind": "reply", "text": outcome.text,
+		                    "status": outcome.status})
+
+	def _checkpoint(self, sid: str, messages: list, emit) -> None:
+		"""压缩器压过之后存一个上下文检查点。
+
+		存不上**不掀翻这一轮**:轮末那次保存(finish_turn)才是权威的,而且
+		它存的是同一个 messages——压过的形状已经在内存里了。为一次中途的
+		检查点把整轮判失败,损失比它想避免的大。但也不能一声不吭:那意味着
+		"进程现在死掉会退回压缩前那份",用户该知道。
+		"""
+		try:
+			STORE.save_context(sid, messages, compacted=True)
+		except Exception as e:
+			emit_quietly(emit, {"kind": "note", "source": "store",
+			                    "text": f"压缩后的上下文没存上(进程现在退出会退回压缩前那份): "
+			                            f"{type(e).__name__}: {e}"})
 
 	def log_message(self, fmt, *args):
 		# 默认实现往 stderr 打一行每个请求。前端本来就是终端,不需要它

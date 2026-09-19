@@ -36,15 +36,21 @@ if __name__ == "__main__":
 		trigger_hooks("UserPromptSubmit", query)
 		history.append({"role": "user", "content": query})
 		try:
-			print(agent_loop(history,
-			                 active_request=query,
-			                 system=SYSTEM,
-			                 tools=TOOLS,
-			                 model=MODEL,
-			                 max_rounds=MAX_ROUNDS,
-			                 compactor=COMPACTOR,
-			                 ask=terminal_ask,
-			                 emit=terminal_emit))
+			outcome = agent_loop(history,
+			                     active_request=query,
+			                     system=SYSTEM,
+			                     tools=TOOLS,
+			                     model=MODEL,
+			                     max_rounds=MAX_ROUNDS,
+			                     compactor=COMPACTOR,
+			                     ask=terminal_ask,
+			                     emit=terminal_emit)
+			print(outcome.text)
+			# 终端这边不记库,"失败了"就没有第二个人知道 —— 得自己说。
+			# 不说的话,轮数耗尽和一次正常回复在屏幕上长得一模一样,
+			# 下一句提问还会接着一个其实没干完的上下文往下走。
+			if outcome.status == "failed":
+				print(f"\033[31m[这一轮没跑完: {outcome.error}]\033[0m")
 		except Exception as e:
 			# 兜底:任何异常都不该把 history 一起带走
 			print(f"\033[31mError: {type(e).__name__}: {e}\033[0m")
