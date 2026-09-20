@@ -1283,13 +1283,12 @@ function renderThinking(ev) {
 
 // ---- 正在流的那一块 ----
 //
-// 模型吐字的时候,文字是一片片到的(服务端发的 delta,见 agent.py 的
-// delta_of)。它们**不落库**,所以只可能从直播流来 —— 也就永远不会被重放
-// 一遍,不需要 seq 那套去重,每一条都该往同一个节点里追加。
+// 文字是一片片到的(服务端的 delta)。它们**不落库**,所以只可能从直播流
+// 来,永远不会被重放 —— 那条去重规则对它们不适用,每一条都得往同一个
+// 节点里追加。
 //
-// 键是"哪一轮的哪种块":正文和推理各一个。同一轮里会有好几个推理块(每次
-// API 调用一个),所以完整的那条一到,就把这一块**整块换掉**再从表里删掉
-// —— 下一片碎片来了自然另起一块。
+// 键是"哪一轮的哪种块"。同一轮里会有好几个推理块(每次 API 调用一个),
+// 所以完整的那条一到就把这块换掉、从表里删掉,下一片自然另起一块。
 const LIVE = new Map();
 
 function liveBlock(ev) {
@@ -1334,6 +1333,9 @@ function settleLive(turnId, target, fresh) {
   LIVE.delete(key);
   if (!node) return false;
   node.replaceWith(fresh);
+  // 换完跟一次:纯文本换成排好版的成品,高度会变(段落间距、代码块、表格),
+  // 不跟的话人在底部反而被留在半空 —— 而这一步才是"消息出来了"。
+  follow();
   return true;
 }
 
@@ -1345,8 +1347,7 @@ function render(ev) {
   else if (!turn) turn = newSection();
 
   if (ev.kind === "delta") {
-    // 碎片不带 seq(它们不落库),上面那道去重拦不住 —— 这正是要的:
-    // 每一条碎片都得画。
+    // 碎片没有 seq(见上面 LIVE 那段),那道去重拦不住它们 —— 这正是要的。
     streamDelta(ev);
     return;
   }

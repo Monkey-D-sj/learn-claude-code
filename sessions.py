@@ -14,20 +14,15 @@
 三条贯穿全文件的规矩,每条都有理由:
 
 **一、单连接 + 一把锁,不是每个线程一个连接。**
-	sqlite3 连接默认 check_same_thread=True,而服务端是每请求一个线程
-	(ThreadingHTTPServer)。三条路(per-thread 连接 / 单连接加锁 / 专用
-	写线程)在这里性能都是噪声,决定因素是别的:
+	服务端是每请求一个线程(ThreadingHTTPServer),而 sqlite3 连接默认
+	check_same_thread=True。选单连接的理由是 PRAGMA 的作用域:busy_timeout
+	和 foreign_keys 是**每连接**的,每线程一个连接就得记得每个都设一遍,
+	漏掉一次不报错,只是行为慢慢不一样。专用写线程也不行 —— 它把"已经
+	发给页面但还没进库"变成一个真实状态,进程被杀时丢的恰好是要保的东西。
 
-	per-thread 连接的问题在 PRAGMA 的作用域。journal_mode 写进文件、设一次
-	就够,但 busy_timeout 和 foreign_keys 是**每连接**的 —— 每线程一个连接
-	意味着"记得在每个连接上都设一遍",而漏掉一次不报错,只是行为慢慢不
-	一样。收在一个 _setup() 里就没有这条岔路。
-	专用写线程则是把"已经发给页面了但还没进库"变成一个真实状态,读回来
-	会缺一段;进程被杀时队列里那截正好丢掉,丢的恰好是要保的东西。
-
-	代价是并发的正确性从"靠 SQLite 内部"变成"靠我们这把锁" —— 那把锁就
-	摆在文件里,看得到。它**只圈事务(毫秒级)**,序列化一律在锁外做完;
-	它绝不圈住 agent 循环,那是每会话一把锁的事,见 server.py。
+	代价是并发的正确性从"靠 SQLite 内部"变成"靠我们这把锁"。它**只圈事务
+	(毫秒级)**,序列化一律在锁外做完;绝不圈住 agent 循环 —— 那是每会话
+	一把锁的事,见 server.py。
 
 **二、turn_messages 是日志,session_contexts 是镜像。**
 	turn_messages 只追加、永不修改:它是"这一轮到底发生过什么"的原始
@@ -81,10 +76,8 @@ SCHEMA_VERSION = 3
 # 理由:executescript 在遇到已挂起的事务时会先隐式 COMMIT —— 那会把
 # 迁移外面那个 BEGIN IMMEDIATE 拆掉,原子性就没了。逐条 execute 不会。
 #
-# 这一份就是整个库的最终形状:建会话、事件、轮次、原始消息、工作上下文,
-# 五张表一次建齐。以前分两条(v1 建前两张,v2 建后三张),现在并成一条 ——
-# 没有需要逐级升级的老库,分开只让读的人多跳一次。
-# 以后加改动照旧往后接一条,并把 SCHEMA_VERSION 加一。
+# v1 是基线:五张表一次建齐。后面两条只往上加列 —— 那两条分着写,是因为
+# v2 已经落在一个跑着的库上了,改它的正文对那个库没用。
 _MIGRATION_1 = (
 	"""
 	CREATE TABLE sessions (
@@ -242,11 +235,8 @@ class SessionStore:
 	def _tx(self, immediate: bool = True):
 		"""一个事务的进出场:拿锁、BEGIN、COMMIT,出错 ROLLBACK 再抛。
 
-		六个调用点原先各抄一遍这七行。收在这里之后,"锁只圈事务"这条规矩
-		只有一处可改 —— 它正是文件头第一条要守的东西。
-
-		COMMIT 留在 try 里面是照抄原来的形状:它自己失败(比如磁盘满)时也
-		该试着回滚一次,而不是把半开的事务留在连接上,让下一个 BEGIN 撞上
+		COMMIT 留在 try 里面是有意的:它自己失败(比如磁盘满)时也该试着
+		回滚一次,而不是把半开的事务留在连接上,让下一个 BEGIN 撞上
 		"cannot start a transaction within a transaction"。
 
 		immediate=False 给 list_turns:它要的是三条 SELECT 落在同一个快照
@@ -272,7 +262,7 @@ class SessionStore:
 		conn = self._conn
 		# journal_mode 写进文件,设一次就够。WAL 让读者不被写者挡 ——
 		# 重放一条上千事件的会话时,正在跑的那一轮不用停下来。
-		# synchronous 和 foreign_keys 是每连接的,所以必须在 _setup 里设。
+		# synchronous 和 foreign_keys 是每连接的 —— 单连接只要在这儿设一次。
 		conn.execute("PRAGMA journal_mode = WAL")
 		# NORMAL:WAL 下 FULL 是每次 commit 都 fsync,一轮上百条事件就是
 		# 上百次 fsync,Windows 上能拖出半秒。代价是"断电可能丢最后几条",
