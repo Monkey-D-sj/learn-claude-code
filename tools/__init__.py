@@ -9,6 +9,7 @@ from tools.read import read_file
 from tools.skill import skill
 from tools.subagent import task
 from tools.todo import TodoManager, make_todo_write
+from tools.vision import vision
 from tools.write import write_file
 
 # 除了 todo_write 和 ask,其余工具都是无状态的,可以全进程共用一份。
@@ -19,7 +20,7 @@ from tools.write import write_file
 #
 # 所以它俩现造,由 build_tools 挂在后面。
 BASE_TOOLS = [
-	bash, read_file, write_file, edit_file, glob, grep, skill,
+	bash, read_file, write_file, edit_file, glob, grep, skill, vision,
 	memory_tool, user_memory_tool, task,
 ]
 

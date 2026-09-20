@@ -15,7 +15,10 @@ DENY_LIST = [
 	"mkfs", "dd if=", "> /dev/sda",
 ]
 
-FILE_TOOLS = ("read_file", "write_file", "edit_file")
+# 四个都是"拿一个路径去碰文件系统"的。vision 也算 —— 它读文件,所以拿
+# "../.." 去够 WORKDIR 外面的图跟 read_file 是一回事。漏了它就是个洞,
+# 而且不报错。
+FILE_TOOLS = ("read_file", "write_file", "edit_file", "vision")
 
 
 def permission_hook(block, ask):

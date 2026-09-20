@@ -89,6 +89,7 @@ python server.py     # 然后打开 http://localhost:8765/
 | `skill` | 按名字加载一份技能正文 |
 | `memory` | 项目级记忆:这个仓库的约定和坑。`add` / `remove` / `update` |
 | `user_memory` | 用户级记忆:你这个人的喜好和习惯。同上三个动作 |
+| `vision` | 看一眼图片(PNG/JPEG/GIF/WebP),答一个关于它的问题。图不进上下文 |
 | `ask` | 问用户一个问题,等他的回答。可以带一组选项,页面上画成按钮 |
 | `task` | 派一个子 agent,独立上下文,只回结论 |
 
@@ -217,6 +218,24 @@ Facts and preferences from earlier sessions, fixed when this session started. Ba
 决定记不记。
 
 ## 几个设计取舍
+
+**图不进对话,就地消化。** `vision` 把图读进来、就地调一次模型、只把文字交回
+去 —— 图片本身从不进主上下文。模型自己看得见图(实测:一张 153 KB 的 jpg
+才 667 输入 token,冰晶瞳孔、精灵耳、额头宝石全说对了),所以这不是"能不能"
+的问题,是那把**尺子**的问题。
+
+`context.py` 量上下文用的是 `fingerprint()` 的**字符数**,而 base64 也是字符。
+同一张图 base64 后 20 万字符,`CONTEXT_CHAR_LIMIT` 是 50000 —— **一张图就是
+上限的四倍**。实测过:压缩器第一轮就把它换成一句指针,**图没了**,而且"落盘"
+的那份是 `str(list)` 出来的 Python repr,永远发不回 API。
+
+token 那头一点事没有,出问题的只有那把尺子。要让图进对话,得先教会
+`fingerprint` / `tool_result_budget`(别把 base64 当字符)和 `micro_compact` /
+`fit_tool_results`(别对块列表做 `str()`)这四件事,而它们**改错了都是静默
+毁历史**。在那之前,图一律就地消化。
+
+代价:图不留在上下文里,所以同一个问题再问一次就得再调一次(重复那 667
+token)。`vision` 的说明里对模型明说了,它想一次问全就会一次问全。
 
 **两个 ask 不是一个。** `agent_loop(..., ask=...)` 那个是**权限确认器**:
 harness 拦下一次工具调用时问人,签名 `ask(question) -> bool`,答案是放不放行。
