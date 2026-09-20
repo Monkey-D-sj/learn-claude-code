@@ -63,12 +63,13 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from agent import TurnOutcome, agent_loop
-from app import MODEL, SYSTEM, make_compactor
-from config import MAX_ROUNDS
+from app import MODEL, build_system, make_compactor
+from config import MAX_ROUNDS, MEMORY_PATH, USER_MEMORY_PATH
 from context import ContextCompactor
 from hooks import trigger_hooks
 from sessions import SessionStore
 from tools import build_tools
+from tools.memory import load_memory
 from tools.todo import TodoManager
 
 PORT = 8765
@@ -214,9 +215,16 @@ def recording_emit(sid: str, emit, turn: dict):
 	"""
 	def wrapped(event: dict) -> None:
 		event = {**event, "turn_id": turn["id"], "turn_no": turn["turn_no"]}
-		seq = STORE.append_event(sid, event)
-		if seq is not None:
-			event = {**event, "seq": seq}
+		# 碎片(流式吐出来的字)只走直播,不落库、也不带 seq:一轮几千条,
+		# 落了库就是几千行,而它本来就不是"过一会儿还要重放出来"的东西 ——
+		# 完整的那一份(推理块、回答)紧接着就到,那条才是要重放的。
+		#
+		# 判断写在这一处,因为只有这一处知道库的事。kind 自己就是标记,
+		# 不另加一个 partial 字段:两个标记就有对不上的一天。
+		if event.get("kind") != "delta":
+			seq = STORE.append_event(sid, event)
+			if seq is not None:
+				event = {**event, "seq": seq}
 		emit(event)
 	return wrapped
 
@@ -505,7 +513,15 @@ class Handler(BaseHTTPRequestHandler):
 			self.send_error(404)
 
 	def _post_session(self):
-		row = STORE.create_session()
+		# 两份记忆的快照都在**建会话这一刻**读一次,然后跟着这个会话走到底。
+		# 读文件的事在这儿做,不在 sessions.py 里 —— 那个模块只干存取,
+		# 理由见它文件头。
+		#
+		# 这个会话后面写进去的记忆,不会反过来改它自己那两份快照,所以一个
+		# 会话从头到尾的 system prompt 逐字节不变 —— 而 system 是前缀缓存
+		# 的锚点,变一个字后面整段历史都要重算。代价是写入下个会话才生效。
+		row = STORE.create_session(load_memory(MEMORY_PATH),
+		                           load_memory(USER_MEMORY_PATH))
 		self._send_json({"id": row["id"], "title": row["title"]})
 
 	def _post_delete(self, sid: str):
@@ -581,6 +597,10 @@ class Handler(BaseHTTPRequestHandler):
 		# 问题一旦存在,答案就是"在你想不到的时候"。顺带,重启存活是免费的。
 		try:
 			history = STORE.load_context(sid)
+			# 这一会话建会话时冻下的那两份记忆,不是现读文件 —— 现读的话,
+			# 会话中途的一次 memory 写入会把它自己这个会话的 system 也换掉,
+			# 而 system 一变,前面所有轮次的缓存全废。见 _post_session。
+			memories = STORE.get_memory_snapshots(sid)
 			turn = STORE.begin_turn(sid, query)
 		except Exception as e:
 			self.send_error(500, f"cannot start turn: {type(e).__name__}: {e}")
@@ -614,7 +634,7 @@ class Handler(BaseHTTPRequestHandler):
 
 			outcome = agent_loop(history,
 			                     active_request=query,
-			                     system=SYSTEM,
+			                     system=build_system(*memories),
 			                     tools=build_tools(todo_for(sid)),
 			                     model=MODEL,
 			                     max_rounds=MAX_ROUNDS,

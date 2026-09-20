@@ -558,6 +558,10 @@ class ContextCompactor:
 		response = call_api(
 			self.client,
 			self.emit,
+			# 摘要不流。它是内部工序,不是对话里的话 —— 让它流,这一整段
+			# 摘要会一字一句地流进页面,看起来就像模型在说话,而用户根本
+			# 没问过它。压缩本身另有 note 通知,那一条才是该给用户看的。
+			stream=False,
 			model=self.model,
 			system=(
 				"Summarize the supplied coding-agent conversation as factual state. "

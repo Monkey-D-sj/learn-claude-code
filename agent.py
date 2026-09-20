@@ -25,7 +25,29 @@ MAX_ATTEMPTS = 3
 BASE_DELAY = 1.0
 
 
-def call_api(llm_client, emit, **kwargs):
+def delta_of(event) -> tuple[str, str]:
+	"""从一条流事件里取出能转发的碎片。取不到就返回空,调用方据此跳过。
+
+	只转发**正文**和**推理**:这两种碎片每时每刻都是能显示的东西。
+
+	工具参数的碎片不转发 —— 它是半个 JSON(拼到一半长这样:{"path": "/c),
+	拼好之前解析不了、执行不了,拿去问用户也问不明白,转发出去只是乱码。
+	完整的那块由 SDK 拼好交回来,那条路和以前完全一样。
+
+	返回 (去哪儿, 什么字):target 是 text 或 thinking。
+	"""
+	if getattr(event, "type", None) != "content_block_delta":
+		return "", ""
+	delta = getattr(event, "delta", None)
+	kind = getattr(delta, "type", None)
+	if kind == "text_delta":
+		return "text", delta.text
+	if kind == "thinking_delta":
+		return "thinking", delta.thinking
+	return "", ""
+
+
+def call_api(llm_client, emit, stream: bool = True, **kwargs):
 	"""调一次 Messages API,可重试的失败按指数退避重试。
 
 	重试:连接错误、超时、429、5xx
@@ -43,10 +65,30 @@ def call_api(llm_client, emit, **kwargs):
 
 	另外用 exc / err 两个名字:Python 3 里 `except X as exc` 的 exc
 	在 except 块结束时就解绑了,块外再引用会 UnboundLocalError。
+
+	**流式是默认的**,它带来一条新规矩:已经吐出去的字收不回来,所以吐过
+	之后**不再重试** —— 再试一次,页面上就会凭空重复一段。一个字都还没吐
+	的时候照旧重试,那条路和以前一模一样。
+
+	流出去的碎片走的就是传进来的那个 emit,只是多一个 delta 类型;落不落库
+	由 emit 那头决定,这一层不管。完整的那一块由 SDK 拼好交回来,形状和
+	以前 create 返回的一模一样 —— 下游谁都不用改。
+
+	不想流就传 stream=False。压缩器那次摘要就是这么调的:那是内部工序,
+	流出去会像模型在说话,而你根本没问过它。
 	"""
 	for attempt in range(1, MAX_ATTEMPTS + 1):
+		streamed = False
 		try:
-			return llm_client.messages.create(**kwargs)
+			if not stream:
+				return llm_client.messages.create(**kwargs)
+			with llm_client.messages.stream(**kwargs) as live:
+				for event in live:
+					target, text = delta_of(event)
+					if text:
+						streamed = True
+						emit({"kind": "delta", "target": target, "text": text})
+				return live.get_final_message()
 		except anthropic.RateLimitError as exc:
 			err, retryable = exc, True
 		except anthropic.APIStatusError as exc:
@@ -54,7 +96,9 @@ def call_api(llm_client, emit, **kwargs):
 		except anthropic.APIConnectionError as exc:    # 含 APITimeoutError
 			err, retryable = exc, True
 
-		if not retryable or attempt == MAX_ATTEMPTS:
+		# 吐过字就不再重试:重试的代价从"再等一会儿"变成"屏幕上多一段"。
+		# 这一条比退避策略重要,所以放在同一个判断里,别挪到下面去。
+		if not retryable or attempt == MAX_ATTEMPTS or streamed:
 			raise err
 		wait = BASE_DELAY * 2 ** (attempt - 1)
 		# emit 是命名参数,不会被 **kwargs 带走(它写在 **kwargs 前面,

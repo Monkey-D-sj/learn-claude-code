@@ -23,3 +23,9 @@ wheels/
 # 只 ignore 主文件的话,某次 git add -A 会把 -wal 单独提上去 —— 毫无意义
 # 而且误导。反过来说,删 -wal 等于丢数据。
 sessions.db*
+.gstack/
+
+# 用户级记忆。**只 ignore 这一份,memory/ 不 ignore** —— 两份的归属不一样:
+#   user/     写的是"这个人怎么干活",个人偏好,不该跟着仓库走
+#   memory/   写的是"这个仓库的约定和坑",协作者本来就该看到
+user/

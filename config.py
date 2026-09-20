@@ -51,3 +51,30 @@ MAX_ROUNDS = 50
 # 落盘的工具结果,出了 WORKDIR 就够不着(还会被 permission_hook 拦)。
 TRANSCRIPT_DIR = WORKDIR / ".transcripts"
 TOOL_RESULTS_DIR = WORKDIR / ".task_outputs" / "tool-results"
+
+# 两份记忆,两个作用域,两个文件。
+#
+#   memory/MEMORY.md   项目级 —— 这个仓库的约定和坑
+#   user/USER.md       用户级 —— 你这个人的习惯和喜好
+#
+# **为什么分两份而不是一份里加标记:** 两者的寿命和归属不一样。项目那份跟着
+# 仓库走(换个目录起服务就该是另一套),用户那份写的是"这个人怎么干活"。
+# 混在一个文件里,换个仓库就把用户的喜好一起丢了,而丢的时候没有任何提示。
+#
+# **为什么都在 WORKDIR 里:** 跟 skills/ 一个理由 —— 它在 WORKDIR 里,
+# permission_hook 现成管着,read_file/write_file 也能直接读写。搬到 WORKDIR
+# 外面(比如家目录)就得为它开一条权限上的口子,而且用户想手改一条还得去别处找。
+MEMORY_PATH = WORKDIR / "memory" / "MEMORY.md"
+USER_MEMORY_PATH = WORKDIR / "user" / "USER.md"
+
+# 记忆的两条线。放这儿跟 MAX_ROUNDS 并列,而不是散在 tools/memory.py 里:
+# 它们是"这个 agent 的脾气",调的时候该跟轮数上限在同一个地方看到。
+#
+# 条数限的是**粒度** —— 一条一行,模型指认的时候才认得准(remove/update
+# 按子串匹配,条目越短越不容易撞车)。
+# 字符限的是**总量** —— 没有它,30 条可以写成一本书。
+#
+# 两条谁先到谁说了算。system prompt 里那行水位条的百分比取更满的那个,
+# 见 tools/memory.py 的 memory_meter()。
+MEMORY_MAX_ENTRIES = 30
+MEMORY_MAX_CHARS = 4000

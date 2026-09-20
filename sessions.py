@@ -5,14 +5,11 @@
 
 现在有五个活着的对象:
 
-	sessions          会话本身
+	sessions          会话本身,外加会话开始那一刻的记忆快照
 	turns             一轮执行,状态机只有 running -> completed / failed
 	turn_messages     这一轮的原始消息,只追加、不修改
 	session_contexts  交给模型的那份工作上下文,整体重写
 	events            页面重放的流水账,只追加
-
-另有一张 messages:它的上下文职责已经交给 session_contexts,现在只是
-迁移前的备份,没人读也没人写(见 _MIGRATION_2)。
 
 三条贯穿全文件的规矩,每条都有理由:
 
@@ -65,6 +62,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 # 库跟 server.py 同级,不跟 WORKDIR(cwd)。
@@ -77,11 +75,16 @@ from pathlib import Path
 # bash 仍然删得掉(permission_hook 也拦不住,不该指望它拦),这个接受。
 DB_PATH = Path(__file__).resolve().parent / "sessions.db"
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # 每条一个语句,不写成一个大字符串走 executescript。
 # 理由:executescript 在遇到已挂起的事务时会先隐式 COMMIT —— 那会把
 # 迁移外面那个 BEGIN IMMEDIATE 拆掉,原子性就没了。逐条 execute 不会。
+#
+# 这一份就是整个库的最终形状:建会话、事件、轮次、原始消息、工作上下文,
+# 五张表一次建齐。以前分两条(v1 建前两张,v2 建后三张),现在并成一条 ——
+# 没有需要逐级升级的老库,分开只让读的人多跳一次。
+# 以后加改动照旧往后接一条,并把 SCHEMA_VERSION 加一。
 _MIGRATION_1 = (
 	"""
 	CREATE TABLE sessions (
@@ -95,19 +98,9 @@ _MIGRATION_1 = (
 	# 索引里,将来要加 LIMIT 翻页不用回头找。
 	"CREATE INDEX sessions_updated ON sessions(updated_at DESC)",
 
-	"""
-	CREATE TABLE messages (
-		id         INTEGER PRIMARY KEY,
-		session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-		message    TEXT NOT NULL,
-		created_at REAL NOT NULL
-	)
-	""",
-	"CREATE INDEX messages_session ON messages(session_id, id)",
-
 	# events.id 是发给页面的游标(?since=),所以它必须是 AUTOINCREMENT:
 	# 普通 rowid 在删掉最大行之后会被复用,而复用一次就等于让客户端跳过
-	# 或重放一段。messages.id 从不外传,普通 rowid 就够。
+	# 或重放一段。
 	"""
 	CREATE TABLE events (
 		id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -117,40 +110,7 @@ _MIGRATION_1 = (
 	)
 	""",
 	"CREATE INDEX events_session ON events(session_id, id)",
-)
 
-
-def _backfill_contexts(conn) -> None:
-	"""把旧 messages 快照搬进 session_contexts。
-
-	旧 messages 存的本来就是"这一段对话的上下文"—— 每轮整体重写,id 顺序
-	就是当时的消息顺序。所以按 id 读出来原样就是一串合法 messages_json,
-	不用重建、也不能重建:它可能已经被压过,原文找不回来了。
-
-	version 固定 1:没有历史版本可继承。last_compacted_at 留空 —— 旧快照
-	压没压过无从判断,编不出一个时间。留空的意思是"不知道",不是"没压过",
-	将来别拿它当"这个会话没压过"用。
-	"""
-	grouped: dict[str, list] = {}
-	latest: dict[str, float] = {}
-	for session_id, message, created_at in conn.execute(
-			"SELECT session_id, message, created_at FROM messages"
-			" ORDER BY session_id, id"):
-		grouped.setdefault(session_id, []).append(json.loads(message))
-		latest[session_id] = max(latest.get(session_id, 0.0), created_at)
-
-	# 遍历 sessions 而不是上面那个分组:一条消息都没有的会话**也要**有一行。
-	# 少了的话 load_context 读不到行,会当成"这个会话没有上下文"—— 而
-	# "空上下文"和"迁移漏了"在那边长得一模一样。
-	for session_id, updated_at in conn.execute("SELECT id, updated_at FROM sessions"):
-		conn.execute(
-			"INSERT INTO session_contexts (session_id, messages_json, version,"
-			" updated_at, last_compacted_at) VALUES (?, ?, 1, ?, NULL)",
-			(session_id, json.dumps(grouped.get(session_id, []), ensure_ascii=False),
-			 latest.get(session_id, updated_at)))
-
-
-_MIGRATION_2 = (
 	# 一轮执行。状态机这一版只有三条边,CHECK 里就写这三种。
 	#
 	# created_at 兼作开始时间:创建即执行,没有排队阶段。以后有了 queued
@@ -208,13 +168,35 @@ _MIGRATION_2 = (
 		last_compacted_at REAL
 	)
 	""",
+)
 
-	_backfill_contexts,
+# v2 和 v3 是同一次改动的两半,分两条只是因为 v2 先落到了一个已经跑着的库上
+# —— 改 v2 的正文对它没用,那条迁移已经被记进那个库的 user_version 里了。
+#
+# 两列名字不对称(memory_snapshot / user_snapshot)也是这个原因:改列名在
+# SQLite 里要重建表,不值得,所以在 _put 注释里把"memory_snapshot 就是项目
+# 那份"写清楚。
+#
+# **为什么要存下来,而不是每轮现读记忆文件:** 记忆是拼进 system prompt 的,
+# 而 tools + system 是 DeepSeek 自动前缀缓存的锚点,从 byte 0 逐字节比。一个
+# 会话内它变一个字,后面整段历史都要按未命中重算 —— 差的不是一点点。冻住
+# 之后本会话零重算,代价只是"写进去的记忆下个会话才生效"。
+#
+# **为什么不塞进 session_contexts:** 那张表每轮整体重写(见文件头第二条),
+# 把永不改变的值放进去等于每轮白写一遍;而且它存的是"消息",system 那截
+# 不是消息。
+_MIGRATION_2 = (
+	"ALTER TABLE sessions ADD COLUMN memory_snapshot TEXT NOT NULL DEFAULT ''",
+)
+
+# v3:用户级那份记忆的快照,跟 v2 那个项目级的并排。见上面。
+_MIGRATION_3 = (
+	"ALTER TABLE sessions ADD COLUMN user_snapshot TEXT NOT NULL DEFAULT ''",
 )
 
 # 下标 = 目标版本 - 1。加一次改动就往后接一个,并把 SCHEMA_VERSION 加一。
-# 每一项里既可以是 SQL 字符串,也可以是拿 conn 的函数(要搬数据的那种)。
-MIGRATIONS = (_MIGRATION_1, _MIGRATION_2)
+# 每一项是一串 SQL 字符串,逐条执行。
+MIGRATIONS = (_MIGRATION_1, _MIGRATION_2, _MIGRATION_3)
 
 
 def _block_json(obj):
@@ -256,6 +238,30 @@ class SessionStore:
 		                             timeout=5.0, isolation_level=None)
 		self._migrate()
 
+	@contextmanager
+	def _tx(self, immediate: bool = True):
+		"""一个事务的进出场:拿锁、BEGIN、COMMIT,出错 ROLLBACK 再抛。
+
+		六个调用点原先各抄一遍这七行。收在这里之后,"锁只圈事务"这条规矩
+		只有一处可改 —— 它正是文件头第一条要守的东西。
+
+		COMMIT 留在 try 里面是照抄原来的形状:它自己失败(比如磁盘满)时也
+		该试着回滚一次,而不是把半开的事务留在连接上,让下一个 BEGIN 撞上
+		"cannot start a transaction within a transaction"。
+
+		immediate=False 给 list_turns:它要的是三条 SELECT 落在同一个快照
+		上,而不是一上来就抢写锁。
+		"""
+		with self._lock:
+			conn = self._conn
+			conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+			try:
+				yield conn
+				conn.execute("COMMIT")
+			except BaseException:
+				conn.execute("ROLLBACK")
+				raise
+
 	def _migrate(self):
 		"""PRAGMA user_version 当版本号,逐级往上迁。
 
@@ -285,21 +291,11 @@ class SessionStore:
 				f"换新版代码再打开它")
 
 		for target in range(version + 1, SCHEMA_VERSION + 1):
-			conn.execute("BEGIN IMMEDIATE")
-			try:
+			with self._tx() as conn:
 				for step in MIGRATIONS[target - 1]:
-					# 迁移里除了 DDL 还有要搬数据的,那种写成一个拿 conn 的
-					# 函数。仍然逐条执行、仍然不用 executescript,理由见上面。
-					if callable(step):
-						step(conn)
-					else:
-						conn.execute(step)
+					conn.execute(step)
 				# PRAGMA 不能带参数占位符;target 是我们自己 range 出来的整数。
 				conn.execute(f"PRAGMA user_version = {target}")
-				conn.execute("COMMIT")
-			except BaseException:
-				conn.execute("ROLLBACK")
-				raise
 
 	# ---- 读路径 / 轮末写路径:会抛,调用方接得住 ----
 
@@ -309,30 +305,31 @@ class SessionStore:
 				"SELECT 1 FROM sessions WHERE id = ?", (sid,)).fetchone()
 		return row is not None
 
-	def create_session(self) -> dict:
-		"""建会话,连它的空上下文一起。
+	def create_session(self, memory_snapshot: str, user_snapshot: str) -> dict:
+		"""建会话,连它的空上下文和两份记忆快照一起。
 
-		两件事一个事务:只有会话行、没有上下文行的话,load_context 读到
+		四件事一个事务:只有会话行、没有上下文行的话,load_context 读到
 		空,而"新会话还没聊过"和"上下文那一行丢了"就分不出来 —— 后者会
 		让旧历史静默消失,所以宁可在建的时候就把它钉死。
+
+		memory_snapshot 是**项目级**那份(列名是 v2 留下的,那时还只有一份),
+		user_snapshot 是用户级那份。
+
+		两个 **故意都不给默认值**:默认值等于把"这份记忆是谁读的、什么时候
+		读的"这个决定藏起来,而它正是这两个参数存在的理由 —— 本模块只干
+		存取,读文件是调用方(server.py)的事,理由见文件头。
 		"""
 		now = time.time()
 		sid = uuid.uuid4().hex
-		with self._lock:
-			conn = self._conn
-			conn.execute("BEGIN IMMEDIATE")
-			try:
-				conn.execute(
-					"INSERT INTO sessions (id, title, created_at, updated_at)"
-					" VALUES (?, ?, ?, ?)", (sid, "", now, now))
-				conn.execute(
-					"INSERT INTO session_contexts (session_id, messages_json,"
-					" version, updated_at, last_compacted_at)"
-					" VALUES (?, '[]', 1, ?, NULL)", (sid, now))
-				conn.execute("COMMIT")
-			except BaseException:
-				conn.execute("ROLLBACK")
-				raise
+		with self._tx() as conn:
+			conn.execute(
+				"INSERT INTO sessions (id, title, created_at, updated_at,"
+				" memory_snapshot, user_snapshot) VALUES (?, ?, ?, ?, ?, ?)",
+				(sid, "", now, now, memory_snapshot, user_snapshot))
+			conn.execute(
+				"INSERT INTO session_contexts (session_id, messages_json,"
+				" version, updated_at, last_compacted_at)"
+				" VALUES (?, '[]', 1, ?, NULL)", (sid, now))
 		return {"id": sid, "title": "", "updated_at": now}
 
 	def list_sessions(self) -> list[dict]:
@@ -361,6 +358,23 @@ class SessionStore:
 				(sid,)).fetchone()
 		return json.loads(row[0]) if row else []
 
+	def get_memory_snapshots(self, sid: str) -> tuple[str, str]:
+		"""这一会话开始时冻下的两份记忆,拼进 system prompt 用。返回
+		(项目级, 用户级)。
+
+		会话中途写进记忆文件的东西**不会**出现在这儿 —— 那正是它存在的
+		理由,见 _MIGRATION_2 上面那段。要拿到最新的记忆文件,得等下一个
+		会话(那时 create_session 会读到新的那两份)。
+
+		跟 load_context 一档,会抛。静默拿一份空记忆去跑一轮,模型会以为
+		用户的规矩是另一套 —— 它不会报错,只会照着自己以为的来。
+		"""
+		with self._lock:
+			row = self._conn.execute(
+				"SELECT memory_snapshot, user_snapshot FROM sessions WHERE id = ?",
+				(sid,)).fetchone()
+		return (row[0], row[1]) if row else ("", "")
+
 	def list_turns(self, sid: str) -> dict:
 		"""这一页要的东西:会话里每一轮,连同它自己的原始消息。
 
@@ -373,27 +387,20 @@ class SessionStore:
 		另外约定:消息是先落库、再发事件(agent.py 里 record 在 emit 前面)。
 		所以 cursor 划到的事件,它对应的消息一定已经在 turn_messages 里了。
 		"""
-		with self._lock:
-			conn = self._conn
-			conn.execute("BEGIN")
-			try:
-				turns = conn.execute(
-					"SELECT id, turn_no, status, created_at, updated_at,"
-					" finished_at, error_message FROM turns"
-					" WHERE session_id = ? ORDER BY turn_no", (sid,)).fetchall()
-				messages = conn.execute(
-					"SELECT m.turn_id, m.message_no, m.kind, m.role,"
-					" m.content_json, m.created_at"
-					" FROM turn_messages m JOIN turns t ON t.id = m.turn_id"
-					" WHERE t.session_id = ? ORDER BY t.turn_no, m.message_no",
-					(sid,)).fetchall()
-				cursor = conn.execute(
-					"SELECT COALESCE(MAX(id), 0) FROM events WHERE session_id = ?",
-					(sid,)).fetchone()[0]
-				conn.execute("COMMIT")
-			except BaseException:
-				conn.execute("ROLLBACK")
-				raise
+		with self._tx(immediate=False) as conn:
+			turns = conn.execute(
+				"SELECT id, turn_no, status, created_at, updated_at,"
+				" finished_at, error_message FROM turns"
+				" WHERE session_id = ? ORDER BY turn_no", (sid,)).fetchall()
+			messages = conn.execute(
+				"SELECT m.turn_id, m.message_no, m.kind, m.role,"
+				" m.content_json, m.created_at"
+				" FROM turn_messages m JOIN turns t ON t.id = m.turn_id"
+				" WHERE t.session_id = ? ORDER BY t.turn_no, m.message_no",
+				(sid,)).fetchall()
+			cursor = conn.execute(
+				"SELECT COALESCE(MAX(id), 0) FROM events WHERE session_id = ?",
+				(sid,)).fetchone()[0]
 
 		by_turn: dict[str, list] = {}
 		for turn_id, no, kind, role, content, created_at in messages:
@@ -453,32 +460,25 @@ class SessionStore:
 		now = time.time()
 		turn_id = uuid.uuid4().hex
 		title = " ".join(query.split())[:40]
-		with self._lock:
-			conn = self._conn
-			conn.execute("BEGIN IMMEDIATE")
-			try:
-				turn_no = conn.execute(
-					"SELECT COALESCE(MAX(turn_no), 0) + 1 FROM turns"
-					" WHERE session_id = ?", (sid,)).fetchone()[0]
-				conn.execute(
-					"INSERT INTO turns (id, session_id, turn_no, status,"
-					" created_at, updated_at, finished_at, error_message)"
-					" VALUES (?, ?, ?, 'running', ?, ?, NULL, NULL)",
-					(turn_id, sid, turn_no, now, now))
-				# message_no=1 是用户那条。后面由 record 回调从 2 接着发。
-				conn.execute(
-					"INSERT INTO turn_messages (turn_id, message_no, kind, role,"
-					" content_json, created_at) VALUES (?, 1, 'user_input',"
-					" 'user', ?, ?)",
-					(turn_id, json.dumps(query, ensure_ascii=False), now))
-				conn.execute(
-					"UPDATE sessions SET updated_at = ?,"
-					" title = CASE WHEN title = '' THEN ? ELSE title END"
-					" WHERE id = ?", (now, title, sid))
-				conn.execute("COMMIT")
-			except BaseException:
-				conn.execute("ROLLBACK")
-				raise
+		with self._tx() as conn:
+			turn_no = conn.execute(
+				"SELECT COALESCE(MAX(turn_no), 0) + 1 FROM turns"
+				" WHERE session_id = ?", (sid,)).fetchone()[0]
+			conn.execute(
+				"INSERT INTO turns (id, session_id, turn_no, status,"
+				" created_at, updated_at, finished_at, error_message)"
+				" VALUES (?, ?, ?, 'running', ?, ?, NULL, NULL)",
+				(turn_id, sid, turn_no, now, now))
+			# message_no=1 是用户那条。后面由 record 回调从 2 接着发。
+			conn.execute(
+				"INSERT INTO turn_messages (turn_id, message_no, kind, role,"
+				" content_json, created_at) VALUES (?, 1, 'user_input',"
+				" 'user', ?, ?)",
+				(turn_id, json.dumps(query, ensure_ascii=False), now))
+			conn.execute(
+				"UPDATE sessions SET updated_at = ?,"
+				" title = CASE WHEN title = '' THEN ? ELSE title END"
+				" WHERE id = ?", (now, title, sid))
 		return {"id": turn_id, "turn_no": turn_no, "status": "running"}
 
 	def save_context(self, sid: str, messages: list, compacted: bool = False) -> None:
@@ -490,15 +490,8 @@ class SessionStore:
 		"""
 		now = time.time()
 		text = json.dumps(messages, ensure_ascii=False, default=_block_json)
-		with self._lock:
-			conn = self._conn
-			conn.execute("BEGIN IMMEDIATE")
-			try:
-				self._put_context(conn, sid, text, now, compacted)
-				conn.execute("COMMIT")
-			except BaseException:
-				conn.execute("ROLLBACK")
-				raise
+		with self._tx() as conn:
+			self._put_context(conn, sid, text, now, compacted)
 
 	def finish_turn(self, sid: str, turn_id: str, status: str,
 	                error_message: str | None, messages: list) -> None:
@@ -513,24 +506,17 @@ class SessionStore:
 		"""
 		now = time.time()
 		text = json.dumps(messages, ensure_ascii=False, default=_block_json)
-		with self._lock:
-			conn = self._conn
-			conn.execute("BEGIN IMMEDIATE")
-			try:
-				# 轮末这一次不带 compacted:本轮压过的话,检查点那一次已经
-				# 把 last_compacted_at 写上了,这里再写一遍只会把它推后。
-				self._put_context(conn, sid, text, now, compacted=False)
-				# 条件更新:只有还在 running 的才收尾。这一版只有一个写者
-				# (攥着会话锁的那条线程),正常跑不到 0 行;真跑到了说明
-				# 有人已经把它写成终态 —— 那声张一声,别静默盖掉。
-				changed = conn.execute(
-					"UPDATE turns SET status = ?, finished_at = ?, updated_at = ?,"
-					" error_message = ? WHERE id = ? AND status = 'running'",
-					(status, now, now, error_message, turn_id)).rowcount
-				conn.execute("COMMIT")
-			except BaseException:
-				conn.execute("ROLLBACK")
-				raise
+		with self._tx() as conn:
+			# 轮末这一次不带 compacted:本轮压过的话,检查点那一次已经
+			# 把 last_compacted_at 写上了,这里再写一遍只会把它推后。
+			self._put_context(conn, sid, text, now, compacted=False)
+			# 条件更新:只有还在 running 的才收尾。这一版只有一个写者
+			# (攥着会话锁的那条线程),正常跑不到 0 行;真跑到了说明
+			# 有人已经把它写成终态 —— 那声张一声,别静默盖掉。
+			changed = conn.execute(
+				"UPDATE turns SET status = ?, finished_at = ?, updated_at = ?,"
+				" error_message = ? WHERE id = ? AND status = 'running'",
+				(status, now, now, error_message, turn_id)).rowcount
 		if not changed:
 			print(f"[sessions] turn {turn_id} 收尾时已经不是 running,状态没改")
 

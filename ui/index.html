@@ -314,6 +314,10 @@
      段落不再用 white-space: pre-wrap —— 换行现在由解析器发成 <br>,
      两个一起上会变成双倍行距。 */
   .reply { margin-top: 18px; }
+  /* 正在流的那一块:字是一片片追加的,还没过解析器,所以先按预格式保留
+     换行(推理那块上面已经有了)。完整的那条一到,整块会被成品换掉,
+     样式跟着变成正式的那套。 */
+  .reply.live { white-space: pre-wrap; word-break: break-word; }
   .reply p {
     margin: 0 0 10px;
     word-break: break-word;
@@ -1277,12 +1281,75 @@ function renderThinking(ev) {
   return d;
 }
 
+// ---- 正在流的那一块 ----
+//
+// 模型吐字的时候,文字是一片片到的(服务端发的 delta,见 agent.py 的
+// delta_of)。它们**不落库**,所以只可能从直播流来 —— 也就永远不会被重放
+// 一遍,不需要 seq 那套去重,每一条都该往同一个节点里追加。
+//
+// 键是"哪一轮的哪种块":正文和推理各一个。同一轮里会有好几个推理块(每次
+// API 调用一个),所以完整的那条一到,就把这一块**整块换掉**再从表里删掉
+// —— 下一片碎片来了自然另起一块。
+const LIVE = new Map();
+
+function liveBlock(ev) {
+  const key = (ev.turn_id || "?") + ":" + ev.target;
+  const had = LIVE.get(key);
+  if (had) return had;
+
+  const thinking = ev.target === "thinking";
+  const node = thinking ? document.createElement("details") : el("div");
+  node.className = thinking ? "think live" : "reply live";
+  // 推理那块是收起的,标题给个预览 —— 流的时候这行跟着长,不用展开
+  // 也看得出它在想什么。正文块没有这层壳,字直接长在节点上。
+  const body = thinking ? el("pre") : node;
+  if (thinking) {
+    node.appendChild(el("summary", null, "推理过程"));
+    node.appendChild(body);
+  }
+  node.body = body;
+  add(node);
+  LIVE.set(key, node);
+  return node;
+}
+
+function streamDelta(ev) {
+  const node = liveBlock(ev);
+  node.body.textContent += ev.text;
+  if (ev.target === "thinking") {
+    node.querySelector("summary").textContent =
+      headline(node.body.textContent) || "推理过程";
+  }
+  follow();
+}
+
+// 完整的那条到了:把流着的那块换成权威的那份重画。
+//
+// 换掉而不是往里补,是因为流的字和最终的字可能不一样(比如 hook 又塞了话
+// 接着说),能信的只有最终那条。找得到就换,找不到(刷新过、或者本来就是
+// 从重放来的)就照老样子画一个新的。
+function settleLive(turnId, target, fresh) {
+  const key = (turnId || "?") + ":" + target;
+  const node = LIVE.get(key);
+  LIVE.delete(key);
+  if (!node) return false;
+  node.replaceWith(fresh);
+  return true;
+}
+
 function render(ev) {
   // 先归位,再画。带 turn_id 的按 id 找容器 —— 轮询可能从半截接上,那时
   // 屏幕上连这一轮的盒子都还没有,得现建;没有 turn_id 的是旧版记录,
   // 沿用老画法。
   if (ev.turn_id) turn = turnBox(ev.turn_id, ev.turn_no);
   else if (!turn) turn = newSection();
+
+  if (ev.kind === "delta") {
+    // 碎片不带 seq(它们不落库),上面那道去重拦不住 —— 这正是要的:
+    // 每一条碎片都得画。
+    streamDelta(ev);
+    return;
+  }
 
   if (ev.kind === "you") {
     // 用户那句话也是服务端发的一条事件,不再在提交时自己画 —— 否则重放
@@ -1295,7 +1362,8 @@ function render(ev) {
     refreshSessionsSoon();   // 这一轮开始了:侧栏那个点该亮起来
 
   } else if (ev.kind === "thinking") {
-    add(renderThinking(ev));
+    const fresh = renderThinking(ev);
+    if (!settleLive(ev.turn_id, "thinking", fresh)) add(fresh);
 
   } else if (ev.kind === "tool_call") {
     call = el("div", "call");
@@ -1321,7 +1389,8 @@ function render(ev) {
     refreshSessionsSoon();   // 有人被挂住了,侧栏那个点要变蓝
 
   } else if (ev.kind === "reply") {
-    add(renderReply(ev.text));
+    const fresh = renderReply(ev.text);
+    if (!settleLive(ev.turn_id, "text", fresh)) add(fresh);
     // 终态跟 reply 一起发过来(见 server.py 的 _run_turn)。标在轮号
     // 旁边 —— 不标的话,一轮跑完屏幕上那个"运行中"要等到下次刷新才变。
     if (ev.turn_id && ev.status) setState(ev.turn_id, ev.status);
@@ -1331,6 +1400,15 @@ function render(ev) {
     // 看得出来,而不是凭空少一段。
     add(el("div", "note", JSON.stringify(ev)));
   }
+
+  // 清空"正在流"的表,让下一片碎片另起一块。已经画上去的字留着不动 ——
+  // 它们本来就是完整的。
+  //
+  // **thinking 和 reply 不在此列**,这一步是有讲究的:一轮的最后一次调用
+  // 常常是"先来一个推理块、再来正文",推理那条完整事件先到。要是它也顺手
+  // 清空,后面那条 reply 就找不到正文那块了,只好再画一个新的 —— 同一段话
+  // 在屏幕上出现两遍。
+  if (ev.kind !== "thinking" && ev.kind !== "reply") LIVE.clear();
 }
 
 // 以前一个 setBusy 把两件事捏在一起。多会话之后它们不再是一回事:另一个

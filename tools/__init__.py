@@ -2,6 +2,7 @@ from tools.base import ToolDesc
 from tools.bash import bash
 from tools.edit import edit_file
 from tools.glob import glob
+from tools.memory import memory_tool, user_memory_tool
 from tools.read import read_file
 from tools.skill import skill
 from tools.subagent import task
@@ -11,7 +12,10 @@ from tools.write import write_file
 # 除了 todo_write,其余工具都是无状态的,可以全进程共用一份。
 # todo_write 不是 —— 它背后是一个任务清单,而清单是每个 agent 一份的,
 # 所以它得现造。
-BASE_TOOLS = [bash, read_file, write_file, edit_file, glob, skill, task]
+BASE_TOOLS = [
+	bash, read_file, write_file, edit_file, glob, skill,
+	memory_tool, user_memory_tool, task,
+]
 
 
 def build_tools(todo: TodoManager) -> list[ToolDesc]:

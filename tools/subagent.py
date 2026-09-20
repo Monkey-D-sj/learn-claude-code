@@ -55,7 +55,18 @@ def run_task(prompt: str) -> str:
 	# 混在一个列表里 —— 这正是 todo 那个工厂存在的理由。
 	#
 	# 排除自己,否则子 agent 可以无限套娃。
-	sub_tools = [t for t in build_tools(TodoManager()) if t.name != "task"]
+	#
+	# 两个记忆工具(memory / user_memory)也排除。两个理由,任一都够:
+	#
+	#   1. 子 agent 的定位是"独立上下文、只回结论"(见上面 SYSTEM)。它翻到
+	#      的东西该写进报告交回主 agent,由主 agent 决定记不记 —— 它自己
+	#      记,主 agent 就看不见记了什么。
+	#   2. 记忆是**一份 WORKDIR 级的文件**,谁都能写就谁都能覆盖。子 agent
+	#      拿的是自己那份上下文,看不到主 agent 刚写了什么。
+	_DENIED = ("task", "memory", "user_memory")
+	sub_tools = [
+		t for t in build_tools(TodoManager()) if t.name not in _DENIED
+	]
 
 	print("\n\033[35m[Subagent started]\033[0m")
 	outcome = agent_loop(
