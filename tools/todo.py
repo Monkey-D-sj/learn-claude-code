@@ -69,7 +69,7 @@ def make_todo_write(todo: TodoManager) -> ToolDesc:
 	为什么是工厂而不是模块级单例:"当前任务清单"是**每个 agent 一份**的
 	东西 —— 主 agent、它派的子 agent、浏览器里另一个会话,各有各的任务。
 	以前只有一条会话,共用一份看不出来(模型看不到别人的清单,见下面),
-	但语义已经错了:工具描述里写的是 "for your current coding session"。
+	但语义已经错了:工具描述里写的是 "for your current session"。
 
 	为什么清单是参数、不在这儿自己 new 一个:那样清单的寿命就等于这个
 	工具对象的寿命,而浏览器那边工具是**每轮现造**的(server.py),
@@ -95,7 +95,7 @@ def make_todo_write(todo: TodoManager) -> ToolDesc:
 	return ToolDesc(
 		name="todo_write",
 		description=(
-			"Create and manage a task list for your current coding session. "
+			"Create and manage a task list for your current session. "
 			"Overwrites the entire list: always send every task, not just the changed ones."
 		),
 		input_schema={

@@ -1,6 +1,6 @@
 """记忆:一条一行的事实与偏好,跨会话活着。两份,两个作用域。
 
-	memory/MEMORY.md   项目级,memory 工具    这个仓库的约定和坑
+	memory/MEMORY.md   项目级,memory 工具    这个项目的约定和坑
 	user/USER.md       用户级,user_memory 工具  你这个人的习惯和喜好
 
 跟 skills/ 是邻居,但两回事:
@@ -338,9 +338,9 @@ _SCHEMA = {
 memory_tool = ToolDesc(
 	name="memory",
 	description=_describe(
-		what="for this project: how the repo builds, what not to touch, what "
-		     "bit you last time",
-		criteria=("Record only facts about this repo that you verified "
+		what="for this project: how the workspace is laid out, what not to "
+		     "touch, what bit you last time",
+		criteria=("Record only facts about this project that you verified "
 		          "yourself — for what the person is like, or how they want "
 		          "you to work, use the user_memory tool instead."),
 		rel=_PROJECT_REL,
@@ -356,7 +356,7 @@ user_memory_tool = ToolDesc(
 		what="about the person you are working with: their habits, their "
 		     "preferences, and how they want you to work",
 		criteria=("Record only what the user stated or showed you — for facts "
-		          "about this repo, use the memory tool instead."),
+		          "about this project, use the memory tool instead."),
 		rel=_USER_REL,
 		section="User",
 	),
