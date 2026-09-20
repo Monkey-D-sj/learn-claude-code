@@ -140,11 +140,18 @@ def test_include里写点点出不去WORKDIR(tree):
 	assert grep_mod.run_grep("needle outside", include="../*.py") == "(no matches)"
 
 
+def _nobody(question, options):
+	"""build_tools 那个 ask_user 是必填的(理由见 tools/__init__.py:没有哪个
+	默认值在三个前端里都对)。这几项不碰 ask 工具,给一个够用的就行。"""
+	return None
+
+
 def test_进工具集_挨着glob():
-	names = [t.name for t in build_tools(TodoManager())]
+	tools = build_tools(TodoManager(), _nobody)
+	names = [t.name for t in tools]
 	assert names[names.index("glob") + 1] == "grep", names
-	desc = [t.description for t in build_tools(TodoManager()) if t.name == "grep"][0]
 	# 描述里得说清楚什么时候用它、什么时候该用 glob 和它的已知边界
+	desc = [t.description for t in tools if t.name == "grep"][0]
 	assert "glob" in desc and "Hidden" in desc, desc
 
 

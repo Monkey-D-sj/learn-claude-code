@@ -16,9 +16,11 @@
     POST /session/<id>/delete     删会话
     POST /ask                     请求体是 JSON {"session": "...", "query": "..."},
                                   响应是一条 NDJSON 流(一行一个 JSON)
-    POST /answer                  请求体是 JSON {"id": "...", "allow": true},回答
-                                  /ask 那条流里挂出来的 ask 事件 —— 见 make_ask。
-                                  它是**唯一能授权**的入口,所以门看得比 /ask 还紧
+    POST /answer                  请求体是 JSON {"id": "..."},外加 "allow":
+                                  true(权限确认)或 "text": "..."(模型提问),
+                                  回答 /ask 那条流里挂出来的 ask 事件 —— 见
+                                  make_ask / make_ask_text。它是**唯一能授权**
+                                  的入口,所以门看得比 /ask 还紧
     OPTIONS /*                    预检。跨源那道门就架在这儿,见 do_OPTIONS
 
 **为什么不用 SSE(EventSource):** 它只能发 GET,查询就得塞进 URL。
@@ -248,32 +250,74 @@ def quiet(emit):
 	代价说清楚:一个被忘掉的标签页会把这一轮的钱烧完,边界是现成的
 	(MAX_ROUNDS、ASK_TIMEOUT、侧栏上看得到的"在跑")。
 
-	make_ask 拿的**不是**这份:它靠 emit_quietly 的返回值判断"还有人能回答
-	吗",给它安静版的话,页面一关就没人回答,而 agent 会在那儿干等 300 秒。
+	两个提问器(make_ask / make_ask_text)拿的**不是**这份,而它们底下共用的
+	_ask_and_wait 靠 emit_quietly 的返回值判断"还有人能回答吗"。给它安静版
+	的话,页面一关就没人回答,而 agent 会在那儿干等 300 秒。
 	"""
 	return lambda event: emit_quietly(emit, event)
 
 
-# 等一个确认最多等多久。超了算拒绝。
+# 一个问题最多等多久。超了算没答上。
 #
 # 想短一点也行,但注意代价不对称:等太久只是页面刷不出新一轮(这期间
 # 同一个会话的请求全是 409),放行放错是把机器交出去。所以宁可等。
+#
+# 模型提问(ask 工具)共用这一个超时。它没这么强的方向性 —— 没答上就是
+# 没答上,模型收到一句报错然后自己拿主意 —— 但为此多一个旋钮不值当,
+# 而侧栏那个"在等你回答"本来就看得见。
 ASK_TIMEOUT = 300.0
 
-# 挂起的确认。key 是 ask 事件的 id,value 是那个槽。
+# 挂起的问题。key 是 ask 事件的 id,value 是那个槽。
 #
 # 为什么需要这张表:agent 循环跑在 POST /ask 那条线程里,它要停下来等人;
 # 而人的回答从另一条连接(POST /answer)进来 —— 两条线程之间没有别的
-# 交汇点。Event 负责"停",allow 负责"答案"。
+# 交汇点。Event 负责"停",槽里那个字段负责"答案"。
 #
-# 槽里记着 session 只是为了 /sessions 能报出"哪个会话在等你确认",
+# 槽里记着 session 只是为了 /sessions 能报出"哪个会话在等你",
 # 记 question/turn_id 是为了 /turns 能把它补回去(见 _get_turns)。
-# 认槽始终只看 rid —— 它就是那张能力凭证,/answer 不需要知道会话。
+# mode 是为了页面知道画什么(是/否按钮还是输入框),也是 /answer 分派
+# 两种回答的依据。认槽始终只看 rid —— 它就是那张能力凭证,/answer 不
+# 需要知道会话,也不知道自己答的是哪一种,那是槽自己说了算。
+#
+# 两种问题(权限确认 / 模型提问)**共用这一张表**:鉴权、超时、清理、
+# "谁在等"的统计只有一份。分头写的话,一边加了闸另一边会漏 —— 而漏的
+# 那边不报错,只会留下一个永远清不掉的槽。
 PENDING: dict[str, dict] = {}
 
 
+def _ask_and_wait(emit, sid: str, turn_id: str, mode: str,
+                  **fields) -> tuple[dict | None, str]:
+	"""把一条 ask 挂到流上,然后挂住等回答。返回 (槽, 没答上的原因)。
+
+	槽是 None 就表示没人答上,第二项是给人看的原因(写进 record);答上了
+	时第二项是空字符串。
+
+	mode 决定页面画什么,也决定 /answer 往回写哪个字段 —— 见 PENDING。
+
+	这里拿到的是**不安静**的 emit,不能换成 quiet():emit_quietly 的返回值
+	就是"还有人能回答吗",安静版把失败吞掉了,于是页面关掉之后这儿会干等
+	满 300 秒才走。
+	"""
+	rid = uuid.uuid4().hex
+	slot = {"event": threading.Event(), "mode": mode, "session": sid,
+	        "turn_id": turn_id, **fields}
+	PENDING[rid] = slot
+	try:
+		if not emit_quietly(emit, {"kind": "ask", "id": rid, "mode": mode,
+		                           **fields}):
+			return None, "流已经断了,没人能回答"
+		if not slot["event"].wait(ASK_TIMEOUT):
+			emit_quietly(emit, {"kind": "note", "source": "ask",
+			                    "text": f"no answer in {ASK_TIMEOUT:.0f}s"})
+			return None, f"等满 {ASK_TIMEOUT:.0f}s 没人回答"
+		return slot, ""
+	finally:
+		# 无论哪条路径出去都要清,不然 PENDING 会一直涨。
+		PENDING.pop(rid, None)
+
+
 def make_ask(emit, sid: str, turn_id: str, record):
-	"""造一个把问题推给浏览器、然后挂起等回答的确认器。
+	"""造一个把问题推给浏览器、然后挂起等回答的**权限确认器**。
 
 	和 emit 一样按请求建:它绑在那条响应流上,而流是每请求一条。这也正好
 	对应"一轮只有一个确认在飞"——同一轮里工具是顺序跑的。
@@ -284,28 +328,38 @@ def make_ask(emit, sid: str, turn_id: str, record):
 	不记的话,刷新之后这一轮的记录里就完全看不出"它当时问过你、你是怎么
 	答的",而这恰恰是回头看时最想知道的一件事(比如那个要读仓库外面文件
 	的调用,你到底放没放行)。
+
+	模型提问那个(make_ask_text)不记 —— 问题在模型那条 tool_use 里、回答在
+	紧随其后的 tool_result 里,agent_loop 两头都记了,再记一条是同一个决定
+	在库里存两遍。
 	"""
 	def ask(question: str) -> bool:
-		rid = uuid.uuid4().hex
-		slot = {"event": threading.Event(), "allow": False, "session": sid,
-		        "question": question, "turn_id": turn_id}
-		PENDING[rid] = slot
-		try:
-			if not emit_quietly(emit, {"kind": "ask", "id": rid,
-			                           "question": question}):
-				verdict = "流已经断了,没人能回答,按拒绝处理"
-			elif not slot["event"].wait(ASK_TIMEOUT):
-				emit_quietly(emit, {"kind": "note", "source": "permission",
-				                    "text": f"no answer in {ASK_TIMEOUT:.0f}s, denied"})
-				verdict = f"等满 {ASK_TIMEOUT:.0f}s 没人回答,按拒绝处理"
-			else:
-				verdict = "已允许" if slot["allow"] else "已拒绝"
-		finally:
-			# 无论哪条路径出去都要清,不然 PENDING 会一直涨。
-			PENDING.pop(rid, None)
+		slot, why = _ask_and_wait(emit, sid, turn_id, "confirm",
+		                          question=question)
+		if slot is None:
+			allowed, verdict = False, f"{why},按拒绝处理"
+		else:
+			allowed = bool(slot.get("allow"))
+			verdict = "已允许" if allowed else "已拒绝"
 		record("control", "user", f"[permission] {question} → {verdict}")
-		return slot["allow"]
+		return allowed
 	return ask
+
+
+def make_ask_text(emit, sid: str, turn_id: str):
+	"""造一个模型提问用的提问器:推到浏览器,挂起等一段文字。
+
+	返回 None = 没人答上(超时 / 页面关了),**不是空字符串** —— 空回答是
+	一句合法的回答,模型得分得清"人说了句空的"和"根本没人在",见 tools/ask.py
+	那条报错。空字符串从 /answer 那头就进不来。
+
+	跟 make_ask 一样按请求建,理由也一样:它绑在那条响应流上。
+	"""
+	def ask_text(question: str, options: list[str]) -> str | None:
+		slot, _ = _ask_and_wait(emit, sid, turn_id, "question",
+		                        question=question, options=options)
+		return None if slot is None else slot.get("answer")
+	return ask_text
 
 
 def trim_dangling_tool_use(history: list) -> int:
@@ -419,16 +473,21 @@ class Handler(BaseHTTPRequestHandler):
 			return
 		payload = STORE.list_turns(sid)
 		payload["running"] = is_running(sid)
-		# 挂起中的确认要一起给。它是**唯一**没法从库里重建的东西:ask 不是
+		# 挂起中的问题要一起给。它是**唯一**没法从库里重建的东西:ask 不是
 		# 一条消息,库里没有它,而页面拿到的 cursor 已经越过它那条事件了 ——
-		# 不补这一下,刷新之后页面上就没有那个按钮,而 agent 那头正挂在
-		# 上面等满 300 秒然后按拒绝往下走。
+		# 不补这一下,刷新之后页面上就没有那个按钮或那个输入框,而 agent
+		# 那头正挂在上面等满 300 秒然后往下走。
+		#
+		# mode 和 options 必须跟着来:少了它们,一个提问会被画成是/否两个
+		# 按钮 —— 而按钮点下去发的是 allow,到了服务端被 mode 挡回来,
+		# 于是人看着页面上有个能点的东西,点了什么也没发生。
 		#
 		# 别的直播事件都不用补:thinking / tool_call / 工具输出都能在
 		# turn_messages 里找到,旁注(retry、压缩)丢了也不影响读。
 		with REGISTRY:
 			payload["pending"] = [
-				{"kind": "ask", "id": rid, "question": slot["question"],
+				{"kind": "ask", "id": rid, "mode": slot["mode"],
+				 "question": slot["question"], "options": slot.get("options", []),
 				 "turn_id": slot["turn_id"]}
 				for rid, slot in list(PENDING.items()) if slot["session"] == sid
 			]
@@ -529,8 +588,15 @@ class Handler(BaseHTTPRequestHandler):
 		self._send_json({"ok": True})
 
 	def _post_answer(self):
-		"""回答一条挂起的确认。这是唯一能授权的入口,所以只看 id 认槽。"""
-		body = self._json_body('{"id": "...", "allow": true}')
+		"""回答一条挂起的问题。确认和提问都走这儿,靠槽自己的 mode 分派。
+
+		不开第二个端点:挂起、超时、清理、"谁在等"这套东西只该有一份,而它
+		已经在 PENDING 里了。这也是必须认槽才分派的原因 —— 请求体长什么样
+		不能说了算,否则谁都拿 allow 往一个提问的槽里塞。
+
+		只看 id 认槽,槽就是那张能力凭证。
+		"""
+		body = self._json_body('{"id": "...", "allow": true | "text": "..."}')
 		if body is None:
 			return
 
@@ -541,7 +607,16 @@ class Handler(BaseHTTPRequestHandler):
 			self.send_error(409, "no such pending question")
 			return
 
-		slot["allow"] = bool(body.get("allow"))
+		if slot["mode"] == "question":
+			text = clean_query(body.get("text", ""))
+			if not text:
+				# 空回答在**清槽之前**拒掉:模型那边"人说了句空的"和"没人答"
+				# 是两件事,放一个空字符串过去就把这个区别抹了。
+				self.send_error(400, "empty answer")
+				return
+			slot["answer"] = text
+		else:
+			slot["allow"] = bool(body.get("allow"))
 		slot["event"].set()
 
 		out = b'{"ok": true}'
@@ -628,7 +703,12 @@ class Handler(BaseHTTPRequestHandler):
 			outcome = agent_loop(history,
 			                     active_request=query,
 			                     system=build_system(*memories),
-			                     tools=build_tools(todo_for(sid)),
+			                     tools=build_tools(
+				                         todo_for(sid),
+				                         # 提问器绑在这一轮这条流上,所以每轮现造。
+				                         # 跟 ask= 那份不同:那个的答案是是/否
+				                         # (权限),这个是一段文字(模型提问)。
+				                         make_ask_text(emit, sid, turn["id"])),
 			                     model=MODEL,
 			                     max_rounds=MAX_ROUNDS,
 			                     compactor=make_compactor(silent),

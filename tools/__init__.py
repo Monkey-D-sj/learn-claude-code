@@ -1,3 +1,4 @@
+from tools.ask import make_ask_tool
 from tools.base import ToolDesc
 from tools.bash import bash
 from tools.edit import edit_file
@@ -10,20 +11,30 @@ from tools.subagent import task
 from tools.todo import TodoManager, make_todo_write
 from tools.write import write_file
 
-# 除了 todo_write,其余工具都是无状态的,可以全进程共用一份。
-# todo_write 不是 —— 它背后是一个任务清单,而清单是每个 agent 一份的,
-# 所以它得现造。
+# 除了 todo_write 和 ask,其余工具都是无状态的,可以全进程共用一份。
+#
+# 那两个不是,而且**都是因为要绑一个每轮/每会话才存在的东西**:
+#   todo_write  背后是一个任务清单,清单是每个 agent 一份的
+#   ask         背后是"这一轮的问题往哪条流上问",那条流是每请求一条的
+#
+# 所以它俩现造,由 build_tools 挂在后面。
 BASE_TOOLS = [
 	bash, read_file, write_file, edit_file, glob, grep, skill,
 	memory_tool, user_memory_tool, task,
 ]
 
 
-def build_tools(todo: TodoManager) -> list[ToolDesc]:
-	"""组一份完整的工具集。todo 是**谁的**清单,由调用方说了算。
+def build_tools(todo: TodoManager, ask_user) -> list[ToolDesc]:
+	"""组一份完整的工具集。todo 是**谁的**清单、ask_user 是**往哪儿问**,
+	两个都由调用方说了算。
 
-	故意不给默认值。默认值等于把"这是谁的清单"这个决定藏起来,而它正是
-	这个函数存在的理由:终端传进程一份(main.py),浏览器传当前会话那一份
-	(server.py),子 agent 传一个新造的(tools/subagent.py)。
+	故意都不给默认值。默认值等于把这两个决定藏起来,而它们正是这个函数存在
+	的理由:终端传进程一份清单 + 终端那个提问器(main.py),浏览器传当前会话
+	那一份 + 绑在这一轮那条流上的提问器(server.py),子 agent 传一个新造的
+	+ 一个一律拒答的(tools/subagent.py)。
+
+	ask_user 更是一份默认值都编不出来 —— 卡在 input() 上等,浏览器那边会
+	把 HTTP 线程连同会话锁一起挂死;直接返回"没人答",那个前端里 ask 就
+	静默地永远不能用。不给默认值,忘了传就是调用处当场 TypeError。
 	"""
-	return [*BASE_TOOLS, make_todo_write(todo)]
+	return [*BASE_TOOLS, make_ask_tool(ask_user), make_todo_write(todo)]

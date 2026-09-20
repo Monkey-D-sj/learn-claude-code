@@ -1,7 +1,7 @@
 from agent import agent_loop
 from app import MODEL, SYSTEM, make_compactor
 from config import MAX_ROUNDS
-from emit import terminal_ask, terminal_emit
+from emit import terminal_ask, terminal_ask_text, terminal_emit
 from hooks import trigger_hooks
 from tools import build_tools
 from tools.todo import TodoManager
@@ -13,7 +13,10 @@ COMPACTOR = make_compactor(terminal_emit)
 # 终端一个进程只有一个 agent,所以任务清单也是进程一份。
 # 浏览器那个前端不是 —— 那边是每个会话一份,见 server.py。
 TODO = TodoManager()
-TOOLS = build_tools(TODO)
+# ask 那个工具问出来的问题也打在这个终端上。终端这一个进程从头到尾就是一个
+# 会话,所以提问器可以是模块级的那一个;浏览器那边不是 —— 那边得绑在"这一轮
+# 那条响应流"上,每轮现造,见 server.py 的 make_ask_text。
+TOOLS = build_tools(TODO, terminal_ask_text)
 
 if __name__ == "__main__":
 	print("s01: Agent Loop")

@@ -89,10 +89,16 @@ python server.py     # 然后打开 http://localhost:8765/
 | `skill` | 按名字加载一份技能正文 |
 | `memory` | 项目级记忆:这个仓库的约定和坑。`add` / `remove` / `update` |
 | `user_memory` | 用户级记忆:你这个人的喜好和习惯。同上三个动作 |
+| `ask` | 问用户一个问题,等他的回答。可以带一组选项,页面上画成按钮 |
 | `task` | 派一个子 agent,独立上下文,只回结论 |
 
 每个工具都是一个 `ToolDesc`(dataclass):名字 + 描述 + input schema + handler。
-加工具 = 新建一个文件、写个 `ToolDesc`、在 `tools/__init__.py` 里加进 `TOOLS`。
+加工具 = 新建一个文件、写个 `ToolDesc`、在 `tools/__init__.py` 里加进
+`BASE_TOOLS`。
+
+要是它得绑一个**每轮或每会话才存在**的东西(某个 agent 的任务清单、这一轮的
+问题该往哪条流上问),就写成工厂,由 `build_tools` 现造 —— `todo_write` 和
+`ask` 就是这两个,`BASE_TOOLS` 里没有它们。
 
 ## Hooks
 
@@ -106,7 +112,9 @@ python server.py     # 然后打开 http://localhost:8765/
 | `Stop` | 模型不再调工具时 | `summary_hook` 会话统计 |
 
 `permission_hook` 是唯一会**交互**的 hook:bash 命中 `DENY_LIST` 直接拒;
-读写 `WORKDIR` 之外的文件会在终端问一句 `Allow? [y/N]`。
+读写 `WORKDIR` 之外的文件会问你一句(终端是 `Allow? [y/N]`,浏览器是页面上
+两个按钮)。这是 **harness** 在问;模型自己也能问,走的是 `ask` 工具 ——
+两条通道都叫 ask 但不是一回事,见下面的设计取舍。
 
 ## 上下文压缩
 
@@ -209,6 +217,37 @@ Facts and preferences from earlier sessions, fixed when this session started. Ba
 决定记不记。
 
 ## 几个设计取舍
+
+**两个 ask 不是一个。** `agent_loop(..., ask=...)` 那个是**权限确认器**:
+harness 拦下一次工具调用时问人,签名 `ask(question) -> bool`,答案是放不放行。
+`tools/ask.py` 那个是**模型主动提问**的通道,答案是任意一段文字。方向相反、
+类型也不同,所以没合成一个带 `mode` 的函数 —— 合了的话调用方得先看 mode 才
+知道手里那个值是哪种,而漏判时不报错:`False` 和 `""` 都是 falsy,
+`if answer:` 会把"人答了个空"和"没人答"读成同一件事。
+
+两者在服务端**共用** `PENDING` 那张表和 `/answer` 那个端点(底下是
+`_ask_and_wait`),靠槽自己的 `mode` 分派。分头写的话,鉴权、超时、清理、
+"谁在等"就有两份 —— 而它们漂了不报错,只会在某一条路径上留下一个永远清不掉
+的槽(侧栏于是一直显示"在等你回答")。
+
+**工具 handler 够不着前端。** `agent_loop` 调的是 `handler(**block.input)`
+(见 `agent.py`),没有 emit、没有 ask。所以"拿不准的时候问谁"由调用方
+partial 进去,而 `build_tools` 那个 `ask_user` **故意不给默认值** —— 因为
+一个对的默认值都编不出来:卡在 `input()` 上等,浏览器那边会把 HTTP 线程连同
+会话锁一起挂死;直接返回"没人答",那个前端里 `ask` 就静默地永远不能用。
+
+也正因为如此,`ask` 是**每轮现造**的:它绑着"这一轮的问题往哪条流上问",
+而服务端那份闭包住了 `emit`(每请求一条的响应流)、`sid`(`/sessions` 靠它
+报出谁在等)、`turn_id`(刷新后 `/turns` 靠它把框补回来)。两次 build 拿到
+同一个 ToolDesc 的话,第二个会话的问题会推到第一个会话的页面上去,而两边
+都不报错。
+
+子 agent 拿不到它,理由跟记忆那两个工具一样:它的 SYSTEM 头一句就是
+`nobody can answer questions`。
+
+**序号和下标不过线。** 页面上点了哪个按钮、终端里敲了哪个数字,都在**本地**
+换回选项原文再交出去 —— 模型看到的永远是文字。传下标的话,"第几项对应哪段
+文字"就成了两边各存一半的约定,而它会漂,漂的时候不报错。
 
 **压缩必须切片赋值。** `messages[:] = compactor.prepare(...)`,不能写
 `messages = ...`。`prepare()` 内部构造新列表返回,而 `messages` 是调用方

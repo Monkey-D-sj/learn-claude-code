@@ -44,6 +44,17 @@ def _deny_all(question: str) -> bool:
 	return False
 
 
+def _nobody_to_ask(question: str, options) -> None:
+	"""子 agent 的提问器:没人能回答,返回 None(= 没答上)。
+
+	正常路径上轮不到它 —— ask 已经躺在 _DENIED 里,压根没进工具集。留着是因为
+	build_tools 那个参数是必填的,而**签名必须是对的**:随手把 _deny_all 传过去
+	能过,但它是按一个参数调的,哪天 deny 名单动了一下,炸出来的是一个
+	TypeError,而不是"没人答得上"。
+	"""
+	return None
+
+
 def run_task(prompt: str) -> str:
 	# 延迟导入:子 agent 要"所有工具",而本模块由 tools/__init__ 加载,
 	# 模块级 from tools import build_tools 会拿到半初始化的包。
@@ -63,9 +74,14 @@ def run_task(prompt: str) -> str:
 	#      记,主 agent 就看不见记了什么。
 	#   2. 记忆是**一份 WORKDIR 级的文件**,谁都能写就谁都能覆盖。子 agent
 	#      拿的是自己那份上下文,看不到主 agent 刚写了什么。
-	_DENIED = ("task", "memory", "user_memory")
+	#
+	# ask 排除,理由跟 _deny_all 是同一个:上面 SYSTEM 头一句就是"nobody can
+	# answer questions"。给它一个能问的工具,等于同时推翻那句设定和 _deny_all
+	# 存在的理由。
+	_DENIED = ("task", "memory", "user_memory", "ask")
 	sub_tools = [
-		t for t in build_tools(TodoManager()) if t.name not in _DENIED
+		t for t in build_tools(TodoManager(), _nobody_to_ask)
+		if t.name not in _DENIED
 	]
 
 	print("\n\033[35m[Subagent started]\033[0m")

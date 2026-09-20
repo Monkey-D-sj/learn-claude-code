@@ -3,9 +3,14 @@
 它是"终端这个前端"的展示层,跟 server.py 里那个"推给浏览器"的 emit
 是一对 —— 两边拿到的是同一批事件,各自决定怎么显示。
 
-展示层有两件事:把事件画出来(terminal_emit),和拿不准的时候问人
-(terminal_ask)。后者也是前端的活 —— 浏览器那边问的是网页,不是终端,
-所以 agent_loop 把它当参数收,而不是在 hook 里写死。
+展示层有三件事:把事件画出来(terminal_emit),和拿不准的时候问人
+(terminal_ask / terminal_ask_text)。后者也是前端的活 —— 浏览器那边问的是
+网页,不是终端,所以 agent_loop / build_tools 把它当参数收,而不是写死。
+
+问人有**两个**函数,不是一个带 mode 参数的:回答的类型不同,一个是 bool
+(放不放行),一个是 str(说了什么)。合成一个的话,调用方得先看 mode 才知道
+手里那个值是哪种,而漏判的时候不报错 —— `False` 和 `""` 都是 falsy,
+`if answer:` 会把"人答了个空"和"没人答"读成同一件事。
 
 放在单独一个模块里,是因为有两个地方要用它:main.py 的 REPL,和子
 agent。子 agent 的循环不往上抛事件(它的定位就是把过程藏起来,只回
@@ -61,3 +66,30 @@ def terminal_ask(question: str) -> bool:
 		print()
 		return False
 	return reply.strip().lower() in ("y", "yes")
+
+
+def terminal_ask_text(question: str, options: list[str]) -> str | None:
+	"""终端这个前端的提问器(模型主动问的那种)。返回用户说了什么,None = 没答上。
+
+	选项用序号点,不用整行抄一遍 —— 这是终端里"按钮"的等价物。但序号**只
+	活在本地**:换回选项原文再交出去,模型看到的永远是文字。浏览器那边同理
+	(按钮直接把原文回上来)。两边都传下标的话,那个下标到文字的对应关系就是
+	一份两边各存一半的约定 —— 而它会漂,漂的时候不报错。
+
+	EOFError / KeyboardInterrupt 算**没答上**,不算空回答:管道里跑或
+	stdin 被关掉时 input() 直接 EOF,那条路径上给一个空字符串的话,模型的
+	tool_result 里就是一段空白,而它分不出"人说了句空的"和"根本没人在"。
+
+	跟 terminal_ask 分开而不是合并成一个,理由见文件头。
+	"""
+	print(f"{YELLOW}{question}{RESET}")
+	for i, option in enumerate(options, 1):
+		print(f"  {i}) {option}")
+	try:
+		reply = input("  回答: ").strip()
+	except (EOFError, KeyboardInterrupt):
+		print()
+		return None
+	if options and reply.isdigit() and 1 <= int(reply) <= len(options):
+		return options[int(reply) - 1]
+	return reply or None

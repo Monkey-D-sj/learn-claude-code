@@ -31,9 +31,10 @@ from config import MEMORY_MAX_CHARS, MEMORY_MAX_ENTRIES
 from tools import build_tools, memory_tool, user_memory_tool
 from tools.todo import TodoManager
 
-# **不能写 `import tools.memory as M`**:tools/__init__.py 里那句
-# `from tools.memory import memory_tool` 会把包上的 `tools.memory` 属性覆成
-# ToolDesc 对象,`as` 形式取的是属性而不是 sys.modules。理由见那个文件末尾。
+# 用 importlib 而不是 `import tools.memory as M`:`as` 形式取的是**包上的
+# 属性**而不是 sys.modules。变量当初就叫 memory 的时候,那句 import 拿到的
+# 是一个 ToolDesc —— 生产代码为此改名叫 memory_tool(见那个文件末尾)。现在
+# 两个写法都对,但 importlib 不会再被同一种改名咬第二次。
 M = importlib.import_module("tools.memory")
 
 
@@ -264,10 +265,16 @@ def test_两个工具绑的是各自的路径():
 	assert config.MEMORY_PATH != config.USER_MEMORY_PATH
 
 
+def _nobody(question, options):
+	"""build_tools 那个 ask_user 是必填的(理由见 tools/__init__.py:没有哪个
+	默认值在三个前端里都对)。这里验的是记忆工具,给一个够用的就行。"""
+	return None
+
+
 def test_两个工具的名字和schema():
 	assert memory_tool.name == "memory"
 	assert user_memory_tool.name == "user_memory"
-	names = [t.name for t in build_tools(TodoManager())]
+	names = [t.name for t in build_tools(TodoManager(), _nobody)]
 	assert "memory" in names and "user_memory" in names
 	# 同一个 dict 对象:它俩的入参本来就该一字不差,共用才漂不了
 	assert memory_tool.input_schema is user_memory_tool.input_schema

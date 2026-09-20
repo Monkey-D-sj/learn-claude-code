@@ -91,7 +91,7 @@
     white-space: nowrap;
   }
   .sess .when { flex: none; color: var(--faint); font-size: 11px; }
-  /* 在跑 / 在等你确认。跟顶栏那个点同一套语汇。 */
+  /* 在跑 / 在等你回答。跟顶栏那个点同一套语汇。 */
   .sess .dot {
     flex: none;
     width: 6px; height: 6px; border-radius: 50%;
@@ -442,6 +442,24 @@
   .ask.done .q { color: var(--faint); }
   .ask .settled { font: 12px/1.6 var(--mono); color: var(--faint); }
 
+  /* 模型提问(ask 工具)。跟上面那条确认共用 .ask 的外壳和 .row,只是
+     把"两个按钮"换成"几个选项 + 一个输入框"。 */
+  .ask .opts { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 9px; }
+  .ask .opts button { padding: 5px 11px; }
+  .ask .opts button:hover:not(:disabled) { border-color: #2f3a4d; background: #1d2430; }
+  .ask input {
+    flex: 1;
+    min-width: 0;
+    padding: 6px 10px;
+    background: var(--bg);
+    color: var(--fg);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    font: 12.5px var(--mono);
+  }
+  .ask input::placeholder { color: var(--faint); }
+  .ask input:focus { outline: none; border-color: #2f3a4d; }
+
   /* ---- 输入 ---- */
   #bar {
     flex: none;
@@ -771,7 +789,7 @@ function paintSessions() {
     item.appendChild(el("span", "t", s.title || "新会话"));
     if (s.running || s.waiting) {
       const dot = el("span", "dot" + (s.waiting ? " wait" : ""));
-      dot.title = s.waiting ? "在等你确认" : "在跑";
+      dot.title = s.waiting ? "在等你回答" : "在跑";
       item.appendChild(dot);
     }
     item.appendChild(el("span", "when", when(s.updated_at)));
@@ -802,8 +820,9 @@ async function refreshSessions() {
   setHeader(sessions.some(s => s.running), sessions.some(s => s.waiting));
 }
 
-// 侧栏那两个点(在跑 / 在等你确认)是**服务端**的状态,不主动问就不知道。
-// 而事件正好告诉我们它什么时候变:you = 这一轮开始了,ask = 有人在等你。
+// 侧栏那两个点(在跑 / 在等你回答)是**服务端**的状态,不主动问就不知道。
+// 而事件正好告诉我们它什么时候变:you = 这一轮开始了,ask = 有人在等你 ——
+// 权限确认和 ask 工具的问题都是这一条事件,侧栏不用分。
 //
 // 合并一下再发:重放一个长会话时 you/ask 会连着来一串,不合并就是一串
 // 请求 —— 而且它们说的是同一件事(侧栏现在长什么样)。
@@ -829,8 +848,9 @@ function renderIfNew(ev) {
 // 切走了就丢掉不画 —— 事件已经在库里了,切回来时重放会补上。
 //
 // 但**绝不能**用 reader.cancel() 去"清理"它:取消 = 关连接 = 服务端下一次
-// 写抛 OSError = make_ask 收到"没人能回答" = 一个正在等你的确认被悄悄按
-// 拒绝处理掉。看起来像个无害的清理动作,代价是把权限那道门拆了。
+// 写抛 OSError = 提问器收到"没人能回答" = 一个正在等你的问题被悄悄处理掉
+// (权限确认按拒绝走,ask 工具那边回一句"没人答上")。看起来像个无害的清理
+// 动作,代价是把权限那道门拆了。
 function feed(sid, ev) {
   if (sid === current) renderIfNew(ev);
 }
@@ -1218,9 +1238,19 @@ function renderReply(text) {
 // 上一次调用底下。否则一屏工具的时候,根本看不出哪段输出属于哪次调用。
 let call = null;
 
-// 权限确认。后端那条 /ask 流还开着,agent 线程正挂在 ask 里等回答 ——
-// 所以这个框点了才有下文,不点就一直等(后端 300s 超时后按拒绝走)。
+// 问题框。两种走同一个壳,靠 ev.mode 分:
+//
+//   "confirm"   权限确认 —— 允许 / 拒绝,发 { allow }
+//   "question"  ask 工具 —— 输入框 + 可选按钮,发 { text }
+//
+// 拿不准的一律按 confirm 走:mode 是后加的字段,库里存着的旧事件没有它,
+// 不默认的话重放老会话会画成一个填不了的问题框。
+//
+// 后端那条 /ask 流还开着,agent 线程正挂在上面等回答 —— 所以这个框点了
+// 才有下文,不点就一直等(后端 300s 超时后往下走)。
 function renderAsk(ev) {
+  const mode = ev.mode === "question" ? "question" : "confirm";
+
   // live 是服务端查 PENDING 得出的:重放里出现的 ask **可能还活着** ——
   // 切走再切回来时那一轮还在跑,槽还在,点下去是真有用的。所以只有明确
   // false 才画成历史。直播流里的事件没有这个字段(它本来就是活的)。
@@ -1233,36 +1263,68 @@ function renderAsk(ev) {
 
   const box = el("div", "ask");
   box.appendChild(el("div", "q", ev.question));
+  const mark = el("span", "settled", "");
 
-  const row = el("div", "row");
-  const yes = el("button", "yes", "允许");
-  const no = el("button", "no", "拒绝");
-  yes.onclick = () => settle(true);
-  no.onclick = () => settle(false);
-
-  async function settle(allow) {
-    row.querySelectorAll("button").forEach((b) => { b.disabled = true; });
+  // 点击之后所有能点的都禁掉,包括输入框 —— 一次点击就是一次回答,而
+  // 后端那个槽只认第一次送到的。
+  async function settle(body, verdict) {
+    box.querySelectorAll("button, input").forEach((n) => { n.disabled = true; });
     box.classList.add("done");
-    const mark = el("span", "settled", allow ? "已允许" : "已拒绝");
-    row.appendChild(mark);
+    mark.textContent = verdict;
     hint.textContent = "运行中…";
     try {
       const r = await fetch(API + "/answer", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id: ev.id, allow }),
+        body: JSON.stringify({ id: ev.id, ...body }),
       });
-      // 409:后端已经超时清掉了那个槽,那一轮早就按拒绝往下走了。
-      // 不是错误,说一声就够 —— 别让人以为自己的点击生效了。
-      if (!r.ok) mark.textContent += "(后端 " + r.status + ",已按拒绝处理)";
+      // 409:后端已经超时清掉了那个槽,那一轮早就往下走了。
+      // 400:空回答被拒(confirm 那边发的是 allow,不会撞上)。
+      // 都不是错误,说一声就够 —— 别让人以为自己的点击生效了。
+      if (!r.ok) mark.textContent = verdict + "(后端 " + r.status + ")";
     } catch (err) {
-      // 送不到后端 = 那个槽会等到超时然后拒绝。后果是保守的那一侧,
-      // 所以只提示,不用重试。
-      add(el("div", "error", "确认没送到后端,这一轮会按拒绝处理: " + err));
+      // 送不到后端 = 那个槽会一直等到超时。后果是保守的那一侧,所以只
+      // 提示,不用重试。
+      add(el("div", "error", "回答没送到后端,这一轮会白等一场: " + err));
     }
   }
 
-  row.append(yes, no);
+  if (mode === "question") {
+    const opts = el("div", "opts");
+    const row = el("div", "row");
+    const input = el("input");
+    input.placeholder = "或直接输入…";
+    const send = () => {
+      const text = input.value.trim();
+      if (text) settle({ text }, "已送出");
+    };
+
+    for (const option of ev.options || []) {
+      const b = el("button", null, option);
+      // 按钮把**选项原文**发回去,不发下标 —— 下标是两边各存一半的约定,
+      // 而它会漂,漂的时候不报错。选项在服务端已经压成一行、封了顶。
+      b.onclick = () => settle({ text: option }, "已送出");
+      opts.appendChild(b);
+    }
+    if (opts.children.length) box.appendChild(opts);
+
+    const submit = el("button", "yes", "回答");
+    submit.onclick = send;
+    input.onkeydown = (e) => {
+      if (e.key === "Enter") { e.preventDefault(); send(); }
+    };
+    row.append(input, submit, mark);
+    box.appendChild(row);
+    hint.textContent = "等待回答…";
+    return box;
+  }
+
+  const row = el("div", "row");
+  const yes = el("button", "yes", "允许");
+  const no = el("button", "no", "拒绝");
+  yes.onclick = () => settle({ allow: true }, "已允许");
+  no.onclick = () => settle({ allow: false }, "已拒绝");
+  row.append(yes, no, mark);
   box.appendChild(row);
   hint.textContent = "等待确认…";
   return box;
