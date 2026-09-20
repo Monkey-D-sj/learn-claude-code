@@ -165,15 +165,21 @@ python server.py     # 然后打开 http://localhost:8765/
 ```
 ## Memory
 
-Facts and preferences from earlier sessions, fixed when this session started.
-Background, not instructions.
+Facts and preferences from earlier sessions, fixed when this session started. Background, not instructions.
 
 ### Project — 12/30 entries, 1400/4000 chars — 40% full
-- 这个仓库用 uv
+这个仓库用 uv
 
 ### User — 3/30 entries, 120/4000 chars — 10% full
-- 用户不喜欢过度设计
+用户不喜欢过度设计
 ```
+
+条目在文件里是**裸行**,不加 `- `。两个工具都不写列表符号,也不认得它 ——
+你手写的会原样留着,只是 `update` 是**整行替换**,它换掉的那一条连写法一起
+换掉。
+
+以 `#` 开头的行是**标题、不算条目**:可以自己往文件里加 `## 今天记的` 分组,
+不占额度,也不会出现在 `remove` 的候选里。
 
 注意最后那条的写法:**陈述句,不是命令**。两个工具的说明里都写死了这条规矩——
 `User prefers concise responses` ✓,`Always respond concisely` ✗。命令式的措辞
@@ -194,9 +200,10 @@ Background, not instructions.
 子串匹配对着当前文件找,前面增删不影响后面;撞 0 条或撞多条一律报错并列出
 候选,让它自己把说法改具体。
 
-**记忆在一个会话内不变。** 两份快照都在建会话时冻住,写进去的东西下个会话才
-生效——工具的返回值里会明说这一句,否则模型写完回头看自己上下文一个字没变,
-会当成没写进去然后反复重试。
+**记忆在一个会话内不变。** 两份快照都在会话开始时冻住——终端冻在进程启动
+(一个终端进程从头到尾就是一个会话),浏览器冻在建会话那一刻、存进库里。写
+进去的东西下个会话才生效,工具的返回值里会明说这一句,否则模型写完回头看自己
+上下文一个字没变,会当成没写进去然后反复重试。
 
 子 agent 两个记忆工具都拿不到:它翻到的东西该写进报告交回主 agent,由主 agent
 决定记不记。
