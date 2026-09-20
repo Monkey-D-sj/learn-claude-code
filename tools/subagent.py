@@ -79,6 +79,11 @@ def run_task(prompt: str) -> str:
 		compactor=COMPACTOR,
 		ask=_deny_all,
 		emit=terminal_emit,
+		# 不走流式。terminal_emit 没有 delta 分支,碎片打进去等于丢掉 ——
+		# 对终端一点好处没有,代价却是**把重试禁掉**:call_api 里"吐过字就
+		# 不再重试"那条与 emit 收到什么无关,吐出第一个字之后再来个 500 或
+		# 连接超时,这一轮就只能整个失败交回主 agent。
+		stream=False,
 	)
 	# 工具 handler 只能回字符串,所以 TurnOutcome 到这儿要摊平。失败必须
 	# 说出来:主 agent 看不到子 agent 的中间过程,它唯一的信息源就是这段

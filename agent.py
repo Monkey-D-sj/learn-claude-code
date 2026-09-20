@@ -180,7 +180,7 @@ def clip_for_event(output: str) -> str:
 
 def agent_loop(messages: list, active_request: str, system: str, tools: list,
                model: str, max_rounds: int, compactor, emit, ask,
-               record=_drop, checkpoint=None) -> TurnOutcome:
+               record=_drop, checkpoint=None, stream: bool = True) -> TurnOutcome:
 	"""跑一轮完整的 agent 循环,返回这一轮的结果(TurnOutcome)。
 
 	只负责机制。提示词、工具集、模型、轮数上限、压缩器都从外面传进来 ——
@@ -220,6 +220,13 @@ def agent_loop(messages: list, active_request: str, system: str, tools: list,
 	拿事件游标当分界(turns 接口返回的那个 cursor),反过来的话,卡在
 	两者中间的那次读会既没有这条消息、又已经跳过了它的事件 —— 页面上
 	凭空少一条工具结果,而且刷新也补不回来。
+
+	stream 是"这一轮要不要流式",默认要 —— 两个前端都靠它把字尽早显示出来。
+	子 agent 传 False(见 tools/subagent.py):它的 emit 是终端,而
+	terminal_emit 没有 delta 分支,碎片打进去等于丢掉,所以流式对它唯一的
+	实际影响是**把重试禁掉** —— call_api 里"吐过字就不再重试"那条跟 emit
+	收到什么无关,模型吐第一个字的那一刻起,后面一个 500 或连接超时就没得
+	重试了。
 	"""
 	handlers = {t.name: t.handler for t in tools}
 	wire = [t.to_wire() for t in tools]
@@ -265,6 +272,7 @@ def agent_loop(messages: list, active_request: str, system: str, tools: list,
 				system=system,
 				tools=wire,
 				max_tokens=8000,
+				stream=stream,
 			)
 		except anthropic.APIError as e:
 			# 重试耗尽或不可重试:作为结果交回去,不让它掀翻整个会话。
