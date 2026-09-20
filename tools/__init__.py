@@ -2,6 +2,7 @@ from tools.base import ToolDesc
 from tools.bash import bash
 from tools.edit import edit_file
 from tools.glob import glob
+from tools.grep import grep
 from tools.memory import memory_tool, user_memory_tool
 from tools.read import read_file
 from tools.skill import skill
@@ -13,7 +14,7 @@ from tools.write import write_file
 # todo_write 不是 —— 它背后是一个任务清单,而清单是每个 agent 一份的,
 # 所以它得现造。
 BASE_TOOLS = [
-	bash, read_file, write_file, edit_file, glob, skill,
+	bash, read_file, write_file, edit_file, glob, grep, skill,
 	memory_tool, user_memory_tool, task,
 ]
 

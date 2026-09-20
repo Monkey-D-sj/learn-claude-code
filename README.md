@@ -84,6 +84,7 @@ python server.py     # 然后打开 http://localhost:8765/
 | `bash` | 跑 shell 命令(黑名单 + 越界需确认) |
 | `read_file` / `write_file` / `edit_file` | 文件读写改 |
 | `glob` | 列文件,支持 `**` 跨目录 |
+| `grep` | 按内容搜,返回 `路径:行号: 内容`;命中封顶 200 条 |
 | `todo_write` | 任务清单,同时让 agent 别跑偏 |
 | `skill` | 按名字加载一份技能正文 |
 | `memory` | 项目级记忆:这个仓库的约定和坑。`add` / `remove` / `update` |
