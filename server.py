@@ -69,6 +69,7 @@ from sessions import SessionStore
 from tools import build_tools
 from tools.memory import load_memory
 from tools.todo import TodoManager
+import usage
 
 PORT = 8765
 PAGE = Path(__file__).parent / "ui" / "index.html"
@@ -700,22 +701,26 @@ class Handler(BaseHTTPRequestHandler):
 			# OSError,把整轮带走 —— 而"切走了照跑"要的正好相反。
 			emit_quietly(emit, {"kind": "you", "text": query})
 
-			outcome = agent_loop(history,
-			                     active_request=query,
-			                     system=build_system(*memories),
-			                     tools=build_tools(
-				                         todo_for(sid),
-				                         # 提问器绑在这一轮这条流上,所以每轮现造。
-				                         # 跟 ask= 那份不同:那个的答案是是/否
-				                         # (权限),这个是一段文字(模型提问)。
-				                         make_ask_text(emit, sid, turn["id"])),
-			                     model=MODEL,
-			                     max_rounds=MAX_ROUNDS,
-			                     compactor=make_compactor(silent),
-			                     ask=make_ask(emit, sid, turn["id"], record),
-			                     emit=silent,
-			                     record=record,
-			                     checkpoint=lambda messages: self._checkpoint(sid, messages, emit))
+			# 归属:这一轮里所有的 API 调用都带上 session / turn。压缩器和 vision
+			# 都在这一层里面,所以它们自动跟着 —— 传参是传不到工具 handler 里的
+			# (agent_loop 只给 handler 传 **block.input)。
+			with usage.span(session=sid, turn=turn["id"]):
+				outcome = agent_loop(history,
+				                     active_request=query,
+				                     system=build_system(*memories),
+				                     tools=build_tools(
+					                         todo_for(sid),
+					                         # 提问器绑在这一轮这条流上,所以每轮现造。
+					                         # 跟 ask= 那份不同:那个的答案是是/否
+					                         # (权限),这个是一段文字(模型提问)。
+					                         make_ask_text(emit, sid, turn["id"])),
+				                     model=MODEL,
+				                     max_rounds=MAX_ROUNDS,
+				                     compactor=make_compactor(silent),
+				                     ask=make_ask(emit, sid, turn["id"], record),
+				                     emit=silent,
+				                     record=record,
+				                     checkpoint=lambda messages: self._checkpoint(sid, messages, emit))
 		except Exception as e:
 			# 兜底:异常不该把 history 一起带走,也不该让流断在半截
 			# 而没有下文 —— 前端会一直转圈。这一轮记 failed。

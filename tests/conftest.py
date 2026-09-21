@@ -15,6 +15,19 @@
 
     不能改成 monkeypatch sessions.DB_PATH:默认参数在 def 那一刻就绑定了,
     之后再改那个常量对 path 的默认值没有任何影响。
+
+三、**账本同理,而且更隐蔽。** agent.call_api 现在每调一次就记一笔
+    (usage.meter),而 test_streaming.py:113 是直接调它的 —— 用 fixture
+    拦不住,因为那是模块级的用例函数,而 fixture 的换法只对"拿到 fixture
+    的那些测试"生效。
+
+    不拦的表现:每次跑 pytest 都往 .traces/usage.jsonl 掺二十来行
+    model="m" 的假账。**掺进去不报错** —— 只是从此报表不可信:命中率被
+    拉平、按 purpose 的拆分里多一个 main、成本算不出来。跟真实的那些行长得
+    几乎一样,唯一的区别是 model 字段。
+
+    手法跟二一样:换掉 usage 模块里 USAGE_PATH 那个名字。usage._append 每次
+    调用现读它,所以此刻换是生效的。
 """
 
 import shutil
@@ -28,8 +41,9 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import sessions  # noqa: E402
+import usage  # noqa: E402
 
-# 模块级执行 —— 必须赶在任何测试模块 import server 之前。
+# 模块级执行 —— 必须赶在任何测试模块 import server / 调 agent.call_api 之前。
 _SCRATCH = Path(tempfile.mkdtemp(prefix="agent-tests-"))
 _RealStore = sessions.SessionStore
 
@@ -40,6 +54,8 @@ def _scratch_store(path=None):
 
 
 sessions.SessionStore = _scratch_store
+
+usage.USAGE_PATH = _SCRATCH / "usage.jsonl"
 
 
 @pytest.fixture(scope="session", autouse=True)

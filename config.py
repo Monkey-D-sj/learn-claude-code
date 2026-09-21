@@ -52,6 +52,13 @@ MAX_ROUNDS = 50
 TRANSCRIPT_DIR = WORKDIR / ".transcripts"
 TOOL_RESULTS_DIR = WORKDIR / ".task_outputs" / "tool-results"
 
+# 账本。一次 API 调用一行,append-only。
+#
+# 跟上面两个放一起(都在 WORKDIR 里),但**有一条重要区别:它不给模型看**。
+# 模型没有任何工具能读到"这次花了多少钱",也不该有 —— 成本是运维信息,进了
+# 上下文只是占位置,还多一个能被 write_file 写坏的面。
+USAGE_PATH = WORKDIR / ".traces" / "usage.jsonl"
+
 # 两份记忆,两个作用域,两个文件。
 #
 #   memory/MEMORY.md   项目级 —— 这个仓库的约定和坑

@@ -6,6 +6,7 @@ import anthropic
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
+import usage
 from hooks import trigger_hooks
 
 load_dotenv()
@@ -45,7 +46,20 @@ def delta_of(event) -> tuple[str, str]:
 	return "", ""
 
 
-def call_api(llm_client, emit, stream: bool = True, **kwargs):
+def _meter(purpose: str, model: str, usage_obj, attempt: int, ok: bool,
+           started: float, kind: str) -> None:
+	"""把一次调用的用量交给账本。薄壳,不做判断。
+
+	判断放在 usage.meter 里,是因为"记什么"和"什么时候记"是两件事:这里只
+	知道时机(拿到响应了 / 这次要重试了),那边知道该留下哪些字段。
+	"""
+	usage.meter(purpose=purpose, model=model, usage_obj=usage_obj,
+	            attempt=attempt, ok=ok,
+	            elapsed_ms=int((time.monotonic() - started) * 1000), kind=kind)
+
+
+def call_api(llm_client, emit, stream: bool = True, purpose: str = "main",
+             **kwargs):
 	"""调一次 Messages API,可重试的失败按指数退避重试。
 
 	重试:连接错误、超时、429、5xx
@@ -71,25 +85,74 @@ def call_api(llm_client, emit, stream: bool = True, **kwargs):
 
 	不想流就传 stream=False —— 压缩器那次摘要就是这么调的:内部工序,流
 	出去会像模型在说话。
+
+	purpose 是"这笔钱算谁的"。全项目四个调用点都把用量送进同一个账本,但账上
+	必须分得开:主循环、压缩摘要、vision。分不开的话最贵的那笔永远是看不见的
+	—— 摘要调用拿的是**完整上下文**,它可能是整个会话里最大的一笔,而以前它
+	在账上是零。
+
+	跟 emit 一样,必须写在 **kwargs 前面。写成 **{"purpose": ...} 会被当成
+	messages.create 的参数发出去,SDK 那边报一个 TypeError —— 比 emit 那个
+	被彻底静默吞掉好一点,但一样不该发生。
 	"""
+	model = kwargs.get("model", "")
 	for attempt in range(1, MAX_ATTEMPTS + 1):
 		streamed = False
+		# 这次尝试的计时,以及"服务端已经告诉我们的用量"。
+		#
+		# partial 存在的唯一理由是重试:第一次请求哪怕在中途炸掉,它的 input
+		# **已经被计费了** —— 而服务端把 usage 塞在 message_start 里,也就是流
+		# 一开始就送到了。不接住它,每一次重试都有一笔账凭空消失。
+		# 这跟下面"吐过字就不再重试"是同一类判断,只是换成了钱。
+		#
+		# message_delta 那份更全(output_tokens 到那儿才齐),所以后到的覆盖
+		# 先到的。代价说清楚:**中途失败记下的 output_tokens 偏低** —— 最后
+		# 一个 delta 没到,而模型可能已经吐了几百字。偏低是没办法的,但不能编:
+		# 编出来的那一笔看起来是完整的,你就永远不会去查它。
+		started = time.monotonic()
+		partial = None
 		try:
 			if not stream:
-				return llm_client.messages.create(**kwargs)
+				response = llm_client.messages.create(**kwargs)
+				_meter(purpose, model, getattr(response, "usage", None),
+				       attempt, True, started, "nonstream")
+				return response
 			with llm_client.messages.stream(**kwargs) as live:
 				for event in live:
+					event_type = getattr(event, "type", None)
+					if event_type == "message_start":
+						partial = getattr(getattr(event, "message", None),
+						                  "usage", None)
+					elif event_type == "message_delta":
+						delta_usage = getattr(event, "usage", None)
+						if delta_usage is not None:
+							partial = delta_usage
 					target, text = delta_of(event)
 					if text:
 						streamed = True
 						emit({"kind": "delta", "target": target, "text": text})
-				return live.get_final_message()
+				final = live.get_final_message()
+			_meter(purpose, model, getattr(final, "usage", None),
+			       attempt, True, started, "stream")
+			partial = None
+			return final
 		except anthropic.RateLimitError as exc:
 			err, retryable = exc, True
 		except anthropic.APIStatusError as exc:
 			err, retryable = exc, exc.status_code >= 500
 		except anthropic.APIConnectionError as exc:    # 含 APITimeoutError
 			err, retryable = exc, True
+		finally:
+			# 走到这儿 partial 还留着,只有一种可能:上面三条 except 一条都没
+			# 接住 —— 一个非 APIError 跳了出去(终端那边 emit 撞上断掉的管道
+			# 之类)。不补这一下,那笔钱就从账上消失了,而"消失了"和"没花"
+			# 在报表里长得一模一样。
+			#
+			# 放 finally 而不是放重试判断前面:重试会再走一遍上面这段,而
+			# **失败的那一次不会再回来**。
+			if partial is not None:
+				_meter(purpose, model, partial, attempt, False, started, "partial")
+				partial = None
 
 		# 吐过字就不再重试:重试的代价从"再等一会儿"变成"屏幕上多一段"。
 		# 这一条比退避策略重要,所以放在同一个判断里,别挪到下面去。

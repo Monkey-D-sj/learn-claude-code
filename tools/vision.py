@@ -110,6 +110,10 @@ def run_vision(path: str, question: str) -> str:
 	]
 	try:
 		response = call_api(client, _quiet, stream=False, model=MODEL,
+		                    # 跟主循环分开记账:图不进上下文,所以这一次的信息量
+		                    # 跟它花的钱完全不成比例。混进 main 里,你会以为主循环
+		                    # 贵 —— 而真正贵的地方一次都看不见。
+		                    purpose="vision",
 		                    max_tokens=MAX_TOKENS,
 		                    messages=[{"role": "user", "content": content}])
 	except anthropic.APIError as e:

@@ -5,6 +5,7 @@ from emit import terminal_ask, terminal_ask_text, terminal_emit
 from hooks import trigger_hooks
 from tools import build_tools
 from tools.todo import TodoManager
+import usage
 
 # 终端这个前端:事件打在这儿,压缩器的日志也打在这儿。
 # 浏览器那个前端在 server.py,它建自己那个压缩器。
@@ -23,6 +24,9 @@ if __name__ == "__main__":
 	print("Enter a question, press Enter to send. Type q to quit.\n")
 
 	history = []
+	# 轮次序号,只给账本用。终端一个进程从头到尾就是一个会话,所以"第几轮"
+	# 拿一个计数器就够了 —— 浏览器那边不是,它有真正的 turn_id,见 server.py。
+	turn = 0
 	while True:
 		try:
 			# \001/\002 tell Readline the ANSI escapes have zero display width.
@@ -38,16 +42,21 @@ if __name__ == "__main__":
 			break
 		trigger_hooks("UserPromptSubmit", query)
 		history.append({"role": "user", "content": query})
+		turn += 1
 		try:
-			outcome = agent_loop(history,
-			                     active_request=query,
-			                     system=SYSTEM,
-			                     tools=TOOLS,
-			                     model=MODEL,
-			                     max_rounds=MAX_ROUNDS,
-			                     compactor=COMPACTOR,
-			                     ask=terminal_ask,
-			                     emit=terminal_emit)
+			# span 里发生的每一次 API 调用都自动带上这些归属 —— 包括压缩器
+			# 那次摘要,和工具里那些(vision)。传参穿不过工具 handler:
+			# agent_loop 只给 handler 传 **block.input,所以只能用这一层环境。
+			with usage.span(session="terminal", turn=turn):
+				outcome = agent_loop(history,
+				                     active_request=query,
+				                     system=SYSTEM,
+				                     tools=TOOLS,
+				                     model=MODEL,
+				                     max_rounds=MAX_ROUNDS,
+				                     compactor=COMPACTOR,
+				                     ask=terminal_ask,
+				                     emit=terminal_emit)
 			print(outcome.text)
 			# 终端这边不记库,"失败了"就没有第二个人知道 —— 得自己说。
 			# 不说的话,轮数耗尽和一次正常回复在屏幕上长得一模一样,

@@ -3,6 +3,7 @@ from config import MAX_ROUNDS, TOOL_RESULTS_DIR, TRANSCRIPT_DIR, WORKDIR
 from context import ContextCompactor
 from emit import terminal_emit
 from tools.base import ToolDesc
+import usage
 
 SYSTEM = (
 	f"You are a subagent working in {WORKDIR}. "
@@ -85,22 +86,28 @@ def run_task(prompt: str) -> str:
 	]
 
 	print("\n\033[35m[Subagent started]\033[0m")
-	outcome = agent_loop(
-		[{"role": "user", "content": prompt}],
-		active_request=prompt,
-		system=SYSTEM,
-		tools=sub_tools,
-		model=MODEL,
-		max_rounds=MAX_ROUNDS,
-		compactor=COMPACTOR,
-		ask=_deny_all,
-		emit=terminal_emit,
-		# 不走流式。terminal_emit 没有 delta 分支,碎片打进去等于丢掉 ——
-		# 对终端一点好处没有,代价却是**把重试禁掉**:call_api 里"吐过字就
-		# 不再重试"那条与 emit 收到什么无关,吐出第一个字之后再来个 500 或
-		# 连接超时,这一轮就只能整个失败交回主 agent。
-		stream=False,
-	)
+	# 嵌套 span:只把 agent 改成 "subagent",session / turn 从外层继承。
+	#
+	# **合并而不是覆盖**是必须的 —— 覆盖的话子 agent 花的钱会变成一条没有归属
+	# 的孤儿记录。而它恰恰是最该被看见的一笔:嵌套、没人看、没人问,而且是整个
+	# 系统里最容易失控的地方(它可以继续派活,只被 _DENIED 挡住)。
+	with usage.span(agent="subagent"):
+		outcome = agent_loop(
+			[{"role": "user", "content": prompt}],
+			active_request=prompt,
+			system=SYSTEM,
+			tools=sub_tools,
+			model=MODEL,
+			max_rounds=MAX_ROUNDS,
+			compactor=COMPACTOR,
+			ask=_deny_all,
+			emit=terminal_emit,
+			# 不走流式。terminal_emit 没有 delta 分支,碎片打进去等于丢掉 ——
+			# 对终端一点好处没有,代价却是**把重试禁掉**:call_api 里"吐过字就
+			# 不再重试"那条与 emit 收到什么无关,吐出第一个字之后再来个 500 或
+			# 连接超时,这一轮就只能整个失败交回主 agent。
+			stream=False,
+		)
 	# 工具 handler 只能回字符串,所以 TurnOutcome 到这儿要摊平。失败必须
 	# 说出来:主 agent 看不到子 agent 的中间过程,它唯一的信息源就是这段
 	# 返回文本。"跑了一半就停下"和"干完了"给出的结论长得一样的话,主 agent
