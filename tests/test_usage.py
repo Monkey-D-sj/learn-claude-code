@@ -47,7 +47,7 @@ def test_two_tiers_differ_by_exactly_two():
 	钉住它:哪天有人只改了一档的价格,这里会红 —— 而只改一档的表现是账目
 	"有点偏",从别的地方看不出来。
 	"""
-	table = pricing.USD_PER_MTOK["deepseek-flash"]
+	table = pricing.CNY_PER_MTOK["deepseek-flash"]
 	for counter in ("input_tokens", "cache_read_input_tokens", "output_tokens"):
 		assert table[pricing.PEAK][counter] == pytest.approx(
 			table[pricing.OFF_PEAK][counter] * 2), counter
@@ -55,7 +55,7 @@ def test_two_tiers_differ_by_exactly_two():
 
 def test_real_prices_match_the_published_table():
 	"""照抄一遍价目表 —— 填错数字的表现是账目整体偏一个倍数,不报错。"""
-	table = pricing.USD_PER_MTOK["deepseek-flash"]
+	table = pricing.CNY_PER_MTOK["deepseek-flash"]
 	assert table[pricing.OFF_PEAK]["cache_read_input_tokens"] == 0.02
 	assert table[pricing.PEAK]["cache_read_input_tokens"] == 0.04
 	assert table[pricing.OFF_PEAK]["input_tokens"] == 1.0
@@ -70,13 +70,13 @@ def test_cache_creation_is_free_not_unknown():
 	实测这个端点的 cache_creation_input_tokens 恒为 0 —— 那是"没有这一笔",
 	不是"不知道价格"。填 None 会让整笔都算不出金额。
 	"""
-	table = pricing.USD_PER_MTOK["deepseek-flash"]
+	table = pricing.CNY_PER_MTOK["deepseek-flash"]
 	for tier in (pricing.PEAK, pricing.OFF_PEAK):
 		assert table[tier]["cache_creation_input_tokens"] == 0.0
 
 
 def test_cost_math_per_tier(monkeypatch):
-	monkeypatch.setitem(pricing.USD_PER_MTOK, "m", {
+	monkeypatch.setitem(pricing.CNY_PER_MTOK, "m", {
 		pricing.PEAK: {"input_tokens": 2.0, "cache_read_input_tokens": 0.2,
 		               "cache_creation_input_tokens": 0.0, "output_tokens": 8.0},
 		pricing.OFF_PEAK: {"input_tokens": 1.0, "cache_read_input_tokens": 0.1,
@@ -105,7 +105,7 @@ def test_unfilled_price_is_none_not_zero(monkeypatch):
 
 	写成 0 的话总账看起来是零,而真正的结论是"我不知道花了多少"。
 	"""
-	monkeypatch.setitem(pricing.USD_PER_MTOK, "half-filled", {
+	monkeypatch.setitem(pricing.CNY_PER_MTOK, "half-filled", {
 		pricing.PEAK: {"input_tokens": None, "cache_read_input_tokens": 0.04,
 		               "cache_creation_input_tokens": 0.0, "output_tokens": 8.0},
 	})
@@ -121,7 +121,7 @@ def test_missing_counters_are_not_costed(monkeypatch):
 	两者在 cost_status 上已经分开了,所以这儿可以按 0 算 —— 分开这件事只该
 	发生一次。
 	"""
-	monkeypatch.setitem(pricing.USD_PER_MTOK, "m", {
+	monkeypatch.setitem(pricing.CNY_PER_MTOK, "m", {
 		pricing.PEAK: {"input_tokens": 1.0, "cache_read_input_tokens": 0.1,
 		               "cache_creation_input_tokens": 0.0, "output_tokens": 2.0},
 	})
@@ -143,17 +143,30 @@ def _beijing(hour: int, minute: int) -> float:
 	                tzinfo=timezone(timedelta(hours=8))).timestamp()
 
 
-def test_off_peak_window_is_left_closed_right_open():
-	"""窗口边界。左闭右开。
+def test_peak_window_boundaries_are_left_closed_right_open():
+	"""两段高峰窗口的四个边界。左闭右开。
 
 	边界写错的表现:窗口两侧各错一次,而账目只是"有一点偏",看不出来。
 	"""
-	assert pricing.tier_at(_beijing(0, 29)) == pricing.PEAK
-	assert pricing.tier_at(_beijing(0, 30)) == pricing.OFF_PEAK     # 左闭
-	assert pricing.tier_at(_beijing(3, 0)) == pricing.OFF_PEAK
-	assert pricing.tier_at(_beijing(8, 29)) == pricing.OFF_PEAK
-	assert pricing.tier_at(_beijing(8, 30)) == pricing.PEAK         # 右开
-	assert pricing.tier_at(_beijing(12, 0)) == pricing.PEAK
+	assert pricing.tier_at(_beijing(8, 59)) == pricing.OFF_PEAK
+	assert pricing.tier_at(_beijing(9, 0)) == pricing.PEAK           # 左闭
+	assert pricing.tier_at(_beijing(11, 59)) == pricing.PEAK
+	assert pricing.tier_at(_beijing(12, 0)) == pricing.OFF_PEAK      # 右开
+	assert pricing.tier_at(_beijing(13, 59)) == pricing.OFF_PEAK
+	assert pricing.tier_at(_beijing(14, 0)) == pricing.PEAK          # 左闭
+	assert pricing.tier_at(_beijing(17, 59)) == pricing.PEAK
+	assert pricing.tier_at(_beijing(18, 0)) == pricing.OFF_PEAK      # 右开
+
+
+def test_off_peak_is_the_complement_of_the_peak_windows():
+	"""两段窗口之间的午休,和窗口以外的夜里,都是空闲。
+
+	漏掉午休那一段(把 09:00–18:00 整个当高峰)的表现:12:00–14:00 的调用按
+	两倍计价,账目整体偏高,不报错。
+	"""
+	for hour, minute in ((0, 0), (3, 0), (8, 30), (12, 30), (13, 0),
+	                     (18, 30), (23, 59)):
+		assert pricing.tier_at(_beijing(hour, minute)) == pricing.OFF_PEAK, (hour, minute)
 
 
 def test_tier_is_beijing_not_utc():
@@ -161,11 +174,11 @@ def test_tier_is_beijing_not_utc():
 
 	按 UTC 判的表现:同一份账本换个时区读就变了样,而它不报错。
 	"""
-	# 北京 02:00(= UTC 前一天 18:00)→ 空闲。若误按 UTC 的 18:00 判就是高峰。
-	moment = _beijing(2, 0)
-	assert pricing.tier_at(moment) == pricing.OFF_PEAK
+	# 北京 15:00(= UTC 07:00)→ 高峰。若误按 UTC 的 07:00 判就是空闲。
+	moment = _beijing(15, 0)
+	assert pricing.tier_at(moment) == pricing.PEAK
 	utc_hour = datetime.fromtimestamp(moment, timezone.utc).hour
-	assert utc_hour == 18          # 证明确实是"UTC 看是 18 点"的那个时刻
+	assert utc_hour == 7           # 证明确实是"UTC 看是 7 点"的那个时刻
 
 
 # ---------------------------------------------------------------- 计数器
@@ -637,7 +650,7 @@ def test_turn_line_shows_tokens_and_hides_unknown_money(ledger):
 
 
 def test_turn_line_shows_money_when_priced(ledger, monkeypatch):
-	monkeypatch.setitem(pricing.USD_PER_MTOK, "priced-model", {
+	monkeypatch.setitem(pricing.CNY_PER_MTOK, "priced-model", {
 		pricing.PEAK: {"input_tokens": 1.0, "cache_read_input_tokens": 0.1,
 		               "cache_creation_input_tokens": 0.0, "output_tokens": 2.0},
 		pricing.OFF_PEAK: {"input_tokens": 0.5, "cache_read_input_tokens": 0.05,

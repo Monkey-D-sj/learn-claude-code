@@ -16,6 +16,9 @@
     哪个时段"必须由**调用发生的时刻**决定,不能事后猜 —— 事后重算等于用今天的
     时段改写历史的账。见 tier_at。
 
+    哪些时刻算高峰是你定的(09:00–12:00、14:00–18:00,北京时间),其余全是
+    空闲。窗口只写在这里一处,别处没有第二份。
+
 三、缓存写入**不在这张表里**。实测这个端点的 cache_creation_input_tokens 恒为
     0,所以它不是"未知",是"没有这一笔"。填 0.0 而不是留 None:留 None 会让
     整笔都算不出金额。
@@ -27,9 +30,10 @@
 import time
 from datetime import datetime, timedelta, timezone
 
-# 价格变了必须改它。改之前写出去的那些记录带着旧版本号,所以历史账目不会被
-# 新价悄悄改写。
-PRICING_VERSION = "ds-2026-09-21-cny"
+# 价格或**时段窗口**变了必须改它:两者都决定"这一笔按哪一档算"。改之前写出去
+# 的那些记录带着旧版本号,所以历史账目不会被新价悄悄改写 —— 报表自检报"tier 和
+# ts 对不上"时,先看这些记录带的版本号是不是旧的。
+PRICING_VERSION = "ds-2026-09-21-cny-peakhours"
 
 # 计价的货币。记录里带着它走(见 usage.meter),报表按它渲染 —— 而不是所有地方
 # 都硬写一个 ¥。换供应商换币种时,旧记录仍然读得对。
@@ -40,10 +44,14 @@ OFF_PEAK = "off_peak"
 
 # 单价:人民币 / 每 100 万 token。
 #
+# 名字里是 CNY 不是 USD —— 这张表装的是人民币。一个叫 `_usd` 的表装着人民币跟
+# 一个叫 `cost_usd` 的字段装着人民币是同一种错:看起来一直是对的,直到拿去对账单。
+# (这名字原来就叫 USD_PER_MTOK,是跟着旧字段名一起改的。)
+#
 # 字段名**故意**跟 SDK 的 usage 计数器一模一样(input_tokens /
 # cache_read_input_tokens / cache_creation_input_tokens / output_tokens),不做
 # 改名。中间加一层"业务名 ↔ 字段名"的映射就是多一个会漂的地方,而它漂了不报错。
-USD_PER_MTOK = {
+CNY_PER_MTOK = {
 	"deepseek-flash": {
 		PEAK: {
 			"input_tokens": 2.0,
@@ -63,19 +71,22 @@ USD_PER_MTOK = {
 # 算金额之前必须都填上的那几项。cache_creation 不在里面:它是 0,乘不乘都一样。
 _REQUIRED = ("input_tokens", "cache_read_input_tokens", "output_tokens")
 
-# 优惠时段的窗口,**北京时间**,按分钟表示。左闭右开。
+# 高峰时段的窗口,**北京时间**,按分钟表示。左闭右开。
 #
-# ⚠️ **这个窗口我核不了** —— 我手上没有联网工具,查不到 DeepSeek 当前公布的
-#    优惠时段。下面填的是"北京时间 00:30–08:30"(也就是 UTC 16:30–00:30),
-#    这是 DeepSeek 一贯的优惠时段。**你必须自己确认一次。**
+# 你确认过的表:09:00–12:00、14:00–18:00 是高峰。**其余时段全是空闲** —— 空闲
+# 不再是一个窗口,而是这张高峰窗口表的补集,所以夜里(00:00–09:00)、午间
+# (12:00–14:00)、傍晚到半夜(18:00–24:00)都按空闲计价。
 #
-# 猜错的表现:落在窗口里的调用被按高峰计价,账目整体偏高,而它不报错。所以每次
-# 调用都把 tier 记进账本(见 usage.meter),报表还专门有一段"按时段"——
-# 拿它跟你的账单对一下就知道这里填得对不对。
+# 按高峰写、按补集判:是因为高峰是**你给的那张表**里的东西,照抄它不用我在这里
+# 做补集运算。补集算漏一段(比如把 12:00–14:00 漏在窗口里)的表现是那一段悄悄
+# 按两倍计价,而整张账只是"有一点偏",不报错。
 #
-# 改这里只需要改这两个数,别处不用动。
-_OFF_PEAK_START_MIN = 0 * 60 + 30      # 00:30
-_OFF_PEAK_END_MIN = 8 * 60 + 30        # 08:30
+# 窗口错一格只影响落在边界上的调用,所以边界由测试逐条钉住(见 test_usage 的
+# 时段一节),不靠这里看两眼。改这里只需要改这张表,别处不用动。
+_PEAK_WINDOWS = (
+	(9 * 60, 12 * 60),     # 09:00–12:00;12:00 整开始算空闲
+	(14 * 60, 18 * 60),    # 14:00–18:00;18:00 整开始算空闲
+)
 
 # 中国没有夏令时,固定 UTC+8 —— 所以直接加 8 小时就够,不用 zoneinfo。
 # (Windows 上 zoneinfo 还得额外装 tzdata,而"只在某些机器上崩"是另一类坑。)
@@ -90,12 +101,14 @@ def tier_at(ts: float) -> str:
 	"""
 	local = datetime.fromtimestamp(ts, _BEIJING)
 	minutes = local.hour * 60 + local.minute
-	return OFF_PEAK if _OFF_PEAK_START_MIN <= minutes < _OFF_PEAK_END_MIN else PEAK
+	if any(start <= minutes < end for start, end in _PEAK_WINDOWS):
+		return PEAK
+	return OFF_PEAK
 
 
 def rates(model: str, tier: str):
 	"""这个模型这个时段的单价表。没有返回 None。"""
-	return USD_PER_MTOK.get(model, {}).get(tier)
+	return CNY_PER_MTOK.get(model, {}).get(tier)
 
 
 def estimate_cost(model: str, counts: dict, tier: str) -> tuple[float | None, str]:
@@ -109,7 +122,7 @@ def estimate_cost(model: str, counts: dict, tier: str) -> tuple[float | None, st
 	后两种都返回 None 而不是 0.0。0 的意思是"确定不花钱" —— 把"不知道"写成 0,
 	总账看起来是零,而你会以为很便宜。
 	"""
-	table = USD_PER_MTOK.get(model)
+	table = CNY_PER_MTOK.get(model)
 	if table is None:
 		return None, "unknown_model"
 	prices = table.get(tier)

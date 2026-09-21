@@ -129,8 +129,8 @@ def _run(tmp_path, monkeypatch, records):
 
 
 def test_self_check_passes_when_tier_matches_ts(tmp_path, monkeypatch, capsys):
-	# 北京 12:00 → 高峰,记的也是 peak
-	_run(tmp_path, monkeypatch, [record(tier="peak", ts=_beijing(12, 0))])
+	# 北京 15:00 → 高峰,记的也是 peak
+	_run(tmp_path, monkeypatch, [record(tier="peak", ts=_beijing(15, 0))])
 	out = capsys.readouterr().out
 	assert "1 条带 tier 的记录,都和自己的 ts 对得上" in out
 	assert "⚠️" not in out
@@ -153,7 +153,7 @@ def test_self_check_flags_tier_that_contradicts_its_own_ts(tmp_path, monkeypatch
 def test_self_check_says_how_many_records_it_skipped(tmp_path, monkeypatch,
                                                      capsys):
 	"""没有 tier 的旧记录不算"查过" —— 别让"都对得上"把没查的也包进去。"""
-	_run(tmp_path, monkeypatch, [record(tier="peak", ts=_beijing(12, 0)),
+	_run(tmp_path, monkeypatch, [record(tier="peak", ts=_beijing(15, 0)),
 	                             record()])          # 第二条没有 ts / tier
 	out = capsys.readouterr().out
 	assert "1 条带 tier 的记录,都和自己的 ts 对得上" in out
