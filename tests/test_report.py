@@ -12,6 +12,7 @@ test_usage.py。report.py 从 usage 那头 import,不抄第二份。
 
 import json
 import sys
+from datetime import datetime, timedelta, timezone
 
 import report
 
@@ -20,7 +21,7 @@ def record(**over):
 	base = dict(session="s1", turn="t1", agent="main", purpose="main",
 	            ok=True, input_tokens=100, cache_read_input_tokens=900,
 	            cache_creation_input_tokens=0, output_tokens=10,
-	            elapsed_ms=100, cost_usd=0.001)
+	            elapsed_ms=100, cost=0.001, cost_currency="CNY")
 	base.update(over)
 	return base
 
@@ -103,7 +104,7 @@ def test_main_reports_unpriced_instead_of_zero(tmp_path, monkeypatch, capsys):
 
 	"$0" 的意思是"确定不花钱"。这条从 usage.py 一路守到报表,别从报表这头漏。
 	"""
-	path = _write(tmp_path, [record(cost_usd=None)])
+	path = _write(tmp_path, [record(cost=None)])
 	monkeypatch.setattr(sys, "argv", ["report.py", str(path)])
 	monkeypatch.setattr(report, "USAGE_PATH", path)
 
@@ -111,3 +112,49 @@ def test_main_reports_unpriced_instead_of_zero(tmp_path, monkeypatch, capsys):
 	out = capsys.readouterr().out
 	assert "总成本      —" in out
 	assert "价目表没填" in out
+
+
+# ------------------------------------------------------- 账本自检
+
+def _beijing(hour, minute):
+	return datetime(2026, 9, 21, hour, minute,
+	                tzinfo=timezone(timedelta(hours=8))).timestamp()
+
+
+def _run(tmp_path, monkeypatch, records):
+	path = _write(tmp_path, records)
+	monkeypatch.setattr(sys, "argv", ["report.py", str(path)])
+	monkeypatch.setattr(report, "USAGE_PATH", path)
+	report.main()
+
+
+def test_self_check_passes_when_tier_matches_ts(tmp_path, monkeypatch, capsys):
+	# 北京 12:00 → 高峰,记的也是 peak
+	_run(tmp_path, monkeypatch, [record(tier="peak", ts=_beijing(12, 0))])
+	out = capsys.readouterr().out
+	assert "1 条带 tier 的记录,都和自己的 ts 对得上" in out
+	assert "⚠️" not in out
+
+
+def test_self_check_flags_tier_that_contradicts_its_own_ts(tmp_path, monkeypatch,
+                                                           capsys):
+	"""tier 和它自己的 ts 对不上必须报出来。
+
+	两种来源:账本被手改过,或者优惠时段窗口改过。两种都只有这一处能发现,
+	而后果都是整个成本栏悄悄偏一倍。
+	"""
+	# 北京 03:00 → 空闲,却记成 peak
+	_run(tmp_path, monkeypatch, [record(tier="peak", ts=_beijing(3, 0))])
+	out = capsys.readouterr().out
+	assert "⚠️ 1/1 条的 tier 和它自己的 ts 对不上" in out
+	assert "优惠时段窗口改过" in out
+
+
+def test_self_check_says_how_many_records_it_skipped(tmp_path, monkeypatch,
+                                                     capsys):
+	"""没有 tier 的旧记录不算"查过" —— 别让"都对得上"把没查的也包进去。"""
+	_run(tmp_path, monkeypatch, [record(tier="peak", ts=_beijing(12, 0)),
+	                             record()])          # 第二条没有 ts / tier
+	out = capsys.readouterr().out
+	assert "1 条带 tier 的记录,都和自己的 ts 对得上" in out
+	assert "另外 1 条没有 tier 字段" in out

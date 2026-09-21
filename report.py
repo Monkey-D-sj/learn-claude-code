@@ -4,19 +4,21 @@
     python report.py                  # 默认 config.USAGE_PATH
     python report.py 别的/usage.jsonl
 
-六段,每一段回答一个具体问题:
+八段,每一段回答一个具体问题:
 
     总览          花了多少 / 缓存命中没有 / 有没有算不出金额的
     按 purpose    **哪一块最贵** —— 这一张是"下一步优化什么"的直接输入
     按 agent      子 agent 值不值
     按会话        最大的几个会话
+    按时段        空闲还是高峰 —— **差整整一倍**,挪时段是最直接的省钱
     重试的账      花掉了但没拿到结果的那些
     命中率曲线    逐轮看命中率,压缩那一轮标出来 —— 压缩有没有把缓存打掉
+    账本自检      tier 和 ts 对不对得上(不一致 = 有人动过账本或窗口)
 
-最后一段是这份报表存在的主要理由。压缩省下 token,但缓存是**前缀匹配**,
+命中率曲线那一张是这份报表存在的主要理由。压缩省下 token,但缓存是**前缀匹配**,
 而压缩器的摘要每次措辞都不可能逐字节相同 —— 于是存在一个反直觉的可能:
-**压缩把缓存打掉了**,省下的 token 不如失去的折扣值钱。这件事只看总成本
-永远看不出来,必须逐轮看。
+**压缩把缓存打掉了**,省下的 token 不如失去的折扣值钱。这件事只看总成本永远
+看不出来,必须逐轮看。
 """
 
 import json
@@ -30,7 +32,7 @@ from config import USAGE_PATH
 #   COUNTERS   哪些计数器
 #   summarize  怎么加总
 #   hit_rate   命中率的分母是什么
-#   usd        金额怎么渲染
+#   money      金额怎么渲染(含币种)
 #
 # 抄一份的代价:某天加了计数器、或者改了某个口径,usage.py 改了、这儿没改 ——
 # 报表少算一栏、数字偏低。**而这不会报错**,只是数字变小了。同一个定义写两遍、
@@ -38,7 +40,8 @@ from config import USAGE_PATH
 #
 # 终端那边(usage.turn_line)用的是同一批函数,所以屏幕上那句小结和这份报表
 # 必然一致 —— 不一致的可能性从"会不会漂"变成了"不可能"。
-from usage import COUNTERS, hit_rate, summarize, usd
+from pricing import tier_at
+from usage import COUNTERS, hit_rate, money, summarize
 
 
 def load(path: Path) -> tuple[list[dict], int]:
@@ -129,21 +132,22 @@ def main() -> None:
 	print(f"  输出        {overall['output_tokens']:,}")
 	print(f"  上下文总量  {total_in:,}")
 	print(f"  缓存命中率  {hit_rate(overall)}")
-	print(f"  总成本      {usd(overall['cost'])}"
+	print(f"  总成本      {money(overall['cost'], overall['currency'])}"
 	      + (f"   ({overall['unpriced']}/{overall['calls']} 条算不出金额)"
 	         if overall["unpriced"] else ""))
 	if overall["unpriced"]:
 		print("              ↑ 价目表没填,见 pricing.py。它报 None 而不是 0,"
 		      "所以这个数是**偏低**的,不是免费的。")
 	if overall["cost"] is not None:
-		print(f"  平均每次    {usd(overall['cost'] / overall['calls'])}")
+		print(f"  平均每次    "
+		      f"{money(overall['cost'] / overall['calls'], overall['currency'])}")
 
 	# ---- 按 purpose ----
 	print("\n## 按 purpose —— 哪一块最贵")
 	grouped = _group(records, lambda r: r.get("purpose") or "?")
 	rows = [(name, row["calls"], f"{row['input_tokens']:,}",
 	         f"{row['cache_read_input_tokens']:,}", f"{row['output_tokens']:,}",
-	         hit_rate(row), usd(row["cost"])) for name, row in grouped]
+	         hit_rate(row), money(row["cost"], row["currency"])) for name, row in grouped]
 	print(_table(("purpose", "calls", "miss", "hit", "out", "hit%", "cost"), rows))
 	if any(name == "compaction" for name, _ in grouped):
 		print("  compaction 那一行拿的是**完整上下文**,它常常是最大的一笔 ——")
@@ -158,7 +162,7 @@ def main() -> None:
 	for name, row in _group(records, lambda r: r.get("agent") or "?"):
 		rows.append((name, row["calls"], f"{row['input_tokens']:,}",
 		             f"{row['cache_read_input_tokens']:,}", hit_rate(row),
-		             usd(row["cost"])))
+		             money(row["cost"], row["currency"])))
 	print(_table(("agent", "calls", "miss", "hit", "hit%", "cost"), rows))
 
 	# ---- 按会话 ----
@@ -167,9 +171,21 @@ def main() -> None:
 	for name, row in _group(records, lambda r: r.get("session") or "(无归属)"):
 		rows.append((name, row["calls"], f"{row['input_tokens']:,}",
 		             f"{row['cache_read_input_tokens']:,}", hit_rate(row),
-		             usd(row["cost"])))
+		             money(row["cost"], row["currency"])))
 	for row in rows[:10]:
 		print(_table(("session", "calls", "miss", "hit", "hit%", "cost"), [row]))
+
+	# ---- 按时段 ----
+	print("\n## 按时段 —— 空闲是高峰的一半")
+	by_tier = _group(records, lambda r: r.get("tier") or "(无)")
+	rows = [(name, row["calls"], f"{row['input_tokens']:,}",
+	         f"{row['cache_read_input_tokens']:,}", f"{row['output_tokens']:,}",
+	         f"{row['elapsed_ms'] / 1000:.0f}s",
+	         money(row["cost"], row["currency"])) for name, row in by_tier]
+	print(_table(("tier", "calls", "miss", "hit", "out", "耗时", "cost"), rows))
+	if any(name == "peak" for name, _ in by_tier):
+		print("  高峰那段如果占了大头:批处理、长任务、批量重构挪到空闲时段 ——")
+		print("  同样的量直接省一半,而且不用改一行代码。这是最省力的那个动作。")
 
 	# ---- 重试的账 ----
 	failed = [r for r in records if not r.get("ok", True)]
@@ -178,7 +194,7 @@ def main() -> None:
 		print("\n## 重试花掉的钱")
 		print(f"  {row['calls']} 次调用没有拿到结果,"
 		      f"其中 input 未命中 {row['input_tokens']:,} token,"
-		      f"成本 {usd(row['cost'])}")
+		      f"成本 {money(row['cost'], row['currency'])}")
 		print("  这些请求发出去了、被计费了,然后失败了。不单独记账的话,"
 		      "它们和'没花过'在总账里长得一样。")
 	else:
@@ -225,6 +241,37 @@ def main() -> None:
 		print(_table(("turn", "calls", "miss", "hit", "hit%", "发生了"), rows))
 		print("  看什么:压缩那一轮的 hit% 如果掉一大截,而它省下的 token 又不多,"
 		      "\n  那压缩的**净收益是负的** —— 省了 token,赔了缓存折扣。")
+
+	# ---- 账本自检 ----
+	#
+	# tier 和 ts 在 usage.meter 里取自同一个时刻,所以拿 tier_at(ts) 复核每一条
+	# 都该一致。不一致只有两种可能,两种都值得知道:
+	#
+	#   1. 账本被手改过;
+	#   2. pricing 里的优惠时段窗口改过 —— 那会让**所有**历史记录一起对不上,
+	#      而历史账目不该被新窗口重写(跟"改价必须一起改 PRICING_VERSION"是
+	#      同一件事)。
+	#
+	# 这条检查的价值在于:上面两种都不会从别的任何地方露出来,而它们的后果是
+	# 整个成本栏悄悄偏一倍。
+	checked = [r for r in records
+	           if r.get("ts") is not None and r.get("tier") is not None]
+	drifted = [r for r in checked if tier_at(r["ts"]) != r["tier"]]
+	print("\n## 账本自检")
+	if drifted:
+		sample = drifted[0]
+		print(f"  ⚠️ {len(drifted)}/{len(checked)} 条的 tier 和它自己的 ts 对不上")
+		print(f"     ts={sample['ts']} 记的是 {sample['tier']},"
+		      f"按现在的窗口应是 {tier_at(sample['ts'])}")
+		print("     要么账本被手改过,要么优惠时段窗口改过。后者会让全部历史")
+		print("     记录一起对不上 —— 而历史账目不该被新窗口重写。")
+	else:
+		print(f"  {len(checked)} 条带 tier 的记录,都和自己的 ts 对得上。")
+		# 没 tier 的那些是旧版记录(字段是这次改之前写的)。说出来,别让
+		# "都对得上"这句话把没查的部分也算进去。
+		skipped = len(records) - len(checked)
+		if skipped:
+			print(f"  (另外 {skipped} 条没有 tier 字段 —— 这次改动之前的旧记录)")
 
 
 if __name__ == "__main__":

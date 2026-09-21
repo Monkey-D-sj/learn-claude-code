@@ -36,7 +36,7 @@ import threading
 import time
 
 from config import USAGE_PATH
-from pricing import PRICING_VERSION, estimate_cost
+from pricing import CURRENCY, PRICING_VERSION, estimate_cost, tier_at
 
 # 计数器名单。顺序就是写进 JSONL 的顺序,方便肉眼比对。
 COUNTERS = (
@@ -117,19 +117,23 @@ def summarize(records: list[dict]) -> dict:
 	"""
 	counters = {name: 0 for name in COUNTERS}
 	cost, priced, unpriced = 0.0, 0, 0
+	currency = None
 	for record in records:
 		for name in COUNTERS:
 			counters[name] += record.get(name) or 0
-		if record.get("cost_usd") is None:
+		if record.get("cost") is None:
 			unpriced += 1
 		else:
-			cost += record["cost_usd"]
+			cost += record["cost"]
 			priced += 1
+			currency = currency or record.get("cost_currency")
 	return {
 		"calls": len(records),
 		# **一条都算不出来时给 None,不是 0.0。** 0 的意思是"确定不花钱",
 		# 而真实情况是"价目表没填,不知道"。
 		"cost": cost if priced else None,
+		# 币种从记录里带上来,不在渲染处硬写 —— 换币种时旧记录仍然读得对。
+		"currency": currency or CURRENCY,
 		"priced": priced,
 		"unpriced": unpriced,
 		"total_input": total_input(counters),
@@ -149,23 +153,30 @@ def hit_rate(row: dict) -> str:
 	return "—" if total == 0 else f"{100 * (row.get('cache_read_input_tokens') or 0) / total:.1f}%"
 
 
-def usd(value: float | None) -> str:
+_SYMBOLS = {"CNY": "¥", "USD": "$"}
+
+
+def money(value: float | None, currency: str = CURRENCY) -> str:
 	"""渲染金额。三种"零"必须长得不一样:
 
-	  None  不知道(价目表没填)   → "—"
-	  0.0   确定不花钱            → "$0"
-	  极小但非零                  → 科学计数,不能四舍五入成 "$0"
+	  None  不知道(模型/时段没填价)  → "—"
+	  0.0   确定不花钱               → "¥0"
+	  极小但非零                     → 科学计数,不能四舍五入成 "¥0"
 
-	第三条不是洁癖:把"花了一点"渲染成 "$0",这一栏就失去了存在理由 ——
+	第三条不是洁癖:把"花了一点"渲染成 "¥0",这一栏就失去了存在理由 ——
 	而它上面两行的区别正是同一个道理。
+
+	**符号按记录自带的币种来。** 认不出的币种就把代码打出来(比如 "XXX 1.2"),
+	不猜一个符号:¥ 和 $ 差着七倍,而猜错的那个看起来一直是对的。
 	"""
+	head = _SYMBOLS.get(currency) or f"{currency} "
 	if value is None:
 		return "—"
 	if value == 0:
-		return "$0"
+		return f"{head}0"
 	digits = 6 if value < 0.01 else 4
 	text = f"{value:.{digits}f}".rstrip("0").rstrip(".")
-	return f"${text}" if text != "0" else f"${value:.2e}"
+	return f"{head}{text}" if text != "0" else f"{head}{value:.2e}"
 
 
 def read_turn(session: str, turn) -> list[dict]:
@@ -208,7 +219,7 @@ def turn_line(records: list[dict]) -> str | None:
 	        f"输出 {row['output_tokens']:,} · "
 	        f"{row['elapsed_ms'] / 1000:.1f}s")
 	if row["cost"] is not None:
-		line += f" · {usd(row['cost'])}"
+		line += f" · {money(row['cost'], row['currency'])}"
 	return line
 
 
@@ -231,9 +242,15 @@ def meter(*, purpose: str, model: str, usage_obj, attempt: int,
 	"""
 	try:
 		counts = counts_of(usage_obj)
-		cost, status = estimate_cost(model, counts)
+		# **时段在调用发生的这一刻定,不留给事后。** 空闲和高峰差整整一倍,
+		# 而事后重算等于用今天的时段改写历史的账 —— 历史账目一旦能被重写,它
+		# 就不再是账目了。ts 和 tier 取自同一个时刻,所以报表那边能拿
+		# tier_at(ts) 复核这一条,两个值必然一致(不一致就是有人插了手)。
+		now = time.time()
+		tier = tier_at(now)
+		cost, status = estimate_cost(model, counts, tier)
 		record = {
-			"ts": round(time.time(), 3),
+			"ts": round(now, 3),
 			"session": None,
 			"turn": None,
 			"agent": "main",
@@ -247,7 +264,11 @@ def meter(*, purpose: str, model: str, usage_obj, attempt: int,
 			**counts,
 			"total_input_tokens": total_input(counts),
 			"service_tier": getattr(usage_obj, "service_tier", None),
-			"cost_usd": cost,
+			"tier": tier,
+			# 金额的字段叫 cost 不叫 cost_usd —— 它是人民币。币种跟着记录走,
+			# 报表按它渲染,而不是各处硬写一个符号。
+			"cost": cost,
+			"cost_currency": CURRENCY,
 			"cost_status": status,
 			"pricing_version": PRICING_VERSION,
 		}

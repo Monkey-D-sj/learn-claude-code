@@ -17,6 +17,7 @@
 
 import json
 import time
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import anthropic
@@ -30,62 +31,141 @@ import usage
 
 # ---------------------------------------------------------------- 价目表
 
-def test_unfilled_price_is_none_not_zero():
-	"""单价没填 → None,不是 0。
+def test_price_is_in_cny_not_usd():
+	"""币种是人民币。所以字段叫 `cost` 不叫 `cost_usd`,渲染用 ¥。
 
-	写成 0 的话总账看起来是零,而你会以为很便宜 —— 而真正的结论是
-	"我不知道花了多少"。
+	一个叫 `_usd` 的字段装着人民币是最坏的那种错 —— 它看起来一直是对的,
+	直到你拿它去对账单。
 	"""
-	counts = {"input_tokens": 1_000_000, "cache_read_input_tokens": 0,
+	assert pricing.CURRENCY == "CNY"
+	assert usage.money(1.0) == "¥1"
+
+
+def test_two_tiers_differ_by_exactly_two():
+	"""高峰是空闲的两倍。这是那张表里唯一的规律,而整张表靠它自洽。
+
+	钉住它:哪天有人只改了一档的价格,这里会红 —— 而只改一档的表现是账目
+	"有点偏",从别的地方看不出来。
+	"""
+	table = pricing.USD_PER_MTOK["deepseek-flash"]
+	for counter in ("input_tokens", "cache_read_input_tokens", "output_tokens"):
+		assert table[pricing.PEAK][counter] == pytest.approx(
+			table[pricing.OFF_PEAK][counter] * 2), counter
+
+
+def test_real_prices_match_the_published_table():
+	"""照抄一遍价目表 —— 填错数字的表现是账目整体偏一个倍数,不报错。"""
+	table = pricing.USD_PER_MTOK["deepseek-flash"]
+	assert table[pricing.OFF_PEAK]["cache_read_input_tokens"] == 0.02
+	assert table[pricing.PEAK]["cache_read_input_tokens"] == 0.04
+	assert table[pricing.OFF_PEAK]["input_tokens"] == 1.0
+	assert table[pricing.PEAK]["input_tokens"] == 2.0
+	assert table[pricing.OFF_PEAK]["output_tokens"] == 4.0
+	assert table[pricing.PEAK]["output_tokens"] == 8.0
+
+
+def test_cache_creation_is_free_not_unknown():
+	"""缓存写入填的是 0.0,不是 None。
+
+	实测这个端点的 cache_creation_input_tokens 恒为 0 —— 那是"没有这一笔",
+	不是"不知道价格"。填 None 会让整笔都算不出金额。
+	"""
+	table = pricing.USD_PER_MTOK["deepseek-flash"]
+	for tier in (pricing.PEAK, pricing.OFF_PEAK):
+		assert table[tier]["cache_creation_input_tokens"] == 0.0
+
+
+def test_cost_math_per_tier(monkeypatch):
+	monkeypatch.setitem(pricing.USD_PER_MTOK, "m", {
+		pricing.PEAK: {"input_tokens": 2.0, "cache_read_input_tokens": 0.2,
+		               "cache_creation_input_tokens": 0.0, "output_tokens": 8.0},
+		pricing.OFF_PEAK: {"input_tokens": 1.0, "cache_read_input_tokens": 0.1,
+		                   "cache_creation_input_tokens": 0.0, "output_tokens": 4.0},
+	})
+	counts = {"input_tokens": 1_000_000, "cache_read_input_tokens": 1_000_000,
 	          "cache_creation_input_tokens": 0, "output_tokens": 1_000_000}
-	cost, status = pricing.estimate_cost("deepseek-flash", counts)
+	peak, peak_status = pricing.estimate_cost("m", counts, pricing.PEAK)
+	off, off_status = pricing.estimate_cost("m", counts, pricing.OFF_PEAK)
+	assert peak_status == "priced" and off_status == "priced"
+	assert peak == pytest.approx(2.0 + 0.2 + 8.0)
+	assert off == pytest.approx(1.0 + 0.1 + 4.0)
+	assert peak == pytest.approx(off * 2)
+
+
+def test_unknown_model_or_tier_is_unknown_not_zero():
+	cost, status = pricing.estimate_cost("gpt-nobody", {}, pricing.PEAK)
+	assert cost is None and status == "unknown_model"
+	# 模型认得、时段认不得 —— 也是 unknown。当成 0 就是把"不知道"说成"不花钱"。
+	cost, status = pricing.estimate_cost("deepseek-flash", {}, "半夜")
+	assert cost is None and status == "unknown_model"
+
+
+def test_unfilled_price_is_none_not_zero(monkeypatch):
+	"""某一档单价没填 → None,不是 0。
+
+	写成 0 的话总账看起来是零,而真正的结论是"我不知道花了多少"。
+	"""
+	monkeypatch.setitem(pricing.USD_PER_MTOK, "half-filled", {
+		pricing.PEAK: {"input_tokens": None, "cache_read_input_tokens": 0.04,
+		               "cache_creation_input_tokens": 0.0, "output_tokens": 8.0},
+	})
+	cost, status = pricing.estimate_cost(
+		"half-filled", {"input_tokens": 1_000_000}, pricing.PEAK)
 	assert cost is None
 	assert status == "unpriced"
 
 
-def test_unknown_model_is_a_different_status():
-	cost, status = pricing.estimate_cost("gpt-nobody", {})
-	assert cost is None
-	assert status == "unknown_model"
-
-
-def test_cost_math(monkeypatch):
-	monkeypatch.setitem(pricing.USD_PER_MTOK, "m", {
-		"input_tokens": 1.0,
-		"cache_read_input_tokens": 0.1,
-		"cache_creation_input_tokens": 0.0,
-		"output_tokens": 2.0,
-	})
-	cost, status = pricing.estimate_cost("m", {
-		"input_tokens": 1_000_000,
-		"cache_read_input_tokens": 1_000_000,
-		"cache_creation_input_tokens": 5_000_000,
-		"output_tokens": 1_000_000,
-	})
-	assert status == "priced"
-	assert cost == pytest.approx(1.0 + 0.1 + 0.0 + 2.0)
-
-
 def test_missing_counters_are_not_costed(monkeypatch):
-	"""端点没报的口径按 0 计,但那是"没有这一笔",不是"价格不知道"。
+	"""端点没报的口径按 0 计 —— 那是"没有这一笔",不是"价格不知道"。
 
-	cost_status 已经在更外层把这两件事分开了,所以这儿可以按 0 算 ——
-	分开这件事只该发生一次。
+	两者在 cost_status 上已经分开了,所以这儿可以按 0 算 —— 分开这件事只该
+	发生一次。
 	"""
 	monkeypatch.setitem(pricing.USD_PER_MTOK, "m", {
-		"input_tokens": 1.0,
-		"cache_read_input_tokens": 0.1,
-		"cache_creation_input_tokens": 0.0,
-		"output_tokens": 2.0,
+		pricing.PEAK: {"input_tokens": 1.0, "cache_read_input_tokens": 0.1,
+		               "cache_creation_input_tokens": 0.0, "output_tokens": 2.0},
 	})
 	cost, status = pricing.estimate_cost("m", {
 		"input_tokens": 1_000_000,
 		"cache_read_input_tokens": None,
 		"cache_creation_input_tokens": None,
 		"output_tokens": 0,
-	})
+	}, pricing.PEAK)
 	assert status == "priced"
 	assert cost == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------- 时段
+
+def _beijing(hour: int, minute: int) -> float:
+	"""北京时间某点某分对应的 epoch。中国固定 UTC+8,没有夏令时。"""
+	return datetime(2026, 9, 21, hour, minute,
+	                tzinfo=timezone(timedelta(hours=8))).timestamp()
+
+
+def test_off_peak_window_is_left_closed_right_open():
+	"""窗口边界。左闭右开。
+
+	边界写错的表现:窗口两侧各错一次,而账目只是"有一点偏",看不出来。
+	"""
+	assert pricing.tier_at(_beijing(0, 29)) == pricing.PEAK
+	assert pricing.tier_at(_beijing(0, 30)) == pricing.OFF_PEAK     # 左闭
+	assert pricing.tier_at(_beijing(3, 0)) == pricing.OFF_PEAK
+	assert pricing.tier_at(_beijing(8, 29)) == pricing.OFF_PEAK
+	assert pricing.tier_at(_beijing(8, 30)) == pricing.PEAK         # 右开
+	assert pricing.tier_at(_beijing(12, 0)) == pricing.PEAK
+
+
+def test_tier_is_beijing_not_utc():
+	"""窗口按北京时间 —— 不能跟着跑代码那台机器的时区、也不能按 UTC 判。
+
+	按 UTC 判的表现:同一份账本换个时区读就变了样,而它不报错。
+	"""
+	# 北京 02:00(= UTC 前一天 18:00)→ 空闲。若误按 UTC 的 18:00 判就是高峰。
+	moment = _beijing(2, 0)
+	assert pricing.tier_at(moment) == pricing.OFF_PEAK
+	utc_hour = datetime.fromtimestamp(moment, timezone.utc).hour
+	assert utc_hour == 18          # 证明确实是"UTC 看是 18 点"的那个时刻
 
 
 # ---------------------------------------------------------------- 计数器
@@ -178,8 +258,25 @@ def test_meter_carries_the_span(ledger):
 	assert record["agent"] == "subagent"
 	assert record["purpose"] == "main"
 	assert record["total_input_tokens"] == 100
-	assert record["cost_status"] == "unpriced"
+	assert record["cost_status"] == "priced"      # 这个模型现在有真价了
 	assert record["pricing_version"] == pricing.PRICING_VERSION
+
+
+def test_meter_freezes_the_tier_with_the_timestamp(ledger):
+	"""tier 和 ts 必须同源 —— 报表最后那段"账本自检"就靠这条。
+
+	不同源的表现:报表每次都说"有记录对不上";而没人去看的时候更糟 ——
+	整个成本栏悄悄偏一倍,因为时段决定单价。
+	"""
+	with usage.span(session="s1", turn=1):
+		usage.meter(purpose="main", model="deepseek-flash",
+		            usage_obj=make_usage(), attempt=1, ok=True,
+		            elapsed_ms=5, kind="stream")
+	record = read_ledger(ledger)[0]
+	assert record["tier"] in (pricing.PEAK, pricing.OFF_PEAK)
+	assert pricing.tier_at(record["ts"]) == record["tier"]
+	assert record["cost_currency"] == pricing.CURRENCY
+	assert record["cost"] > 0        # 有真价了,金额算得出来(而且不是 None)
 
 
 def test_meter_appends_one_line_per_call(ledger):
@@ -395,7 +492,7 @@ def test_nonstream_is_labelled(ledger, monkeypatch):
 def rows(**over):
 	base = dict(input_tokens=100, cache_read_input_tokens=900,
 	            cache_creation_input_tokens=0, output_tokens=10,
-	            elapsed_ms=100, cost_usd=0.001)
+	            elapsed_ms=100, cost=0.001, cost_currency="CNY")
 	base.update(over)
 	return base
 
@@ -427,21 +524,21 @@ def test_summarize_cost_is_none_when_nothing_priced():
 	$0 的意思是"确定不花钱",而真实情况是"价目表没填,不知道"。第一版报表
 	在这儿打了 "$0"。
 	"""
-	row = usage.summarize([rows(cost_usd=None), rows(cost_usd=None)])
+	row = usage.summarize([rows(cost=None), rows(cost=None)])
 	assert row["cost"] is None
 	assert row["unpriced"] == 2
 	assert row["priced"] == 0
 
 
 def test_summarize_genuinely_free_is_zero():
-	row = usage.summarize([rows(cost_usd=0.0)])
+	row = usage.summarize([rows(cost=0.0)])
 	assert row["cost"] == 0.0
 	assert row["priced"] == 1
 
 
 def test_unpriced_rows_do_not_contaminate_the_sum():
 	"""算不出来的那些不并进总和,单独数出来 —— 不然总账悄悄偏低。"""
-	row = usage.summarize([rows(cost_usd=0.5), rows(cost_usd=None)])
+	row = usage.summarize([rows(cost=0.5), rows(cost=None)])
 	assert row["cost"] == pytest.approx(0.5)
 	assert row["unpriced"] == 1
 
@@ -458,18 +555,29 @@ def test_hit_rate_is_dash_when_nothing_reported():
 	                       "cache_creation_input_tokens": 0}) == "—"
 
 
-def test_usd_distinguishes_three_kinds_of_zero():
-	assert usage.usd(None) == "—"            # 价目表没填
-	assert usage.usd(0.0) == "$0"            # 确定不花钱
-	assert usage.usd(1e-9) == "$1.00e-09"    # 不能四舍五入成 $0
+def test_money_distinguishes_three_kinds_of_zero():
+	assert usage.money(None) == "—"            # 价目表没填
+	assert usage.money(0.0) == "¥0"            # 确定不花钱
+	assert usage.money(1e-9) == "¥1.00e-09"    # 不能四舍五入成 ¥0
 
 
-def test_usd_does_not_trail_zeros():
+def test_money_uses_the_records_currency():
+	"""符号跟着记录自带的币种走,不硬写一个。
+
+	认不出的币种把代码打出来,不猜符号 —— ¥ 和 $ 差着七倍,而猜错的那个
+	看起来一直是对的。
+	"""
+	assert usage.money(1.0, "CNY") == "¥1"
+	assert usage.money(1.0, "USD") == "$1"
+	assert usage.money(1.0, "XYZ") == "XYZ 1"
+
+
+def test_money_does_not_trail_zeros():
 	"""单次调用的钱常常小于一分,所以小数位要够;但够了就别拖零。"""
-	assert usage.usd(0.006) == "$0.006"      # 不是 $0.006000
-	assert usage.usd(0.0185) == "$0.0185"
-	assert usage.usd(0.0009) == "$0.0009"
-	assert usage.usd(1.2345) == "$1.2345"
+	assert usage.money(0.006) == "¥0.006"      # 不是 ¥0.006000
+	assert usage.money(0.0185) == "¥0.0185"
+	assert usage.money(0.0009) == "¥0.0009"
+	assert usage.money(1.2345) == "¥1.2345"
 
 
 # ---------------------------------------------------------------- read_turn / turn_line
@@ -525,21 +633,28 @@ def test_turn_line_shows_tokens_and_hides_unknown_money(ledger):
 	assert "90.0%" in line
 	assert "输出 10" in line
 	assert "1.5s" in line
-	assert "$" not in line
+	assert "$" not in line and "¥" not in line
 
 
 def test_turn_line_shows_money_when_priced(ledger, monkeypatch):
 	monkeypatch.setitem(pricing.USD_PER_MTOK, "priced-model", {
-		"input_tokens": 1.0, "cache_read_input_tokens": 0.1,
-		"cache_creation_input_tokens": 0.0, "output_tokens": 2.0,
+		pricing.PEAK: {"input_tokens": 1.0, "cache_read_input_tokens": 0.1,
+		               "cache_creation_input_tokens": 0.0, "output_tokens": 2.0},
+		pricing.OFF_PEAK: {"input_tokens": 0.5, "cache_read_input_tokens": 0.05,
+		                   "cache_creation_input_tokens": 0.0, "output_tokens": 1.0},
 	})
 	with usage.span(session="s1", turn=1):
 		usage.meter(purpose="main", model="priced-model",
 		            usage_obj=make_usage(input_tokens=1_000_000,
 		                                 output_tokens=1_000_000),
 		            attempt=1, ok=True, elapsed_ms=10, kind="stream")
-	line = usage.turn_line(usage.read_turn("s1", 1))
-	assert "$3" in line           # 1M*1.0 + 1M*2.0 = 3.0
+	record = usage.read_turn("s1", 1)[0]
+	line = usage.turn_line([record])
+	# 不断言具体金额:测试跑在哪个时段是不确定的,而两个时段差一倍。
+	# 断言的是"屏幕上那个数就是账本算出来的那个数"。
+	# 注意记录里那个字段叫 cost_currency,汇总行里才叫 currency。
+	assert usage.money(record["cost"], record["cost_currency"]) in line
+	assert record["cost"] > 1.0
 
 
 def test_turn_line_is_none_without_records():
