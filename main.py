@@ -1,3 +1,5 @@
+import time
+
 from agent import agent_loop
 from app import MODEL, SYSTEM, make_compactor
 from config import MAX_ROUNDS
@@ -18,6 +20,12 @@ TODO = TodoManager()
 # 会话,所以提问器可以是模块级的那一个;浏览器那边不是 —— 那边得绑在"这一轮
 # 那条响应流"上,每轮现造,见 server.py 的 make_ask_text。
 TOOLS = build_tools(TODO, terminal_ask_text)
+
+# 这次运行的名字。**不能写死成 "terminal"**:轮次序号每个进程都从 1 开始,
+# 写死的话两次运行的第 1 轮会撞在一起 —— 报表把它们当同一轮加总,数字凭空
+# 变大,而不报错。一个终端进程从头到尾就是一个会话,但**每跑一次是一个新会话**。
+# 带时间戳是为了在报表里还认得出是哪一次(纯随机串读起来没有信息)。
+SESSION = f"terminal-{time.strftime('%Y%m%d-%H%M%S')}"
 
 if __name__ == "__main__":
 	print("s01: Agent Loop")
@@ -47,7 +55,7 @@ if __name__ == "__main__":
 			# span 里发生的每一次 API 调用都自动带上这些归属 —— 包括压缩器
 			# 那次摘要,和工具里那些(vision)。传参穿不过工具 handler:
 			# agent_loop 只给 handler 传 **block.input,所以只能用这一层环境。
-			with usage.span(session="terminal", turn=turn):
+			with usage.span(session=SESSION, turn=turn):
 				outcome = agent_loop(history,
 				                     active_request=query,
 				                     system=SYSTEM,
@@ -63,6 +71,12 @@ if __name__ == "__main__":
 			# 下一句提问还会接着一个其实没干完的上下文往下走。
 			if outcome.status == "failed":
 				print(f"\033[31m[这一轮没跑完: {outcome.error}]\033[0m")
+			# 这一轮花了多少,当场就能看见 —— 不用等事后去跑 report.py。
+			# 从账本读回来,不另攒一份:见 usage.read_turn 那段。
+			# 灰色,跟工具输出一个色阶:它是诊断信息,不是模型说的话。
+			line = usage.turn_line(usage.read_turn(SESSION, turn))
+			if line:
+				print(f"\033[90m{line}\033[0m")
 		except Exception as e:
 			# 兜底:任何异常都不该把 history 一起带走
 			print(f"\033[31mError: {type(e).__name__}: {e}\033[0m")

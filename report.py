@@ -26,12 +26,19 @@ from pathlib import Path
 
 from config import USAGE_PATH
 
-# 计数器名单**从写的那一头借过来**,不在这儿再抄一份。
+# 账本的**定义和算法**都从写的那一头借过来,不在这儿再抄一份:
+#   COUNTERS   哪些计数器
+#   summarize  怎么加总
+#   hit_rate   命中率的分母是什么
+#   usd        金额怎么渲染
 #
-# 抄一份的代价:某天给账本加一个计数器(reasoning_tokens 之类),usage.py 改了、
-# 这儿没改 —— 报表就少算一栏、总输入偏低。**而这不会报错**,只是数字变小了,
-# 你看不出来。同一个定义写两遍、漂了不报错,是这个仓库反复在防的事。
-from usage import COUNTERS
+# 抄一份的代价:某天加了计数器、或者改了某个口径,usage.py 改了、这儿没改 ——
+# 报表少算一栏、数字偏低。**而这不会报错**,只是数字变小了。同一个定义写两遍、
+# 漂了不报错,是这个仓库反复在防的事。
+#
+# 终端那边(usage.turn_line)用的是同一批函数,所以屏幕上那句小结和这份报表
+# 必然一致 —— 不一致的可能性从"会不会漂"变成了"不可能"。
+from usage import COUNTERS, hit_rate, summarize, usd
 
 
 def load(path: Path) -> tuple[list[dict], int]:
@@ -49,39 +56,6 @@ def load(path: Path) -> tuple[list[dict], int]:
 		except ValueError:
 			broken += 1
 	return records, broken
-
-
-def _sum(records: list[dict]) -> dict:
-	"""把一批记录加成一行。金额算不出的单独数出来,不混进总和。"""
-	total = {name: 0 for name in COUNTERS}
-	cost, priced, unpriced = 0.0, 0, 0
-	for record in records:
-		for name in COUNTERS:
-			total[name] += record.get(name) or 0
-		if record.get("cost_usd") is None:
-			unpriced += 1
-		else:
-			cost += record["cost_usd"]
-			priced += 1
-	# **一条都算不出来的时候给 None,不是 0.0。** 给 0 的话报表会打印 "$0",
-	# 而 $0 的意思是"确定不花钱",真实情况是"价目表没填,不知道"。
-	# 这正是 usage.py 一路在防的那件事 —— 不能让它从报表这头漏回来。
-	return {"calls": len(records), "cost": cost if priced else None,
-	        "unpriced": unpriced, **total}
-
-
-def hit_rate(row: dict) -> str:
-	"""命中率 = 命中 / 输入总量。分母是三个输入计数器之和,不是 input_tokens。
-
-	这是这份报表里最容易写错的一行:input_tokens 只是**未命中**的那部分,
-	拿它当分母会算出一个恒等于 0% 的命中率 —— 而 0% 看起来像"缓存没生效",
-	你会去查缓存,查的却是错的。
-	"""
-	miss = row["input_tokens"]
-	hit = row["cache_read_input_tokens"]
-	written = row["cache_creation_input_tokens"]
-	denom = miss + hit + written
-	return "—" if denom == 0 else f"{100 * hit / denom:.1f}%"
 
 
 def is_main_loop(record: dict) -> bool:
@@ -106,25 +80,6 @@ def is_main_loop(record: dict) -> bool:
 	return record.get("purpose") == "main" and record.get("agent") == "main"
 
 
-def _usd(value: float | None) -> str:
-	"""渲染金额。三种"零"必须长得不一样:
-
-	  None  不知道(价目表没填)   → "—"
-	  0.0   确定不花钱            → "$0"
-	  极小但非零                  → 科学计数,不能四舍五入成 "$0"
-
-	第三条不是洁癖:把"花了一点"渲染成"$0",这一栏就失去了存在理由 ——
-	而它上面两行的区别正是同一个道理。
-	"""
-	if value is None:
-		return "—"
-	if value == 0:
-		return "$0"
-	digits = 6 if value < 0.01 else 4
-	text = f"{value:.{digits}f}".rstrip("0").rstrip(".")
-	return f"${text}" if text != "0" else f"${value:.2e}"
-
-
 def _table(headers: tuple, rows: list[tuple]) -> str:
 	if not rows:
 		return "  (空)"
@@ -144,7 +99,7 @@ def _group(records: list[dict], key) -> list[tuple[str, dict]]:
 	groups = defaultdict(list)
 	for record in records:
 		groups[key(record)].append(record)
-	rows = [(name, _sum(items)) for name, items in groups.items()]
+	rows = [(name, summarize(items)) for name, items in groups.items()]
 	return sorted(rows, key=lambda pair: (-pair[1]["calls"], pair[0]))
 
 
@@ -162,9 +117,10 @@ def main() -> None:
 		return
 
 	# ---- 总览 ----
-	overall = _sum(records)
-	total_in = (overall["input_tokens"] + overall["cache_read_input_tokens"]
-	            + overall["cache_creation_input_tokens"])
+	overall = summarize(records)
+	# 总输入的口径也只有一份(usage.total_input):input_tokens 是**未命中**
+	# 那部分,把它当总量读会少一个数量级。
+	total_in = overall["total_input"]
 	print("\n## 总览")
 	print(f"  调用次数    {overall['calls']}")
 	print(f"  输入未命中  {overall['input_tokens']:,}")
@@ -173,21 +129,21 @@ def main() -> None:
 	print(f"  输出        {overall['output_tokens']:,}")
 	print(f"  上下文总量  {total_in:,}")
 	print(f"  缓存命中率  {hit_rate(overall)}")
-	print(f"  总成本      {_usd(overall['cost'])}"
+	print(f"  总成本      {usd(overall['cost'])}"
 	      + (f"   ({overall['unpriced']}/{overall['calls']} 条算不出金额)"
 	         if overall["unpriced"] else ""))
 	if overall["unpriced"]:
 		print("              ↑ 价目表没填,见 pricing.py。它报 None 而不是 0,"
 		      "所以这个数是**偏低**的,不是免费的。")
 	if overall["cost"] is not None:
-		print(f"  平均每次    {_usd(overall['cost'] / overall['calls'])}")
+		print(f"  平均每次    {usd(overall['cost'] / overall['calls'])}")
 
 	# ---- 按 purpose ----
 	print("\n## 按 purpose —— 哪一块最贵")
 	grouped = _group(records, lambda r: r.get("purpose") or "?")
 	rows = [(name, row["calls"], f"{row['input_tokens']:,}",
 	         f"{row['cache_read_input_tokens']:,}", f"{row['output_tokens']:,}",
-	         hit_rate(row), _usd(row["cost"])) for name, row in grouped]
+	         hit_rate(row), usd(row["cost"])) for name, row in grouped]
 	print(_table(("purpose", "calls", "miss", "hit", "out", "hit%", "cost"), rows))
 	if any(name == "compaction" for name, _ in grouped):
 		print("  compaction 那一行拿的是**完整上下文**,它常常是最大的一笔 ——")
@@ -202,7 +158,7 @@ def main() -> None:
 	for name, row in _group(records, lambda r: r.get("agent") or "?"):
 		rows.append((name, row["calls"], f"{row['input_tokens']:,}",
 		             f"{row['cache_read_input_tokens']:,}", hit_rate(row),
-		             _usd(row["cost"])))
+		             usd(row["cost"])))
 	print(_table(("agent", "calls", "miss", "hit", "hit%", "cost"), rows))
 
 	# ---- 按会话 ----
@@ -211,18 +167,18 @@ def main() -> None:
 	for name, row in _group(records, lambda r: r.get("session") or "(无归属)"):
 		rows.append((name, row["calls"], f"{row['input_tokens']:,}",
 		             f"{row['cache_read_input_tokens']:,}", hit_rate(row),
-		             _usd(row["cost"])))
+		             usd(row["cost"])))
 	for row in rows[:10]:
 		print(_table(("session", "calls", "miss", "hit", "hit%", "cost"), [row]))
 
 	# ---- 重试的账 ----
 	failed = [r for r in records if not r.get("ok", True)]
 	if failed:
-		row = _sum(failed)
+		row = summarize(failed)
 		print("\n## 重试花掉的钱")
 		print(f"  {row['calls']} 次调用没有拿到结果,"
 		      f"其中 input 未命中 {row['input_tokens']:,} token,"
-		      f"成本 {_usd(row['cost'])}")
+		      f"成本 {usd(row['cost'])}")
 		print("  这些请求发出去了、被计费了,然后失败了。不单独记账的话,"
 		      "它们和'没花过'在总账里长得一样。")
 	else:
@@ -260,7 +216,7 @@ def main() -> None:
 		           if not r.get("ok", True)}
 		rows = []
 		for key in order:
-			row = _sum(turns[key])
+			row = summarize(turns[key])
 			marks = [name for name, seen in (("压缩", key in compacted),
 			                                 ("重试", key in retried)) if seen]
 			rows.append((key, row["calls"], f"{row['input_tokens']:,}",

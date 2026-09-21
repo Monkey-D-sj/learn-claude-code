@@ -16,6 +16,7 @@
 """
 
 import json
+import time
 from types import SimpleNamespace
 
 import anthropic
@@ -383,3 +384,188 @@ def test_nonstream_is_labelled(ledger, monkeypatch):
 	assert record["kind"] == "nonstream"
 	assert record["purpose"] == "vision"
 	assert record["output_tokens"] == 7
+
+
+# ---------------------------------------------------------------- 加总 / 命中率 / 金额
+
+# 这三个的口径都在 usage.py 这一头,所以测试也在这儿。报表和终端那句小结都是
+# 从这儿 import 的消费方 —— 只有一份定义,漂不了。
+
+
+def rows(**over):
+	base = dict(input_tokens=100, cache_read_input_tokens=900,
+	            cache_creation_input_tokens=0, output_tokens=10,
+	            elapsed_ms=100, cost_usd=0.001)
+	base.update(over)
+	return base
+
+
+def test_summarize_adds_up():
+	row = usage.summarize([rows(), rows(cache_read_input_tokens=100)])
+	assert row["calls"] == 2
+	assert row["input_tokens"] == 200
+	assert row["cache_read_input_tokens"] == 1000
+	assert row["output_tokens"] == 20
+	assert row["elapsed_ms"] == 200
+
+
+def test_summarize_total_input_counts_cache_read():
+	"""**踩过的坑。** total_input 是三个输入计数器之和。
+
+	input_tokens 单独看会少一个数量级(实测冷 8057/命中 0、热 249/命中 7808,
+	两次相加都是 8057)。
+	"""
+	row = usage.summarize([rows(input_tokens=249, cache_read_input_tokens=7808,
+	                            cache_creation_input_tokens=0)])
+	assert row["input_tokens"] == 249
+	assert row["total_input"] == 8057
+
+
+def test_summarize_cost_is_none_when_nothing_priced():
+	"""**踩过的坑。** 全算不出来时是 None,不是 0.0。
+
+	$0 的意思是"确定不花钱",而真实情况是"价目表没填,不知道"。第一版报表
+	在这儿打了 "$0"。
+	"""
+	row = usage.summarize([rows(cost_usd=None), rows(cost_usd=None)])
+	assert row["cost"] is None
+	assert row["unpriced"] == 2
+	assert row["priced"] == 0
+
+
+def test_summarize_genuinely_free_is_zero():
+	row = usage.summarize([rows(cost_usd=0.0)])
+	assert row["cost"] == 0.0
+	assert row["priced"] == 1
+
+
+def test_unpriced_rows_do_not_contaminate_the_sum():
+	"""算不出来的那些不并进总和,单独数出来 —— 不然总账悄悄偏低。"""
+	row = usage.summarize([rows(cost_usd=0.5), rows(cost_usd=None)])
+	assert row["cost"] == pytest.approx(0.5)
+	assert row["unpriced"] == 1
+
+
+def test_hit_rate_denominator_is_all_three_input_counters():
+	"""分母错写成 input_tokens 会得到一个恒等于 0% 的命中率 —— 而 0% 看起来像
+	"缓存没生效",你会去查缓存,查的却是错的。"""
+	assert usage.hit_rate({"input_tokens": 249, "cache_read_input_tokens": 7808,
+	                       "cache_creation_input_tokens": 0}) == "96.9%"
+
+
+def test_hit_rate_is_dash_when_nothing_reported():
+	assert usage.hit_rate({"input_tokens": 0, "cache_read_input_tokens": 0,
+	                       "cache_creation_input_tokens": 0}) == "—"
+
+
+def test_usd_distinguishes_three_kinds_of_zero():
+	assert usage.usd(None) == "—"            # 价目表没填
+	assert usage.usd(0.0) == "$0"            # 确定不花钱
+	assert usage.usd(1e-9) == "$1.00e-09"    # 不能四舍五入成 $0
+
+
+def test_usd_does_not_trail_zeros():
+	"""单次调用的钱常常小于一分,所以小数位要够;但够了就别拖零。"""
+	assert usage.usd(0.006) == "$0.006"      # 不是 $0.006000
+	assert usage.usd(0.0185) == "$0.0185"
+	assert usage.usd(0.0009) == "$0.0009"
+	assert usage.usd(1.2345) == "$1.2345"
+
+
+# ---------------------------------------------------------------- read_turn / turn_line
+
+def test_read_turn_picks_only_that_turn(ledger):
+	"""读回来的必须正好是 (session, turn) 那一组。
+
+	终端那句小结靠它。多捞一条不报错,只是屏幕上那个数字悄悄变大 —— 而
+	main.py 的 SESSION 带时间戳就是为了让这个匹配成立。
+	"""
+	for session, turn in (("s1", 1), ("s1", 2), ("s2", 1)):
+		with usage.span(session=session, turn=turn):
+			usage.meter(purpose="main", model="m", usage_obj=make_usage(),
+			            attempt=1, ok=True, elapsed_ms=5, kind="stream")
+
+	assert len(usage.read_turn("s1", 1)) == 1
+	assert len(usage.read_turn("s1", 2)) == 1
+	assert len(usage.read_turn("s2", 1)) == 1
+	assert usage.read_turn("s1", 99) == []
+
+
+def test_read_turn_is_empty_without_a_ledger(tmp_path, monkeypatch):
+	monkeypatch.setattr(usage, "USAGE_PATH", tmp_path / "nope.jsonl")
+	assert usage.read_turn("s1", 1) == []
+
+
+def test_read_turn_skips_broken_lines(ledger):
+	with usage.span(session="s1", turn=1):
+		usage.meter(purpose="main", model="m", usage_obj=make_usage(),
+		            attempt=1, ok=True, elapsed_ms=5, kind="stream")
+	with ledger.open("a", encoding="utf-8") as handle:
+		handle.write("{ 半行 JSON\n")
+	with usage.span(session="s1", turn=1):
+		usage.meter(purpose="main", model="m", usage_obj=make_usage(),
+		            attempt=1, ok=True, elapsed_ms=5, kind="stream")
+	assert len(usage.read_turn("s1", 1)) == 2
+
+
+def test_turn_line_shows_tokens_and_hides_unknown_money(ledger):
+	"""价目表没填时**不显示金额**。
+
+	显示 "$0" 是在说"这一轮没花钱" —— 不显示比显示错的强。
+	"""
+	with usage.span(session="s1", turn=1):
+		usage.meter(purpose="main", model="unknown-model",
+		            usage_obj=make_usage(input_tokens=100,
+		                                 cache_read_input_tokens=900,
+		                                 output_tokens=10),
+		            attempt=1, ok=True, elapsed_ms=1500, kind="stream")
+	line = usage.turn_line(usage.read_turn("s1", 1))
+	assert "1 次调用" in line
+	assert "1,000" in line        # 总输入 = 100 + 900,不是 100
+	assert "90.0%" in line
+	assert "输出 10" in line
+	assert "1.5s" in line
+	assert "$" not in line
+
+
+def test_turn_line_shows_money_when_priced(ledger, monkeypatch):
+	monkeypatch.setitem(pricing.USD_PER_MTOK, "priced-model", {
+		"input_tokens": 1.0, "cache_read_input_tokens": 0.1,
+		"cache_creation_input_tokens": 0.0, "output_tokens": 2.0,
+	})
+	with usage.span(session="s1", turn=1):
+		usage.meter(purpose="main", model="priced-model",
+		            usage_obj=make_usage(input_tokens=1_000_000,
+		                                 output_tokens=1_000_000),
+		            attempt=1, ok=True, elapsed_ms=10, kind="stream")
+	line = usage.turn_line(usage.read_turn("s1", 1))
+	assert "$3" in line           # 1M*1.0 + 1M*2.0 = 3.0
+
+
+def test_turn_line_is_none_without_records():
+	"""一条记录都没有时不打空行 —— 记账关掉/全失败的时候不该在终端留个残句。"""
+	assert usage.turn_line([]) is None
+
+
+# ---------------------------------------------------------------- 会话名
+
+def test_terminal_session_name_is_per_run_not_a_constant():
+	"""**踩过的坑。** main.py 的 SESSION 不能写死成那个常量 "terminal"。
+
+	轮次序号每个进程都从 1 开始,而终端进程一个进程就是一个会话 —— 名字写死的
+	话,**两次运行的第 1 轮会撞进同一组**。报表把它们当同一轮加总,数字凭空
+	变大,不报错。
+
+	实测见过:turn 1 显示 3 次调用,其实是两次运行各一次 + 另一次。逐轮数字
+	从此就不可信了,而它看起来完全正常。
+
+	所以这儿断言的是"这个名字是每次运行现造的",不是某个固定值。
+	"""
+	import main
+
+	assert main.SESSION != "terminal"
+	assert main.SESSION.startswith("terminal-")
+	# 带时间戳:两个进程拿到的值不同。纯随机串也能满足唯一性,但读不出是哪次 ——
+	# 报表的"按会话"那一栏就没法看。解析一遍顺便把格式也钉住。
+	name = main.SESSION[len("terminal-"):]
+	time.strptime(name, "%Y%m%d-%H%M%S")

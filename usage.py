@@ -109,6 +109,109 @@ def total_input(counts: dict) -> int | None:
 	return sum(counts.get(name) or 0 for name in COUNTERS[:3])
 
 
+def summarize(records: list[dict]) -> dict:
+	"""把一批记录加成一行。报表的每一段和终端那句小结都走这儿。
+
+	**同一个口径只能写一遍。** 两处各写一遍的话会漂,而漂了不报错 —— 只是
+	报表上那个数和屏幕上那个数不一样,你还得先决定信哪个。
+	"""
+	counters = {name: 0 for name in COUNTERS}
+	cost, priced, unpriced = 0.0, 0, 0
+	for record in records:
+		for name in COUNTERS:
+			counters[name] += record.get(name) or 0
+		if record.get("cost_usd") is None:
+			unpriced += 1
+		else:
+			cost += record["cost_usd"]
+			priced += 1
+	return {
+		"calls": len(records),
+		# **一条都算不出来时给 None,不是 0.0。** 0 的意思是"确定不花钱",
+		# 而真实情况是"价目表没填,不知道"。
+		"cost": cost if priced else None,
+		"priced": priced,
+		"unpriced": unpriced,
+		"total_input": total_input(counters),
+		"elapsed_ms": sum(record.get("elapsed_ms") or 0 for record in records),
+		**counters,
+	}
+
+
+def hit_rate(row: dict) -> str:
+	"""命中率 = 命中 / **输入总量**。
+
+	分母是三个输入计数器之和,不是 input_tokens。拿 input_tokens 当分母会得到
+	一个恒等于 0% 的命中率 —— 而 0% 看起来像"缓存没生效",你会去查缓存,查的
+	却是错的。
+	"""
+	total = sum(row.get(name) or 0 for name in COUNTERS[:3])
+	return "—" if total == 0 else f"{100 * (row.get('cache_read_input_tokens') or 0) / total:.1f}%"
+
+
+def usd(value: float | None) -> str:
+	"""渲染金额。三种"零"必须长得不一样:
+
+	  None  不知道(价目表没填)   → "—"
+	  0.0   确定不花钱            → "$0"
+	  极小但非零                  → 科学计数,不能四舍五入成 "$0"
+
+	第三条不是洁癖:把"花了一点"渲染成 "$0",这一栏就失去了存在理由 ——
+	而它上面两行的区别正是同一个道理。
+	"""
+	if value is None:
+		return "—"
+	if value == 0:
+		return "$0"
+	digits = 6 if value < 0.01 else 4
+	text = f"{value:.{digits}f}".rstrip("0").rstrip(".")
+	return f"${text}" if text != "0" else f"${value:.2e}"
+
+
+def read_turn(session: str, turn) -> list[dict]:
+	"""把某一轮已经落盘的记录捞回来。给前端做一行小结用。
+
+	**从文件读,不在内存里另攒一份。** 账本是唯一真源;攒一份的话"屏幕上显示的"
+	和"账上记的"就成了两份,而它们漂了不报错 —— 屏幕上少一行,账上一条不少。
+	顺带,读回来也算验了一下写有没有落下去。
+
+	代价是每轮 O(账本行数)。一行几百字节,几万次调用也才几 MB,毫秒级 ——
+	换掉"两份可能不一致"这个问题,值。
+	"""
+	if not USAGE_PATH.exists():
+		return []
+	out = []
+	for line in USAGE_PATH.read_text(encoding="utf-8").splitlines():
+		if not line.strip():
+			continue
+		try:
+			record = json.loads(line)
+		except ValueError:
+			continue                      # 坏行跳过;数量由报表那边报
+		if record.get("session") == session and record.get("turn") == turn:
+			out.append(record)
+	return out
+
+
+def turn_line(records: list[dict]) -> str | None:
+	"""终端每跑完一轮打的那一行。没有记录时返回 None(什么都不打)。
+
+	**钱只在算得出来的时候显示。** 价目表没填时打一个 "$0" 是最坏的选择 ——
+	那句话的意思是"这一轮没花钱"。不显示比显示错的强。
+	"""
+	row = summarize(records)
+	if not row["calls"]:
+		return None
+	line = (f"[本轮] {row['calls']} 次调用 · "
+	        f"输入 {row['total_input']:,}"
+	        f"(命中 {row['cache_read_input_tokens']:,} / {hit_rate(row)}) · "
+	        f"输出 {row['output_tokens']:,} · "
+	        f"{row['elapsed_ms'] / 1000:.1f}s")
+	if row["cost"] is not None:
+		line += f" · {usd(row['cost'])}"
+	return line
+
+
 def _append(record: dict) -> None:
 	USAGE_PATH.parent.mkdir(parents=True, exist_ok=True)
 	line = json.dumps(record, ensure_ascii=False) + "\n"
