@@ -474,6 +474,21 @@ class Handler(BaseHTTPRequestHandler):
 			return
 		payload = STORE.list_turns(sid)
 		payload["running"] = is_running(sid)
+
+		# 每一轮花了多少。账本里的归属键就是上面那个 turn.id —— 写的时候是
+		# usage.span(session=sid, turn=turn["id"]),读的时候同一个字符串,不用
+		# 再对一次。
+		#
+		# 整份账本读一遍(read_session),不是每轮读一遍:结果一样,后者把
+		# 同一个文件读 N 遍,而 N 随会话长度涨。
+		#
+		# 发的是**渲染好的那一行**,跟终端打的是同一个 turn_line。金额和命中率
+		# 的规矩(None 和 0 不同、币种跟着记录走、命中率的分母是输入总量)写
+		# 两遍就会漂,而漂了不报错 —— 只是页面上的数和屏幕上的数不一样。
+		ledger = usage.read_session(sid)
+		for turn in payload["turns"]:
+			turn["usage"] = usage.turn_line(ledger.get(turn["id"], []), prefix="")
+
 		# 挂起中的问题要一起给。它是**唯一**没法从库里重建的东西:ask 不是
 		# 一条消息,库里没有它,而页面拿到的 cursor 已经越过它那条事件了 ——
 		# 不补这一下,刷新之后页面上就没有那个按钮或那个输入框,而 agent
@@ -746,8 +761,15 @@ class Handler(BaseHTTPRequestHandler):
 		# reply 排在收尾**之后**发。反过来的话,页面收到 reply 时库里的
 		# status 还是 running,而它的游标已经越过这条事件 —— 刷新也补不
 		# 回来,那一轮会一直显示"运行中"。
+		#
+		# 花费跟着一起发,理由同上一句:这一轮的所有调用都发生在上面,
+		# 到这儿账已经记完了。放在这里面,页面不用为一个数字再跑一趟 ——
+		# 而且那一趟还得解决"什么时候去要"的问题,而"这一轮刚结束"正好
+		# 就是这里。
 		emit_quietly(emit, {"kind": "reply", "text": outcome.text,
-		                    "status": outcome.status})
+		                    "status": outcome.status,
+		                    "usage": usage.turn_line(
+			                    usage.read_turn(sid, turn["id"]), prefix="")})
 
 	def _checkpoint(self, sid: str, messages: list, emit) -> None:
 		"""压缩器压过之后存一个上下文检查点。

@@ -186,6 +186,20 @@
   .turn[data-status="running"] .thead .state { color: var(--tool); }
   .turn[data-status="failed"]  .thead .state { color: var(--err); }
 
+  /* 一轮的花费小结。排在正文**下面**,不跟着抬头 —— 它是读完这一轮之后
+     才想知道的数,不是开始读之前。抬头留轮号和状态,这儿留钱,不打架。
+
+     mono 跟抬头对上,但颜色更暗一档:它是旁注,不该跟正文抢注意力。
+     anywhere 而不是 break-all:这一行有空格和 ·,按词断就够了。 */
+  .tfoot {
+    margin-top: 14px;
+    padding-top: 10px;
+    border-top: 1px dashed var(--line);
+    font: 12px/1.6 var(--mono);
+    color: var(--faint);
+    overflow-wrap: anywhere;
+  }
+
   /* 旧版记录:轮次落库之前的那些会话。它们只有事件流,没有轮号可编,
      所以整块单独放着,跟新记录一眼分得开。 */
   .legacy {
@@ -621,6 +635,22 @@ function setState(id, status, error) {
   }
 }
 
+// 一轮的花费小结。line 是服务端渲染好的那一行(usage.turn_line),空就不画 ——
+// 没记到账的时候返回 null,页面这边不该编一个 "¥0" 出来。
+//
+// **每次都重新 append,不是只在新建时 append。** 这一步是有讲究的:直播那
+// 一路里,这一行的到达(一轮结束时)和后面消息的到达可能交错,而
+// appendChild 对已经在树上的节点是"挪到末尾" —— 于是不管谁先谁后,它永远
+// 待在正文下面。靠"只建一次"的话,下一片碎片就会把它顶到上面去。
+function setUsage(id, line) {
+  const box = TURNS.get(id);
+  if (!box || !line) return;
+  let foot = box.querySelector(".tfoot");
+  if (!foot) foot = el("footer", "tfoot");
+  foot.textContent = line;
+  box.appendChild(foot);
+}
+
 // 没有 turn_id 的那些事件(旧版记录)走这条路:每次 you 现开一个容器,
 // 跟以前一样。它们进了 SINK 指定的那块区域,不是直接挂在正文流上。
 function newSection() {
@@ -712,6 +742,7 @@ function renderTurn(t) {
   if (t.status === "failed" && t.error_message) {
     box.appendChild(el("div", "error", t.error_message));
   }
+  setUsage(t.id, t.usage);
   follow();
 }
 
@@ -1457,6 +1488,9 @@ function render(ev) {
     // 终态跟 reply 一起发过来(见 server.py 的 _run_turn)。标在轮号
     // 旁边 —— 不标的话,一轮跑完屏幕上那个"运行中"要等到下次刷新才变。
     if (ev.turn_id && ev.status) setState(ev.turn_id, ev.status);
+    // 花费跟终态一起来,理由相同 —— 而且到这一刻这一轮的账才记完。
+    // 刷新那一路由 renderTurn 补,两条路画的是同一行字符串。
+    if (ev.turn_id && ev.usage) setUsage(ev.turn_id, ev.usage);
 
   } else {
     // 认不出来的也显示,别默默吞掉 —— 将来加了新 kind,页面上至少
