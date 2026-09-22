@@ -4,17 +4,8 @@
 拿它做判断),它量出来的数直接决定"要不要把工具结果换成指针"。所以它量错了
 不是慢一点的问题,是**该留的被砍掉**。
 
-这里只守一件事:**thinking 块不计入**。理由是实测出来的,两条独立证据:
-
-1. **输入侧不计费。** 同一个 messages,带 thinking 块和不带,端点报的
-   prompt token 一模一样(带 vs 不带:6,193/6,193、109/109、90/90、86/86、
-   174/174,纯问答和真 ReAct 轨迹都试过)。端点把回灌的 thinking 整个丢掉。
-2. **模型也读不到。** 只在 thinking 里出现过的事实,下一轮它答不出来;同样
-   的事实放进正文块或工具结果,立刻就答得出(正对照每次都过)。
-
-所以它是**双重不存在**的:不进账、不进 prompt。拿它去撑字符预算,等于用
-空气顶额度 —— 而第 5 轮那份上下文里它占了 52%(50,369 字符中 26,339 是
-thinking),把尺子撑到线上,逼着压缩器去砍真正会被读到的工具结果。
+这里只守"没量错"和"没改过头"两件事。口径和实测的数记在
+`notes/context.md` 的「尺子」一节 —— 那是笔记该干的活,不在这儿再抄一份。
 
 **`fingerprint` 不跟着改,这是有意的。** 它还被 `prepare` 用来比"压前压后
 是不是同一份"(决定要不要存检查点),那里的语义是"这坨东西变了没有",
@@ -34,33 +25,10 @@ def assistant(thinking_text: str, answer: str = "好的") -> dict:
 	]}
 
 
-def test_estimate_tokens_ignores_thinking_text():
-	"""thinking 写多长,尺子都不动 —— 它不进 prompt。
-
-	改坏的样子:把 thinking 算进去,于是模型"想得越久",压缩器越以为上下文
-	快满了,越早把工具结果换成指针。想得久反而看得少。
-	"""
-	short = [assistant("想一下。"), {"role": "user", "content": "继续"}]
-	long = [assistant("想一下。" * 2000), {"role": "user", "content": "继续"}]
-	assert Compactor.estimate_tokens(short) == Compactor.estimate_tokens(long)
-
-
-def test_estimate_tokens_drops_the_whole_thinking_block():
-	"""整块都不算,连结构也不算 —— 端点丢的是整块,不是只丢正文。
-
-	只把 thinking 正文挖空、留下 {"type":"thinking","signature":...} 那点
-	结构的话,25 个块仍然白占约 1,500 字符。数字不大,但它是同一个错误的
-	小号版本:为一份读不到的东西留位置。
-	"""
-	with_block = [assistant("想了很久。" * 500)]
-	without_block = [{"role": "assistant", "content": [{"type": "text", "text": "好的"}]}]
-	assert Compactor.estimate_tokens(with_block) == Compactor.estimate_tokens(without_block)
-
-
 def test_estimate_tokens_still_counts_everything_else():
-	"""别的东西一个都不能少算 —— 正文、工具入参、工具结果还是会进 prompt 的。
+	"""别的东西一个都不能少算 —— 正文、工具入参、工具结果都是要进 prompt 的。
 
-	这条是防"改过头"的:如果为了实现上面两条而把整条 assistant 消息都跳过,
+	这条是防"改过头"的:如果哪天为了少算某类块,把整条 assistant 消息跳过,
 	尺子就瞎了,该压的时候不压,输入侧的钱直接翻倍。
 	"""
 	base = [{"role": "user", "content": "问题"}]

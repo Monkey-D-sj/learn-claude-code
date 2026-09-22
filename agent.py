@@ -291,6 +291,12 @@ def agent_loop(messages: list, active_request: str, system: str, tools: list,
 	收到什么无关,模型吐第一个字的那一刻起,后面一个 500 或连接超时就没得
 	重试了。
 	"""
+	# 放在函数里,不放模块顶上:context 反过来要 `from agent import call_api`
+	# (压缩器第 4 档要调模型),模块级导入就成了环 —— 而 tools 那个包又拽着
+	# tools.subagent,那边还要 `from agent import agent_loop`。函数里导入没这个
+	# 问题,代价只是一次 sys.modules 查表。
+	import context
+
 	handlers = {t.name: t.handler for t in tools}
 	wire = [t.to_wire() for t in tools]
 	rounds_since_todo = 0
@@ -309,6 +315,16 @@ def agent_loop(messages: list, active_request: str, system: str, tools: list,
 				f"Stopped: round limit of {max_rounds} reached, task incomplete.",
 				f"round limit of {max_rounds} reached")
 		rounds += 1
+
+		# 发号。**在压缩之前发**:刚追加进来的结果先拿到号,模型下一轮才点得动
+		# 它们 —— 发完号紧接着就是 prepare,这一轮压掉的那些号模型本轮已经看见了。
+		#
+		# 顺序还有一层:**发号必须在压缩之后仍然成立**。号拼在结果正文的尾巴上,
+		# 而下面几档会改写那份正文;改写的地方一旦忘了把号拼回去,号就没了,
+		# 模型点它得到的是"这个号不在上下文里"。第 1 档已经这么处理了
+		# (tool_result_budget 里的 _split_marker),2~4 档现在是注释掉的。
+		context.tag_ids(messages)
+
 		
 		# 发送前压缩。必须赶在 call_api 之前:上一轮的工具结果已经追加
 		# 进来但还没发出去,这时压掉才省得下钱;发完之后再压,钱已经花过。
@@ -405,7 +421,11 @@ def agent_loop(messages: list, active_request: str, system: str, tools: list,
 			else:
 				handler = handlers.get(block.name)
 				try:
-					output = handler(**block.input) if handler else f"error: unknown tool {block.name!r}"
+					# bind 把当前这份 messages 递给 compress 那个工具 ——
+					# handler 只拿得到 **block.input,够不着它,而压缩改的正是
+					# 这个活列表。跟 usage.span 同一种做法、同一个理由。
+					with context.bind_messages(messages):
+						output = handler(**block.input) if handler else f"error: unknown tool {block.name!r}"
 				except Exception as e:
 					output = f"Error: {type(e).__name__}: {e}"
 				trigger_hooks("PostToolUse", block, output)

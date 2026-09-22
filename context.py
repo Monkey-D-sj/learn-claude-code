@@ -1,6 +1,7 @@
 import json
 import re
 import uuid
+import contextvars
 from pathlib import Path
 
 from agent import call_api
@@ -48,6 +49,17 @@ def _block_type(block):
 	两边都得认。
 	"""
 	return block.get("type") if isinstance(block, dict) else getattr(block, "type", None)
+
+
+def _block_field(block, name, default=None):
+	"""取 content block 上任意一个字段。理由跟 _block_type 一样:两副形状。
+
+	**踩过一次。** 配对检查原来只认 dict,于是 assistant 那边(sdk 对象)的
+	tool_use 全被跳过,每个 tool_result 看起来都成了孤儿 —— 模型号段点得完全
+	正确,工具却回它"你切的不对"。单测里全是我自己拼的 dict,一条都没红。
+	"""
+	return block.get(name, default) if isinstance(block, dict) \
+		else getattr(block, name, default)
 
 
 def _json_default(obj):
@@ -112,6 +124,263 @@ def _count_tokens(text: str) -> int:
 	                  for m in _NON_ASCII.finditer(text)
 	                  if not _CJK.match(m.group()))
 	return int((cjk + ascii_count / 4 + other_bytes / 4) * _TOKEN_SAFETY)
+
+
+# ------------------------------------------------------------ 号与号段压缩
+#
+# 模型自己压的那条路。**跟那几档自动压缩是两回事,各走各的**:那几档是"超线就
+# 压",这一套是"模型自己觉得一段活干完了,点名压掉它"。
+#
+# **号 = 一次工具调用,拼在它那条结果的末尾:**
+#
+#     输出正文……\n\n<message-id token=1240>m00007</message-id>
+#
+# 为什么拼在正文里:它得活过存库、读回、被压缩改写三件事,挂在外面的字段过一遍
+# 序列化就没了 —— 而号一旦丢失或错位,模型点的那段跟它以为的那段就不是同一段,
+# 还不报错。
+#
+# 为什么只有 tool_result 挂得上:assistant 那条经常一个字正文都没有(实测仓库
+# 里 171 条 assistant 消息,110 条是光秃秃的 [thinking, tool_use]),而它带
+# tool_use 时**必须以 tool_use 收尾** —— 号拼不上去(实测:拼到 tool_use 后面
+# 端点直接 400)。结果那条没这问题:结果本来就是它那条消息的末块。
+
+_MARKER_RE = re.compile(r"\n*<message-id token=(\d+)>(m\d{5,})</message-id>\s*$")
+# 压过的号段长这样。它记的是一段,不是一次调用,所以它自己不带号。
+# 两个捕获组是发号要用的:压过的段那些号**不能再发一遍**,见 tag_ids。
+_SUMMARY_RE = re.compile(r"^\[m(\d{5,})-m(\d{5,})\] 摘要[:：]")
+_TAG_NUMBER_RE = re.compile(r"^m(\d{5,})$")
+
+
+def _split_marker(text: str) -> tuple[str, str]:
+	"""把尾巴上那个号摘下来:返回 (正文, 号)。没有号就给 (原文, "")。
+
+	第 1 层落盘要用它:文件里该存工具的原样输出,不该混进我们贴的号。
+	"""
+	match = _MARKER_RE.search(text)
+	if not match:
+		return text, ""
+	return text[:match.start()].rstrip(), text[match.start():]
+
+
+def result_tag(block) -> str | None:
+	"""这个工具结果身上的号。没有返回 None(不是结果的块也返回 None)。
+
+	**只认末尾那一个。** 工具输出里完全可能真的打印出一串(模型正在读这个文件
+	的时候,仓库里 context.py 本身就写着它),按"出现过"认会把号段切到一条根本
+	没发过号的结果上。
+	"""
+	if _block_type(block) != "tool_result":
+		return None
+	content = _block_field(block, "content")
+	if not isinstance(content, str):
+		return None
+	match = _MARKER_RE.search(content)
+	return match.group(2) if match else None
+
+
+def message_tags(message) -> list[str]:
+	"""这条消息里所有结果身上的号,按顺序。"""
+	content = message.get("content")
+	if not isinstance(content, list):
+		return []
+	return [tag for tag in (result_tag(block) for block in content) if tag]
+
+
+def tag_ids(messages: list) -> int:
+	"""给还没有号的结果发号,返回这次发了几个。**每轮发之前都得先跑它。**
+
+	幂等是命根子。号是给模型记的:它上一轮说"压 m00003-m00010"。重发一遍号,
+	那些号就落到别的结果身上了 —— 模型压掉的是它没打算压的那段,而且不报错。
+
+	**接着最大号发,而且"到过的最大号"也算数。** 只看现在还剩哪些号的话,一段被
+	压掉之后水位就退回去,下一条新结果会拿到刚被压掉那个号:摘要那行写着
+	[m00002-m00005],而新结果也叫 m00002,模型再点它指到的就是别的东西了。
+	(真跑一轮撞上过。)
+
+	**token= 是这个结果正文的估算,只算一次,之后不动。** 每轮重算就会改内容、
+	改前缀,prompt cache 每轮冲一次 —— 而这个数是给模型"值不值得压"参考的,
+	不是账。
+	"""
+	next_no = 0
+	for message in messages:
+		for tag in message_tags(message):
+			next_no = max(next_no, int(tag[1:]))
+		match = _SUMMARY_RE.match(_first_text(message) or "")
+		if match:
+			next_no = max(next_no, int(match.group(2)[1:]))
+
+	count = 0
+	for message in messages:
+		content = message.get("content")
+		if not isinstance(content, list):
+			continue
+		for block in content:
+			if not isinstance(block, dict) or _block_type(block) != "tool_result":
+				continue
+			body = block.get("content")
+			if not isinstance(body, str) or result_tag(block) is not None:
+				continue
+			next_no += 1
+			block["content"] = (body + f"\n\n<message-id token={_count_tokens(body)}>"
+			                           f"m{next_no:05d}</message-id>")
+			count += 1
+	return count
+
+# "当前这份 messages"。给 compress 那个工具用的 —— handler 只拿得到
+# **block.input(agent.py 那行是有意写死的:handler 够不着前端、够不着会话),
+# 而压缩改的正是 agent_loop 手里那个活列表,所以只能靠一层环境递进去,跟
+# usage.py 的 span 同一种做法。
+#
+# **为什么不是模块级变量:** server.py 一个进程里同时跑着好几个会话,模块级那份
+# 会被它们串成一份 —— 而串了不报错,只是 A 会话把 B 会话的上下文压了。
+_CURRENT_MESSAGES: contextvars.ContextVar = contextvars.ContextVar(
+	"current_messages", default=None)
+
+
+class bind_messages:
+	"""`with bind_messages(messages):` —— 这一段里跑的 handler 都看得到它。"""
+
+	def __init__(self, messages: list):
+		self._messages = messages
+		self._token = None
+
+	def __enter__(self):
+		self._token = _CURRENT_MESSAGES.set(self._messages)
+		return self._messages
+
+	def __exit__(self, *exc):
+		_CURRENT_MESSAGES.reset(self._token)
+		return False
+
+
+def current_messages() -> list | None:
+	"""当前这份 messages。不在 agent 循环里跑的时候是 None。"""
+	return _CURRENT_MESSAGES.get()
+
+
+def _first_text(message) -> str | None:
+	"""这条消息开头的文字。给"是不是一条摘要"那种判断用。"""
+	content = message.get("content")
+	if isinstance(content, str):
+		return content
+	if isinstance(content, list) and content and _block_type(content[0]) == "text":
+		return _block_field(content[0], "text") or ""
+	return None
+
+
+def _pairing_problem(span: list) -> str | None:
+	"""号段切断了工具配对的话,说清楚是哪一对;没切断返回 None。
+
+	配对是端点那边的硬约束:带 tool_use 的 assistant 消息后面必须紧跟它的
+	tool_result。段内圈了调用没圈结果(或反过来),压完就是 400。
+	"""
+	uses: dict[str, str] = {}      # tool_use_id -> 它在哪个号上
+	results: dict[str, str] = {}
+	for message in span:
+		content = message.get("content")
+		if not isinstance(content, list):
+			continue
+		tags = message_tags(message)
+		tag = tags[0] if tags else "这一条"
+		for block in content:
+			kind = _block_type(block)
+			if kind == "tool_use":
+				uses[_block_field(block, "id")] = tag
+			elif kind == "tool_result":
+				results[_block_field(block, "tool_use_id")] = tag
+
+	for tool_id, tag in uses.items():
+		if tool_id not in results:
+			return (f"{tag} 那次工具调用的结果不在号段里 —— 它俩得圈在同一个号段,"
+			        f"不然压完这条上下文就发不出去了。")
+	for tool_id, tag in results.items():
+		if tool_id not in uses:
+			return (f"{tag} 是号段外面那次工具调用的结果,不能单拎出来压 —— "
+			        f"把调用那一条也圈进来。")
+	return None
+
+
+def _owner_index(messages: list, result_index: int, tool_use_id: str) -> int | None:
+	"""这次调用的 tool_use 在哪条消息里 —— 往后找,找不到返回 None。
+
+	协议上它一定是**紧跟在这条结果前面**的那条(assistant 发 tool_use,下一条
+	user 回结果),所以正常第一轮循环就命中。往后找是为了"上下文被打断过、结果
+	跟调用之间还夹着别的消息"这种脏情况 —— 那种时候也不该硬压。
+	"""
+	for i in range(result_index - 1, -1, -1):
+		content = messages[i].get("content")
+		if not isinstance(content, list):
+			continue
+		for block in content:
+			if _block_type(block) == "tool_use" and _block_field(block, "id") == tool_use_id:
+				return i
+	return None
+
+
+def compress_range(messages: list, start: str, end: str, summary: str) -> str:
+	"""把 start-end 这段换成一条摘要,返回给模型看的那句话。
+
+	**号段指的是结果,端走的是整轮。** 模型点的是结果上的号,但两端都往前/往后
+	吸附到完整的回合 —— 一轮里可能有好几次调用,只圈其中一条结果的话,同一轮
+	别的调用就悬空了(它的 tool_use 被端走、结果还在,或者反过来,端点直接
+	400)。所以"自动扩"不是顺手做的,是不扩就会炸。
+
+	**原地改**(切片赋值)。messages 是调用方(agent_loop)那个活列表,返回一个
+	新列表的话调用方那份还停在旧的上面 —— 这一轮白压,下一轮模型看到的还是原样,
+	不报错。跟 prepare 那条是同一条规矩。
+
+	切错了就**一个字都不动**、回一句人话。配对检查留着当兜底:吸附算法要是有
+	一天写坏了,这里是最后一道 —— 真发出去就是 400,而 400 在 agent_loop 里被
+	收成"这一轮失败",模型连这句话都看不到。
+	"""
+	if _TAG_NUMBER_RE.match(start or "") is None or _TAG_NUMBER_RE.match(end or "") is None:
+		return "切得不对:号得写成 m00007 这样(字母 m + 五位数字)。"
+	if not summary.strip():
+		return "切得不对:摘要不能是空的 —— 将来只剩这句话,它得能顶替那一段。"
+
+	where = {}      # 号 -> (消息位置, 那个结果块)
+	for position, message in enumerate(messages):
+		content = message.get("content")
+		if not isinstance(content, list):
+			continue
+		for block in content:
+			tag = result_tag(block)
+			if tag:
+				where[tag] = (position, block)
+
+	missing = [t for t in (start, end) if t not in where]
+	if missing:
+		return (f"切得不对:{'、'.join(missing)} 不在现在的上下文里(可能已经被压掉了)。"
+		        f"号段要照着上下文里现在有的号点。")
+
+	first, first_block = where[start]
+	last, _ = where[end]
+	if first > last:
+		return f"切得不对:{start} 排在 {end} 后面,号段是反的。"
+
+	owner = _owner_index(messages, first, _block_field(first_block, "tool_use_id"))
+	if owner is None:
+		return (f"切得不对:找不到 {start} 那次工具调用 —— 号段得从一次完整的调用开始。")
+
+	span = messages[owner:last + 1]
+	problem = _pairing_problem(span)
+	if problem:
+		return f"切得不对:{problem}"
+
+	low, high = int(start[1:]), int(end[1:])
+	swept = [t for message in span for t in message_tags(message)
+	         if not low <= int(t[1:]) <= high]
+
+	messages[owner:last + 1] = [{
+		"role": "user",
+		"content": f"[{start}-{end}] 摘要:{summary}",
+	}]
+	report = (f"已压缩 {start}-{end}:{last - owner + 1} 条消息换成一条摘要。"
+	          f"原文还在库里,按号能查回来。")
+	if swept:
+		report += (f"(同一轮里还有 {len(swept)} 条结果跟着一起圈进来了 —— "
+		           f"它们和号段里的结果出自同一次回复,分不开。)")
+	return report
 
 
 class ContextCompactor:
@@ -266,55 +535,47 @@ class ContextCompactor:
 		1,900 token)—— 聊天模板的真实开销比它略低。方向是**安全**的:偏高
 		只让闸门早响一点,不会漏。
 
-		**thinking 块不算进来**,整块摘掉。这不是省事,是实测出来的两件事:
+		**thinking 块照常算进来**(2026-09-22 改的;原来整块摘掉,摘错了)。
+		分界线是请求里有没有 tools,四格实测:
 
-		一、**输入侧端点不计费。** 同一坨 messages,带 thinking 块和不带,
-		   端点报的 prompt token 一模一样 —— 带/不带:6,193/6,193、
-		   109/109、90/90、86/86、174/174,纯问答和真 ReAct 轨迹都是。
-		   端点把回灌的 thinking 整个丢掉。
-		二、**模型也读不到它。** 只在 thinking 里出现过的事实,下一轮它答不
-		   出来;同一个事实放进正文块或工具结果,立刻答得出(正对照每次
-		   都过)。所以它是**双重不存在**的:不进账、也不进 prompt。
+		    请求带 tools     纯问答 312/315/321    工具链 362/365/371
+		    请求不带 tools   纯问答  52/ 52/ 52    工具链 102/102/102
 
-		拿它撑预算的后果是量出来的:第 5 轮那份上下文 50,369 字符里它占
-		26,339(52%),把那把尺子顶到触发线上,于是压缩器一轮又一轮地去压
-		一个已经压干的东西(那些工具结果早就是指针了),而**砍掉的恰好是
-		唯一会被读到的那部分**。同一份上下文换成这把尺子量是 21,312 ——
-		根本不越线,那 48 次压缩一次都不该发生。
+		(每格三个数 = 不带 thinking / 废话 6 字 / 事实 12 字的总输入,差 3 和 9
+		就是那两段文字算进去的钱。**总输入 = input + cache_read +
+		cache_creation** —— 只比 input_tokens 会被缓存挪走差额,冷热两次能差
+		一倍,见 usage.total_input 那段。)
+
+		所以**触发条件是请求里那个 tools 参数,不是"这轮有没有工具调用"**:
+		左下那格历史里摆着完整的 tool_use + tool_result,照样一个 token 不进。
+		而 agent_loop 每次调用都传 tools(见 agent.py 里的 wire),走的是上排 ——
+		回灌的 thinking 进 prompt、进账,该算。
+
+		模型也读得到它(实测它会主动说"之前回复里出现的 7391 没有可靠来源"),
+		只是常常**不采信**自己的推理 —— 同一份事实藏在工具结果里答得出、藏在
+		推理里答不出。那是归属问题,不影响这条:**进了 prompt 的就得算。**
+
+		端点只数 thinking 的正文,块里 signature/type 那点结构不进账(上面差值
+		只跟文字长度走,那 ~36 字符的 signature 没露面)。这把尺子整块都算,
+		方向是安全的。
+
+		**原来那一刀治错了地方。** 当时的观察是第 5 轮反复压了 48 次已经压干的
+		工具结果(那些早就是指针了)。今天量下来 thinking 真的进账,那 48 次就
+		不是"尺子多算"造成的 —— 再出现压得过频,要查的是压缩器砍了什么,别又
+		把 thinking 摘掉:摘掉只是让尺子对着一份真的很大的上下文说"不大"。
 
 		(上面只写比例和实测值,不写 CONTEXT_TOKEN_BUDGET 当前是多少 —— 那个数
 		是会调的,写进来就会过期。)
+
+		**另一样不进这把尺子的:tools 和 system。** 它只吃 messages。量过,合计
+		约 2.5k(13 个工具的 wire JSON 9,844 字符,端点实测 2,543 token),相对
+		预算不到一个百分点,不值得为它加参数 —— 数记在这儿,省得再查一遍。
 
 		**不能顺手改 fingerprint。** 它还被 prepare 用来比"压前压后是不是
 		同一份"(决定要不要存检查点),那里的语义是"这坨变了没有",跟
 		"要发多大一坨"是两回事 —— 一起改掉会让那个判断静默地变味。
 		"""
-		return _count_tokens(cls.fingerprint(cls.without_thinking(messages)))
-
-	@staticmethod
-	def without_thinking(messages: list) -> list:
-		"""摘掉 thinking 块的那一份。整块摘,不留结构。
-
-		端点丢的是整块({"type":"thinking","thinking":...,"signature":...}
-		整个不要),所以连那几十字节的结构也不该占预算 —— 第 5 轮那份里
-		25 个块的结构是 2,718 字符,同一个错误的小号版本。
-
-		只摘 thinking。正文、工具入参、工具结果一个字都不动:那些是真会进
-		prompt、真要花钱的,少算一点尺子就瞎一点。
-
-		**返回的是新 dict,不能图省事改在原地。** 这里拿到的是调用方那份
-		真实历史(agent.py 的 messages),原地摘就把 thinking 从对话里
-		真删了 —— 而且删得静默:下一轮模型少看到一块,不报错。
-		"""
-		stripped = []
-		for message in messages:
-			content = message.get("content")
-			if not isinstance(content, list):
-				stripped.append(message)
-				continue
-			stripped.append({**message, "content": [
-				block for block in content if _block_type(block) != "thinking"]})
-		return stripped
+		return _count_tokens(cls.fingerprint(messages))
 
 	def tool_result_budget(self, messages: list, max_tokens: int | None = None) -> list:
 		"""第 1 层:一批 tool_result 太大,就把最大的几个落盘。
@@ -358,7 +619,13 @@ class ContextCompactor:
 			output = str(block.get("content", ""))
 			if len(output) <= self.LARGE_RESULT_CHAR_LIMIT:
 				continue
-			block["content"] = self.persist_large_output(block.get("tool_use_id", "unknown"), output)
+			# **号得摘下来再拼回去。** 它拼在正文尾巴上,而这里换的是整条正文 ——
+			# 不摘就没了,而号一没,模型记着的那段就点不动了(不报错,只是它点
+			# 什么都不对)。落盘的那份要干净:文件里是工具的原样输出,不该混进
+			# 我们贴的号。
+			body, marker = _split_marker(output)
+			block["content"] = self.persist_large_output(
+				block.get("tool_use_id", "unknown"), body) + marker
 			persisted += 1
 			# 落盘后这个 block 变小了,总和得重算,否则会多砍几个。
 			# 重算用的是 blocks 而不是上面排序过的那个:它们是同一批 dict,
@@ -815,21 +1082,36 @@ class ContextCompactor:
 		# 第 1 层:单轮一批太大 —— 把最大的几个落盘
 		messages = self.tool_result_budget(messages)
 		# 第 2 层:条数太多 —— 中段归档,只留头尾
-		messages = self.snip_compact(messages)
+		#
+		# **先关掉(2026-09-22,临时的)。** 它把中段消息整批换成一条转录文件
+		# 引用,那些消息连着它们的号一起没了 —— 模型手里记着的号段会指向别的
+		# 消息,而 compress 只会说"号不在上下文里",看起来像模型点错了。
+		# 等 compress 这条路的用法定下来,再决定它是留、是改、还是让位。
+		# 方法本身留着(snip_compact),测试也还照着它跑。
+		# messages = self.snip_compact(messages)
 
 		# 第 3 层:字符数还是超。目标是压到上限的八成,留点余量,免得下一轮
 		# 工具结果一进来又立刻超线、每轮都压一遍。
-		if self.estimate_tokens(messages) > self.CONTEXT_TOKEN_BUDGET:
-			target = int(self.CONTEXT_TOKEN_BUDGET * self.COMPACT_TARGET_RATIO)
-			messages = self.micro_compact(messages, target)
-			if self.estimate_tokens(messages) > self.CONTEXT_TOKEN_BUDGET:
-				messages = self.fit_tool_results(messages, target)
+		#
+		# 和第 2、4 层一起先关掉(2026-09-22,临时的)。理由跟第 2 层那条
+		# 一样,而且这三档都动 tool_result 的正文 —— 而 compress 那个号现在
+		# 就拼在正文末尾,改写正文就会把号吃掉。等 compress 那条路的用法定
+		# 下来,再决定它们是留、是改、还是让位。
+		# **重新打开之前先补一手:** 每一处改写正文的地方(这里两处,加上
+		# micro 里那几处)都得像 tool_result_budget 那样,用 _split_marker
+		# 把号摘下来、换完正文再拼回去。
+		# 方法本身留着(micro_compact / fit_tool_results),测试也还照着它们跑。
+		# if self.estimate_tokens(messages) > self.CONTEXT_TOKEN_BUDGET:
+		# 	target = int(self.CONTEXT_TOKEN_BUDGET * self.COMPACT_TARGET_RATIO)
+		# 	messages = self.micro_compact(messages, target)
+		# 	if self.estimate_tokens(messages) > self.CONTEXT_TOKEN_BUDGET:
+		# 		messages = self.fit_tool_results(messages, target)
 
-			# 第 4 层:前面全是"少给模型看",这一档是"换个说法给它"。
-			# 前三档都只动 tool_result,所以模型自己的输出和用户的输入
-			# 累积到超线时,只有这儿接得住。
-			if self.estimate_tokens(messages) > self.CONTEXT_TOKEN_BUDGET:
-				messages = self.compact_history(messages, active_request)
+		# 第 4 层:前面全是"少给模型看",这一档是"换个说法给它"。
+		# 前三档都只动 tool_result,所以模型自己的输出和用户的输入
+		# 累积到超线时,只有这儿接得住。
+		# if self.estimate_tokens(messages) > self.CONTEXT_TOKEN_BUDGET:
+		# 	messages = self.compact_history(messages, active_request)
 
 		# 位置在这儿是有讲究的:此刻 messages 停在完整回合的边界上(压缩就是
 		# 为了"发请求之前把它改小",所以只能切在那儿),正是能存检查点的位置。

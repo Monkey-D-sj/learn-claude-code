@@ -1,6 +1,7 @@
 from tools.ask import make_ask_tool
 from tools.base import ToolDesc
 from tools.bash import bash
+from tools.compress import compress
 from tools.edit import edit_file
 from tools.glob import glob
 from tools.grep import grep
@@ -19,9 +20,13 @@ from tools.write import write_file
 #   ask         背后是"这一轮的问题往哪条流上问",那条流是每请求一条的
 #
 # 所以它俩现造,由 build_tools 挂在后面。
+#
+# compress 也是"要绑一个东西"的,但绑的那份 messages 是**每轮**都换的(甚至
+# 在同一轮里被压缩改过),没有"造工具的那一刻"可以挂上去 —— 所以它走
+# contextvar,由 agent_loop 在跑 handler 之前 bind,见 tools/compress.py。
 BASE_TOOLS = [
 	bash, read_file, write_file, edit_file, glob, grep, skill, vision,
-	memory_tool, user_memory_tool, task,
+	memory_tool, user_memory_tool, task, compress,
 ]
 
 
