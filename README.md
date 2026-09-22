@@ -1,7 +1,11 @@
 # custom-agent
 
-一个从零手写的极简 coding agent。没有 LangChain、没有框架、没有插件系统 —— 只有
-一个 agent loop、几个工具、几个 hook,和一套自己写的上下文压缩。
+一个从零手写的极简通用 agent。没有 LangChain、没有框架、没有插件系统 —— 只有
+一个 agent loop、几个工具、几个 hook、一套自己写的上下文压缩,和一本自己记的账。
+
+(提示词里不自称 coding agent:`app.py` 的 `_SYSTEM_FROZEN` 写的是
+`general-purpose agent`。它能跑 shell、读写文件、看图、提问、派子 agent,
+不限于改代码。)
 
 模型走 DeepSeek(`deepseek-flash`),通过 `https://api.deepseek.com/anthropic`
 这个 Anthropic 兼容端点,所以代码里直接用 `anthropic` SDK,不额外做一层适配。
@@ -61,23 +65,30 @@ python server.py     # 然后打开 http://localhost:8765/
 | 路径 | 说明 |
 |---|---|
 | `agent.py` | `call_api()`(唯一网络出口,3 次指数退避)和 `agent_loop()` 主循环 |
-| `context.py` | `ContextCompactor` —— 四层上下文压缩 |
-| `config.py` | `WORKDIR`、`MAX_ROUNDS=50`、落盘目录 |
+| `context.py` | `ContextCompactor` —— 四档上下文压缩,外加 `compress` 工具背后那套号段机制(1120 行) |
+| `config.py` | `WORKDIR`、`MAX_ROUNDS=50`、落盘目录、记忆额度 |
 | `emit.py` | 终端渲染器。叶子模块,不 import 项目内任何东西(防循环依赖) |
-| `app.py` | 两个前端共用的 SYSTEM 提示词 / MODEL / 压缩器工厂 |
+| `app.py` | 两个前端共用的 SYSTEM 提示词 / `MODEL` / 压缩器工厂 |
 | `main.py` | 终端前端(REPL) |
 | `server.py` | HTTP 前端:`GET /` 给页面,`POST /ask` 回一条 NDJSON 流 |
 | `ui/index.html` | 页面。单文件,每次请求现读,改完刷新即可生效 |
+| `sessions.py` | SQLite 会话库(会话 / 轮次 / 原始消息 / 工作上下文 / 事件) |
+| `usage.py` | 账本:一次 API 调用一行,append-only JSONL,写到 `.traces/usage.jsonl` |
+| `pricing.py` | 价目表(人民币、两个时段)。数据,不是代码 |
+| `report.py` | 把 `usage.jsonl` 渲染成几张表。`python report.py` |
 | `tools/` | 工具实现,每个文件一个工具 |
 | `hooks/` | 4 个事件点的回调 |
 | `skills/` | 技能正文(`SKILL.md`),按需加载 |
 | `memory/` | 项目级记忆(`MEMORY.md`),一条一行,常驻 system prompt |
 | `user/` | 用户级记忆(`USER.md`),同上;被 `.gitignore` 挡掉 |
+| `notes/context.md` | 压缩的原始设计稿,**不是现行设计** —— 哪些落地了见文件头的状态说明 |
 | `example.py` | 压缩流程的原始设计稿(独立脚本,不被引用),`context.py` 的前身 |
+| `tests/` | pytest。`test_context.py` 按模块直接测,不是端到端 |
 
 ## 工具
 
-`tools/__init__.py` 里的 `TOOLS` 就是模型能看到的全部:
+`tools/__init__.py` 里 `BASE_TOOLS` 那 12 个 + `build_tools()` 现造的 2 个,合起来
+14 个,就是模型能看到的全部:
 
 | 工具 | 作用 |
 |---|---|
@@ -92,6 +103,7 @@ python server.py     # 然后打开 http://localhost:8765/
 | `vision` | 看一眼图片(PNG/JPEG/GIF/WebP),答一个关于它的问题。图不进上下文 |
 | `ask` | 问用户一个问题,等他的回答。可以带一组选项,页面上画成按钮 |
 | `task` | 派一个子 agent,独立上下文,只回结论 |
+| `compress` | 把一段干完的活按号段压成一句话(见下面的上下文压缩) |
 
 每个工具都是一个 `ToolDesc`(dataclass):名字 + 描述 + input schema + handler。
 加工具 = 新建一个文件、写个 `ToolDesc`、在 `tools/__init__.py` 里加进
@@ -100,6 +112,10 @@ python server.py     # 然后打开 http://localhost:8765/
 要是它得绑一个**每轮或每会话才存在**的东西(某个 agent 的任务清单、这一轮的
 问题该往哪条流上问),就写成工厂,由 `build_tools` 现造 —— `todo_write` 和
 `ask` 就是这两个,`BASE_TOOLS` 里没有它们。
+
+`compress` 也属于"要绑东西"的一类,但它绑的那份 `messages` **每轮都换**(甚至
+在同一轮里被压缩改过),没有"造工具的那一刻"可以挂上去 —— 所以它走
+`contextvar`(`context.bind_messages`),由 `agent_loop` 在跑 handler 之前 bind。
 
 ## Hooks
 
@@ -119,19 +135,52 @@ python server.py     # 然后打开 http://localhost:8765/
 
 ## 上下文压缩
 
-`context.py` 是项目里最厚的一块(652 行)。发送前按顺序过四道:
+`context.py` 是项目里最厚的一块(1120 行)。设计上是四档阶梯,代价递增,每轮
+**发送之前**由 `agent_loop` 调一次 `prepare(messages, active_request, checkpoint)`:
 
-1. **tool_result_budget** —— 超大的工具结果落盘到 `.task_outputs/tool-results/`,
-   消息里只留预览和路径。
-2. **snip_compact** —— 把中段旧消息归档到 `.transcripts/`。
-3. **micro_compact** —— 还不够就精简旧结果的正文。
-4. **compact_history** —— 最后兜底,整段换成一条模型摘要。
+| 档 | 方法 | 干什么 | 代价 |
+|---|---|---|---|
+| 1 | `tool_result_budget` | 最新一批 tool_result 超线就把大的落盘到 `.task_outputs/tool-results/`,消息里只留预览和路径 | 不调模型,可逆 |
+| 2 | `snip_compact` | 消息条数 > 150 就把中段归档到 `.transcripts/`,只留头 3 条 + 一条标记 | 不调模型 |
+| 3 | `micro_compact` + `fit_tool_results` | 还超就压到预算的八成:旧结果换成一行指针,再不够连预览一起缩 | 不调模型,要写盘 |
+| 4 | `compact_history` | 兜底:整段对话换成一条模型摘要 | 调模型、不可逆、毁缓存前缀 |
 
-压缩到最后一档时,当前任务原文(`active_request`)会被单独保留成
+触发线是 **token** 不是字符(`CONTEXT_TOKEN_BUDGET = 300_000`),量法是
+`fingerprint()` 序列化 + `_count_tokens()`,CJK 和 ASCII 分开算 —— 同一段文字
+里汉字和 ASCII 的 token 数差着 4 倍,按字符量会把中文注释密集的上下文估错一倍
+以上。
+
+### 当前状态:只有第 1 档在跑
+
+`prepare()` 里**第 2、3、4 档是注释掉的**(`context.py:1084–1115`,2026-09-22,
+标注为临时)。理由是这三档都会改写 `tool_result` 的正文,而 `compress` 那个号
+(`<message-id ...>m00007</message-id>`)现在就拼在正文末尾 —— 改写正文就会把号
+吃掉,模型手里记着的号段会指向别的消息,而且**不报错**,只表现为"它点什么都不对"。
+
+第 1 档是唯一处理了这件事的:它换正文前先用 `_split_marker` 把号摘下来、换完再
+拼回去,落盘的那份文件里是干净的工具原文。
+
+后果得说清楚:**现在没有任何东西拦得住上下文增长**,除非"最新一批 tool_result
+单批就超 30 万 token"。模型自己的输出和用户输入累积超线时,四档里接得住的正是
+被关掉的那几档。重新打开的前置条件是:每一处改写正文的地方(第 3 档的
+`micro_compact` 和 `fit_tool_results`,各有几处)都补上 `_split_marker` 那套
+摘号 / 拼号。
+
+### 模型自己点的那条路
+
+跟上面四档是两回事:那四档是"超线就压",这条路是"模型觉得一段活干完了,点名压掉
+它"。每条工具结果的末尾都拼着一个号,`compress(from_id, to_id, summary)` 按号段
+压 —— 摘要由模型写,原文按号还查得回来。配对检查在 `compress_range` /
+`_pairing_problem` / `_owner_index` 里(号段两端会自己吸附到完整回合,不能切在
+`tool_use` 和它的 `tool_result` 中间),切错了只回一句话、不动上下文。
+
+第 4 档(当前关闭)会把当前任务原文(`active_request`)单独保留成
 `Current user request` 标签 —— 否则当前任务会连同历史一起被总结掉。
 
-两个目录都放在 `WORKDIR` 里,因为模型得能自己用 `bash`/`read_file` 去读落盘的
-完整结果;放到 `WORKDIR` 之外会被 `permission_hook` 拦。
+两个落盘目录(`.task_outputs/tool-results/`、`.transcripts/`)都放在 `WORKDIR` 里,
+因为模型得能自己用 `bash`/`read_file` 去读落盘的完整结果;放到 `WORKDIR` 之外会被
+`permission_hook` 拦。两条标记里的路径都当**不可信输入**验过(必须真在对应目录里、
+而且文件存在),否则伪造一个 `Full output: <path>` 就能把模型引到任意文件上。
 
 ## 技能
 
@@ -217,22 +266,56 @@ Facts and preferences from earlier sessions, fixed when this session started. Ba
 子 agent 两个记忆工具都拿不到:它翻到的东西该写进报告交回主 agent,由主 agent
 决定记不记。
 
+## 记账
+
+一次 API 调用一行,append-only 写到 `.traces/usage.jsonl`(`config.USAGE_PATH`),
+`python report.py` 渲染成八张表:总览、按 purpose、按 agent、按会话、按时段、
+重试的账、命中率曲线、账本自检。
+
+三件容易做错、而且都**不报错**的事:
+
+- **币种。** `pricing.CURRENCY = "CNY"`,字段叫 `cost` 不叫 `cost_usd` —— 一个
+  叫 `_usd` 的字段装着人民币,看起来一直是对的,直到拿去对账单。
+- **时段。** 高峰 09:00–12:00、14:00–18:00(北京时间,左闭右开),其余空闲,
+  两档差整整一倍。这次调用算哪一档由**调用发生的时刻**定(`tier_at`),不能事后
+  重算 —— 那等于用今天的时段改写历史的账。窗口只在 `pricing.py` 写一处。
+- **`purpose`。** 每次调用都得标:默认 `main`,摘要那次显式传
+  `purpose="compaction"`,`vision` 传 `"vision"`。**压缩到底值不值**正是从
+  `compaction` 这一笔和它省下的缓存折扣里算的,混进 `main` 就永远拿不到这个数。
+  子 agent 不走 purpose,走的是另一维:`usage.span(agent="subagent")` ——
+  合并而不是覆盖,否则子 agent 花的钱会变成一条没有归属的孤儿记录,而它恰恰是最
+  该被看见的那一笔。
+
+报表里最要紧的是**命中率曲线**那一张:压缩省 token,但缓存是前缀匹配,而摘要
+每次措辞都不可能逐字节相同 —— 于是存在一个反直觉的可能,**压缩把缓存打掉了**,
+省下的 token 不如失去的折扣值钱。只看总成本永远看不出来,必须逐轮看,压缩那一轮
+单独标出来。
+
+`report.py` 的定义和算法全部从 `usage.py` 借(`COUNTERS` / `summarize` /
+`hit_rate` / `money`),不抄第二份 —— 抄一份的代价是某天改了口径,报表少算一栏、
+数字偏低,而且不报错。
+
 ## 几个设计取舍
 
 **图不进对话,就地消化。** `vision` 把图读进来、就地调一次模型、只把文字交回
 去 —— 图片本身从不进主上下文。模型自己看得见图(实测:一张 153 KB 的 jpg
 才 667 输入 token,冰晶瞳孔、精灵耳、额头宝石全说对了),所以这不是"能不能"
-的问题,是那把**尺子**的问题。
+的问题。
 
-`context.py` 量上下文用的是 `fingerprint()` 的**字符数**,而 base64 也是字符。
-同一张图 base64 后 20 万字符,`CONTEXT_CHAR_LIMIT` 是 50000 —— **一张图就是
-上限的四倍**。实测过:压缩器第一轮就把它换成一句指针,**图没了**,而且"落盘"
-的那份是 `str(list)` 出来的 Python repr,永远发不回 API。
+**当初那条理由已经过期了。** 当时不让图进对话,依据是"尺子量的是**字符数**,
+而 base64 也是字符":同一张图 base64 后 20 万字符,而 `CONTEXT_CHAR_LIMIT` 是
+50000 —— 一张图就是上限的四倍,压缩器第一轮就把它换成一句指针,图没了。现在
+尺子换成了 token(`CONTEXT_TOKEN_BUDGET = 300_000`),base64 走 ASCII 那档
+(4 字符/token),20 万字符约 5.5 万 token —— 不再是四倍超限,而是一个零头。
 
-token 那头一点事没有,出问题的只有那把尺子。要让图进对话,得先教会
-`fingerprint` / `tool_result_budget`(别把 base64 当字符)和 `micro_compact` /
-`fit_tool_results`(别对块列表做 `str()`)这四件事,而它们**改错了都是静默
-毁历史**。在那之前,图一律就地消化。
+结论保留,理由换成现在成立的两条:
+
+- **体积。** 一张图 base64 就是 5 万 token 量级,而 `messages` 每轮都重发 ——
+  留在历史里的一张图,等于每一轮都为它付一次钱。
+- **落盘路径认不出块。** 第 1 档和 `micro` / `fit` 换正文时做的是
+  `str(block["content"])`;`content` 要是块列表(带图的结果就是),`str()` 出来
+  是 Python repr,写进盘里的那份**永远发不回 API**。要让图进对话,先得把这四处
+  教会怎么对待块列表,而它们**改错了都是静默毁历史**。
 
 代价:图不留在上下文里,所以同一个问题再问一次就得再调一次(重复那 667
 token)。`vision` 的说明里对模型明说了,它想一次问全就会一次问全。
@@ -313,10 +396,22 @@ partial 进去,而 `build_tools` 那个 `ask_user` **故意不给默认值** —
 
 ## 已知小问题
 
+- **压缩只跑第 1 档。** 第 2/3/4 档被注释掉(`context.py:1084–1115`),原因是号
+  (`<message-id ...>`)拼在 tool_result 正文末尾,而这几档改写正文。**这是当前
+  唯一一处主动拆掉的兜底**:除非最新一批工具结果单批超线,否则上下文没有任何东西
+  拦得住。重新打开前要先给每一处改正文的地方补上 `_split_marker`。
+- **`compress` 的用法还没定。** 上面那三档关着,就是在等这个决定:号是留在正文里
+  靠摘/拼保护,还是挪到别处存。定了之后再谈那三档是留、是改、还是让位。
+- **测试绿着,但那三档已经不在链上。** `tests/test_context.py` 直接调
+  `snip_compact` / `micro_compact`,它们当然过 —— 缺的是"整条阶梯在 `prepare`
+  里接通了没有"的用例,否则将来重新打开时没人拦得住改错。
+- 根目录的 `HQKbRyBWIAA4t6B.jpg` 是 `vision` 实测带进来的素材,已经入库,该挪进
+  `tests/fixtures/` 或者删掉。
 - `pyproject.toml` 里 `requires-python = ">=3.14"`,与 `.python-version` 一致,
   但 `__pycache__` 里混着 3.11/3.12/3.14 三版的 `.pyc`,开发环境不统一。
 - `dependencies` 里的 `openai` 目前没有任何代码引用,是早期遗留。
-- `README.md` 之前是空文件,本文件就是补上的。
+- 本文件里凡是带**行号**的引用都会随代码漂(比如 `context.py:1084–1115`)。改代码
+  时顺手扫一遍相关的行号。
 
 ## 许可
 

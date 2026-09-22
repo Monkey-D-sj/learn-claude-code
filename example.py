@@ -2,6 +2,10 @@
 """
 s08_context_compact.py - Context Compact
 
+**设计稿,不被任何代码引用**。`context.py` 是它长成的东西(而且已经改了几轮:
+尺子按 token 量、第 2/3/4 档当前注释掉、多了 `compress` 那条模型自己点的路)。
+要读现行设计看 `context.py` 和 `README.md`。
+
     Before every model call:
 
     +--------------------+
