@@ -205,6 +205,23 @@ class ContextCompactor:
 	SNIP_MAX_MESSAGES = 150
 	SNIP_HEAD_MESSAGES = 3
 
+	# 第 2 层往上(含第 2 层)的总闸门:整个上下文不到预算的这个比例,一档
+	# 都不走。第 1 层不在此列 —— 它管的是**单批**多大,跟整个上下文多大无关;
+	# 而且它的门槛就等于整份预算,所以它响的时候这道闸门必然早就开了,并进来
+	# 是空操作(那条关系由 test_the_first_layer_can_never_fire_below_the_gate
+	# 钉住)。
+	#
+	# 条数单独当闸门是不够的,它跟"要花多少钱"没有关系:150 条小结果可能
+	# 只有几千 token,离预算差着两个数量级,却照样把中段切掉 —— 而切中段
+	# 就是改前缀,改了前缀这一轮全部按未命中重算(实测冷 ¥0.005546 对热
+	# ¥0.000528,差 10 倍)。拿一个跟成本无关的量去决定动不动缓存,注定错。
+	#
+	# 为什么是 75% 而不是顶到 100% 才动手:真顶到线那一轮已经按满价发出去了。
+	# 提前一档,是拿一次便宜的 snip 换掉一次全价请求。
+	SNIP_TRIGGER_RATIO = 0.75
+	# 派生值,不写成独立数字 —— 预算改了它得跟着改。
+	SNIP_TRIGGER_TOKENS = int(CONTEXT_TOKEN_BUDGET * SNIP_TRIGGER_RATIO)
+
 	# 第 3 层的预览长度,比第 1 层更短 —— 走到这儿说明常规手段已经用完了。
 	# 两个加起来保持 1000,跟原版的 preview_chars=1000 一个量级。
 	FIT_PREVIEW_HEAD = 800
@@ -803,6 +820,11 @@ class ContextCompactor:
 		四档的代价递增:落盘和 snip 不调模型;micro/fit 也不调,但要写盘;
 		最后的摘要调模型、不可逆,而且会毁掉整个 prompt cache 前缀。
 
+		**第 2 档往上有总闸门**:整段上下文不到预算的 75% 就一档都不走
+		(SNIP_TRIGGER_TOKENS)。理由见那个常量的注释 —— 一句话是压缩改前缀,
+		而 prompt 缓存断在改动处,所以"要不要压"是个按 token 算的账,不是
+		按条数。第 1 档不受这道闸门管:它管的是单批多大。
+
 		checkpoint 可选:这一次真压过了就回调一次,参数是**当前这份**
 		messages —— 也就是活的那个列表对象,调用方必须立刻序列化落库,不能
 		留着,循环接着还会往它上面追加。所谓"真压过了"是拿压前压后的
@@ -812,24 +834,37 @@ class ContextCompactor:
 		"""
 		before = self.fingerprint(messages) if checkpoint is not None else None
 
-		# 第 1 层:单轮一批太大 —— 把最大的几个落盘
+		# 第 1 层:单轮一批太大 —— 把最大的几个落盘。它管的是**单批**多大,
+		# 跟整个上下文多大无关,所以不并进下面那道闸门。
 		messages = self.tool_result_budget(messages)
-		# 第 2 层:条数太多 —— 中段归档,只留头尾
-		messages = self.snip_compact(messages)
 
-		# 第 3 层:字符数还是超。目标是压到上限的八成,留点余量,免得下一轮
-		# 工具结果一进来又立刻超线、每轮都压一遍。
-		if self.estimate_tokens(messages) > self.CONTEXT_TOKEN_BUDGET:
-			target = int(self.CONTEXT_TOKEN_BUDGET * self.COMPACT_TARGET_RATIO)
-			messages = self.micro_compact(messages, target)
-			if self.estimate_tokens(messages) > self.CONTEXT_TOKEN_BUDGET:
-				messages = self.fit_tool_results(messages, target)
+		# 到不了预算的 75%,后面一档都不走。
+		#
+		# 这道闸门的存在理由是缓存:压缩不是免费的,它改前缀,而 prompt 缓存
+		# 就断在改动处 —— 改动点之后的输入全部按未命中重算。所以"该不该压"
+		# 必须先问"省下的 token 值不值作废的缓存",而那个比较只有按 token 量
+		# 才做得出来。第 2 层原来看的只有条数,条数跟钱无关。
+		if self.estimate_tokens(messages) > self.SNIP_TRIGGER_TOKENS:
+			# 第 2 层:条数太多 —— 中段归档,只留头尾
+			messages = self.snip_compact(messages)
 
-			# 第 4 层:前面全是"少给模型看",这一档是"换个说法给它"。
-			# 前三档都只动 tool_result,所以模型自己的输出和用户的输入
-			# 累积到超线时,只有这儿接得住。
+			# 第 3 层:字符数还是超。目标是压到上限的八成,留点余量,免得下一轮
+			# 工具结果一进来又立刻超线、每轮都压一遍。
+			#
+			# 注意八成 > 上面的 75%:第 3 层压完那一份仍然在 snip 的触发区里,
+			# 所以紧接着会再走一次第 2 层。这是有意的 —— 第 2 层不调模型,先让
+			# 它把中段拿掉,比让第 3 层去啃整段便宜。
 			if self.estimate_tokens(messages) > self.CONTEXT_TOKEN_BUDGET:
-				messages = self.compact_history(messages, active_request)
+				target = int(self.CONTEXT_TOKEN_BUDGET * self.COMPACT_TARGET_RATIO)
+				messages = self.micro_compact(messages, target)
+				if self.estimate_tokens(messages) > self.CONTEXT_TOKEN_BUDGET:
+					messages = self.fit_tool_results(messages, target)
+
+				# 第 4 层:前面全是"少给模型看",这一档是"换个说法给它"。
+				# 前三档都只动 tool_result,所以模型自己的输出和用户的输入
+				# 累积到超线时,只有这儿接得住。
+				if self.estimate_tokens(messages) > self.CONTEXT_TOKEN_BUDGET:
+					messages = self.compact_history(messages, active_request)
 
 		# 位置在这儿是有讲究的:此刻 messages 停在完整回合的边界上(压缩就是
 		# 为了"发请求之前把它改小",所以只能切在那儿),正是能存检查点的位置。
