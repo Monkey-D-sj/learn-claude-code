@@ -26,6 +26,29 @@ client = Anthropic(
 MAX_ATTEMPTS = 3
 BASE_DELAY = 1.0
 
+# 单次回复的输出预算。撞上它 = 这一轮是**半截**的,见主循环里那段判断。
+# 写成常量是因为它进错误消息:把数字硬写两遍,改了 max_tokens 而没改消息,
+# 那条消息就会开始骗人 —— 而它骗的正是正在查"为什么结果是空的"那个人。
+#
+# **两个数,不是一个,因为 SDK 对非流式留了一道本地闸门。** 它按
+# "128,000 token / 小时" 估这次请求要跑多久,估出来超过 10 分钟就**在本地**
+# 抛 ValueError("Streaming is required for operations that may take longer
+# than 10 minutes"),请求根本不发出去。边界算下来是
+# 600 * 128_000 / 3_600 = 21,333.3 —— 实测 21,333 通过、21,334 抛。
+#
+# 这道闸门不是可以绕的教条。非流式请求期间没有任何字节往回走,服务端卡住时
+# 唯一能察觉它的就是超时;把 max_tokens 抬到 SDK 认为"这一趟可能要跑十几
+# 分钟",等于让一个 HTTP 线程连同那个会话的锁一起挂在那儿等。
+#
+# 所以:流式那条路(主循环)放开到 80,000,非流式那条路(子 agent)顶在
+# 21,333 之下的一个整数上。**不为了让两边共用一个数就把子 agent 改成流式**
+# —— 流式对它唯一的实际影响是把重试禁掉(吐过第一个字之后不能再试),而
+# 它的 emit 是 terminal_emit,那个没有 delta 分支,碎片打进去等于丢掉。
+#
+# 端点本身收得下 80,000:实测流式下返回 stop_reason=end_turn。
+MAX_OUTPUT_TOKENS = 80_000
+MAX_OUTPUT_TOKENS_NONSTREAM = 20_000
+
 
 def delta_of(event) -> tuple[str, str]:
 	"""从一条流事件里取出能转发的碎片 (去哪儿, 什么字)。取不到返回空。
@@ -385,6 +408,11 @@ def agent_loop(messages: list, active_request: str, system: str, tools: list,
 			# context 那份存的是可继续的对话,这条只属于这一次请求。
 			record("control", "user", [warn])
 
+		# 非流式那条路要用小一号的预算 —— 理由见 MAX_OUTPUT_TOKENS 那段:
+		# 它不是策略,是 SDK 在本地拦下来的硬边界(21,333),超了连请求都发不
+		# 出去。放在循环里算而不是挪进常量,是因为它跟着本轮那条路走。
+		output_budget = (MAX_OUTPUT_TOKENS if stream
+		                 else MAX_OUTPUT_TOKENS_NONSTREAM)
 		try:
 			response = call_api(
 				client,
@@ -393,7 +421,7 @@ def agent_loop(messages: list, active_request: str, system: str, tools: list,
 				messages=payload,
 				system=system,
 				tools=wire,
-				max_tokens=8000,
+				max_tokens=output_budget,
 				stream=stream,
 			)
 		except anthropic.APIError as e:
@@ -407,6 +435,43 @@ def agent_loop(messages: list, active_request: str, system: str, tools: list,
 				detail += f" <- {chain}"
 			return TurnOutcome("failed", f"Error: API call failed: {detail}",
 			                   detail)
+
+		# 输出撞上 max_tokens 上限:这一轮是**半截**的,不能当正常收尾放过去。
+		#
+		# 两条理由,任一条都够:
+		#
+		#   1. 截断的响应里可能**一个 text 块都没有** —— thinking 算在同一个
+		#      输出预算里,它把预算吃光时 text 根本不生成(vision.py 那边为
+		#      同一件事单独留了一道闸门)。那时 final_text 返回空字符串,而
+		#      下面"没有工具调用就是干完了"那条路会把它当成 completed 交出去:
+		#      调用方拿回一个空结果,账上一切正常,连失败都不是。
+		#      实测栽的就是子 agent:三次派活三次撞上 8,000,三次都朝主 agent
+		#      回了一句空话,而主 agent 唯一的信息源就是那句话。
+		#
+		#   2. 截断的 tool_use 是**半个 JSON**。它拼到一半,执行它等于拿一个
+		#      缺参数的东西去动文件。所以不能让它往下走工具那条路。
+		#
+		# 判据用 stop_reason,不用"text 是不是空的":空 text 是现象,stop_reason
+		# 是原因,而只有原因能决定该怎么处置 —— 模型自愿回一句空话是合法的。
+		#
+		# **只进 record,不进 messages。** 截断的那条 assistant 消息可能带着一个
+		# 没有 tool_result 的 tool_use,它一旦留在上下文里,用户下次提问就是
+		# 400(见循环顶部那段注释:整个循环的前提就是退出的位置停在一个完整
+		# 回合上)。上面那条"先 record 再 emit"的规矩在这儿反过来:record 是
+		# 存档,页面上刷新之后还得看得到模型当时说了什么,所以照记;messages
+		# 是"下一轮要发出去的东西",少这一条比多一条坏的强。
+		if getattr(response, "stop_reason", None) == "max_tokens":
+			record("assistant_response", "assistant", response.content)
+			reason = (f"output truncated at the {output_budget}-token limit, "
+			          f"task incomplete")
+			emit({"kind": "note",
+			      "source": f"output limit {output_budget} reached", "text": ""})
+			cut = final_text(response)
+			return TurnOutcome(
+				"failed",
+				f"Stopped: {reason}." + (f"\n\n{cut}" if cut else ""),
+				reason)
+
 		messages.append({
 			"role": "assistant", "content": response.content
 		})

@@ -158,3 +158,47 @@ def test_self_check_says_how_many_records_it_skipped(tmp_path, monkeypatch,
 	out = capsys.readouterr().out
 	assert "1 条带 tier 的记录,都和自己的 ts 对得上" in out
 	assert "另外 1 条没有 tier 字段" in out
+
+
+# --------------------------------------------- 打不出人民币的控制台
+
+def test_终端打不出人民币符号时降级成币种代码():
+	"""Windows 中文控制台是 cp936,打 ¥ 直接抛 UnicodeEncodeError。
+
+	那时候整份报表一个字都出不来,而报错指向 print 那一行 —— 看起来像在说
+	报表算错了,其实账本一个字没毛病。降级成 "CNY " 而不是 "?" 或 "\xa5",
+	跟 money() 里"认不出的币种就把代码打出来,不猜一个符号"是同一条规矩:
+	¥ 和 $ 差着七倍,猜错的那个看起来一直是对的。
+	"""
+	# 造一个 gbk 遇到 ¥ 时抛出来的那种异常,形状要跟真的一样。
+	exc = UnicodeEncodeError("gbk", "¥3.75", 0, 1, "illegal multibyte sequence")
+	assert report._readable_currency(exc) == ("CNY ", 1)
+
+	exc = UnicodeEncodeError("gbk", "$3.75", 0, 1, "illegal multibyte sequence")
+	assert report._readable_currency(exc) == ("USD ", 1)
+
+	# 别的字符没有对应写法,退化成一个问号 —— 但不能崩,也不能悄悄少一位。
+	exc = UnicodeEncodeError("gbk", "🍣3.75", 0, 1, "illegal multibyte sequence")
+	assert report._readable_currency(exc) == ("?", 1)
+
+
+def test_整行金额在gbk控制台上打得出来():
+	"""端到端:同样的写法挂到一条 gbk 的流上,金额那行要出得来。
+
+	只测 error handler 那个函数是不够的 —— 真正会坏的地方是"它有没有被装上",
+	而那只有让一个真编码器去打一次才知道。
+	"""
+	import codecs
+	import io
+
+	import usage
+
+	codecs.register_error("report-gbk-test", report._readable_currency)
+	raw = io.BytesIO()
+	stream = io.TextIOWrapper(raw, encoding="gbk", errors="report-gbk-test")
+	stream.write("  总成本      " + usage.money(3.7542, "CNY") + "\n")
+	stream.flush()
+
+	out = raw.getvalue().decode("gbk")
+	assert "¥" not in out, "还是打出了 gbk 装不下的那个字符"
+	assert "CNY 3.7542" in out, out

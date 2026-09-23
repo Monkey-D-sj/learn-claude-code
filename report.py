@@ -21,6 +21,7 @@
 看不出来,必须逐轮看。
 """
 
+import codecs
 import json
 import sys
 from collections import defaultdict
@@ -33,8 +34,9 @@ from config import USAGE_PATH
 #   summarize      怎么加总
 #   hit_rate       命中率的分母是什么
 #   money          金额怎么渲染(含币种)
-#   is_main_loop   哪些记录算主循环 —— 命中率曲线和页面那栏"上下文"用的是
-#                  同一条规矩,原来写在这儿,现在跟其它几条住一起
+#   is_main_loop   哪些记录算主循环 —— 命中率曲线和页面那行小结(调用次数、
+#                  输入、命中率、输出、耗时、金额)用的是同一条规矩,原来写在
+#                  这儿,现在跟其它几条住一起
 #
 # 抄一份的代价:某天加了计数器、或者改了某个口径,usage.py 改了、这儿没改 ——
 # 报表少算一栏、数字偏低。**而这不会报错**,只是数字变小了。同一个定义写两遍、
@@ -86,7 +88,42 @@ def _group(records: list[dict], key) -> list[tuple[str, dict]]:
 	return sorted(rows, key=lambda pair: (-pair[1]["calls"], pair[0]))
 
 
+def _readable_currency(exc):
+	"""某个字符在**这个终端**的编码里没有时,换一个能打出来的写法。
+
+	Windows 中文控制台的 codepage 是 936,`sys.stdout.encoding` 就是 gbk ——
+	而它在打印 ¥ 的时候直接抛 UnicodeEncodeError。于是整份报表一个字都没
+	出来,报错信息指向 report.py 里一行 `print`,看起来像是在说报表算错了,
+	其实账本一个字没毛病。
+
+	**为什么不 reconfigure 成 utf-8:** 那只是把字节换了个编码往同一个 cp936
+	的控制台里倒 —— ¥ 不崩了,但整个中文也跟着变成乱码,比崩了更难查。终端
+	认什么编码,就按什么编码写,认不出来的那几个字降级。
+
+	降级成 "CNY " / "USD " 而不是 "?" 或 "\\xa5":跟 money() 里那条规矩同一个
+	道理 —— 认不出的币种就把代码打出来,不猜一个符号。¥ 和 $ 差着七倍,而
+	猜错的那个看起来一直是对的。
+
+	注册成 codecs 的 error handler,是为了**一处生效**:money() 那边一个字
+	不用改,也不用去包每一个 print。"""
+	bad = exc.object[exc.start:exc.end]
+	sub = {"¥": "CNY ", "$": "USD "}.get(bad)
+	return (sub if sub is not None else "?", exc.end)
+
+
 def main() -> None:
+	# 装在 main 里,不装在模块顶上:装的那一下改了进程级的 stdout,而
+	# **import 一个模块不该有那种副作用**(tests/test_report.py 就 import 它,
+	# 装早了会连带改掉 pytest 的捕获流)。
+	codecs.register_error("report", _readable_currency)
+	try:
+		sys.stdout.reconfigure(errors="report")
+	except (AttributeError, ValueError, OSError):
+		# reconfigure 是 3.7+ 的,而且 stdout 被换成不支持重配的对象时(管道、
+		# 某些测试替身)会抛。这不是致命问题:拿不到降级就别降级,总比
+		# 为了一行美化把整份报表拦下来强。
+		pass
+
 	path = Path(sys.argv[1]) if len(sys.argv) > 1 else USAGE_PATH
 	if not path.exists():
 		print(f"没有账本:{path}")

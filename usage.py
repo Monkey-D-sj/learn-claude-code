@@ -288,21 +288,47 @@ def turn_line(records: list[dict]) -> str | None:
 	**"输入"和"上下文"是两栏,不能并成一栏。** 前者是这一轮所有调用的求和,
 	后者是跑完时上下文的大小(见 context_size)。并起来的话,一个 35 次调用的
 	轮次看起来就像"上一轮没被加进来",而它其实被重发了 35 遍。
+
+	**这一行只算主循环(见 is_main_loop),另外那一撮单独报一笔。** 这一段
+	原来是把全部记录按求和算的,于是子 agent 混了进来 —— 而它跟主循环是两个
+	上下文窗口、两个 system,缓存行为毫无关系。混出来的不是一个"更全面的"
+	命中率,是一个**谁都不是**的数:分子是所有记录的命中之和,分母是所有记录
+	的输入之和,两半来自不同的上下文。
+
+	实测就栽在这儿:同一轮,页面那行报 76.2%,而主循环自己 93.5% —— 差的 17
+	个点全是 13 次子 agent 调用(64.7%)拉下来的。而这一栏正是用来回答"缓存
+	到底生效没有"的,报低了会让人跑去查一个不存在的缓存问题。
+
+	钱和调用次数**不藏**:非主循环那一份在末尾报总数和金额。它们是真花掉的,
+	从页面上抹掉等于请人来问"那 39 分去哪了"。
 	"""
 	row = summarize(records)
 	if not row["calls"]:
 		return None
-	line = (f"{row['calls']} 次调用 · "
-	        f"输入 {row['total_input']:,}"
-	        f"(命中 {row['cache_read_input_tokens']:,} / {hit_rate(row)}) · ")
+	# 主循环那一份:这一行的每个数都从它来,于是彼此可比。
+	main = summarize([r for r in records if is_main_loop(r)])
+	# 一份主循环记录都没有(理论上不该有:轮次本来就是主循环跑出来的)。
+	# 这时退回全部记录 —— 数字仍然是账上的真数字,只是不分成两份。
+	rest = None
+	if not main["calls"]:
+		main = row
+	else:
+		rest = summarize([r for r in records if not is_main_loop(r)])
+	line = (f"{main['calls']} 次调用 · "
+	        f"输入 {main['total_input']:,}"
+	        f"(命中 {main['cache_read_input_tokens']:,} / {hit_rate(main)}) · ")
 	# 拿不到就整栏不显示,不填 0:0 的意思是"上下文是空的",那是另一回事。
 	context = context_size(records)
 	if context is not None:
 		line += f"上下文 {context:,} · "
-	line += (f"输出 {row['output_tokens']:,} · "
-	         f"{row['elapsed_ms'] / 1000:.1f}s")
-	if row["cost"] is not None:
-		line += f" · {money(row['cost'], row['currency'])}"
+	line += (f"输出 {main['output_tokens']:,} · "
+	         f"{main['elapsed_ms'] / 1000:.1f}s")
+	if main["cost"] is not None:
+		line += f" · {money(main['cost'], main['currency'])}"
+	if rest is not None and rest["calls"]:
+		line += f" · 另 {rest['calls']} 次"
+		if rest["cost"] is not None:
+			line += f" {money(rest['cost'], rest['currency'])}"
 	return line
 
 

@@ -789,3 +789,71 @@ def test_turn_line_omits_context_when_there_is_no_main_call(ledger):
 		            attempt=1, ok=True, elapsed_ms=5, kind="nonstream")
 	assert usage.context_size(usage.read_turn("s1", 1)) is None
 	assert "上下文" not in usage.turn_line(usage.read_turn("s1", 1))
+
+
+def test_turn_line_hit_rate_is_the_main_loop_not_a_blend(ledger):
+	"""**命中率只算主循环**,子 agent 那一撮不算进去。
+
+	这一栏回答的是"缓存到底生效没有",而子 agent 跟主循环是两个上下文窗口、
+	两个 system,缓存行为毫无关系。按求和混着算出来的不是一个更全面的数,是
+	一个**谁都不是**的数:分子是所有记录的命中之和,分母是所有记录的输入之和,
+	两半来自不同的上下文。
+
+	数字取实测那一轮:主循环 9 次调用 93.5%,子 agent 13 次 64.7%,混起来
+	76.2% —— 页面原来报的就是最后这个。
+	"""
+	with usage.span(session="s1", turn=1):
+		usage.meter(purpose="main", model="m",
+		            usage_obj=make_usage(input_tokens=8_441,
+		                                 cache_read_input_tokens=122_112),
+		            attempt=1, ok=True, elapsed_ms=5, kind="stream")
+	with usage.span(session="s1", turn=1, agent="subagent"):
+		usage.meter(purpose="main", model="m",
+		            usage_obj=make_usage(input_tokens=69_400,
+		                                 cache_read_input_tokens=127_360),
+		            attempt=1, ok=True, elapsed_ms=5, kind="nonstream")
+
+	line = usage.turn_line(usage.read_turn("s1", 1))
+	assert "93.5%" in line, line
+	assert "76.2%" not in line, f"子 agent 混进了主循环的命中率:{line}"
+	assert "输入 130,553" in line, f"分子的分母要同源,实际 {line}"
+
+
+def test_turn_line_reports_the_rest_as_a_separate_item(ledger, monkeypatch):
+	"""非主循环那一份单独报一笔 —— 钱和次数不能从页面上消失。
+
+	藏在暗处的那笔最该被看见:子 agent 嵌套、没人看、没人问,而且整个系统里
+	最容易失控的就是它。
+	"""
+	monkeypatch.setitem(pricing.CNY_PER_MTOK, "priced-model", {
+		pricing.PEAK: {"input_tokens": 1.0, "cache_read_input_tokens": 0.0,
+		               "cache_creation_input_tokens": 0.0, "output_tokens": 0.0},
+		pricing.OFF_PEAK: {"input_tokens": 0.5, "cache_read_input_tokens": 0.0,
+		                   "cache_creation_input_tokens": 0.0, "output_tokens": 0.0},
+	})
+	with usage.span(session="s1", turn=1):
+		usage.meter(purpose="main", model="priced-model",
+		            usage_obj=make_usage(input_tokens=1_000_000),
+		            attempt=1, ok=True, elapsed_ms=5, kind="stream")
+	with usage.span(session="s1", turn=1, agent="subagent"):
+		usage.meter(purpose="main", model="priced-model",
+		            usage_obj=make_usage(input_tokens=2_000_000),
+		            attempt=1, ok=True, elapsed_ms=5, kind="nonstream")
+
+	records = usage.read_turn("s1", 1)
+	line = usage.turn_line(records)
+	assert "1 次调用" in line, line
+	assert "另 1 次" in line, line
+	# 那一笔的金额也得报出来,而且是主循环那一笔之外的另一笔。
+	sub = [r for r in records if r["agent"] == "subagent"][0]
+	assert usage.money(sub["cost"], sub["cost_currency"]) in line, line
+
+
+def test_turn_line_says_nothing_extra_when_everything_is_main_loop(ledger):
+	"""常规那一轮(只有主循环)不长出一条多余的尾巴。"""
+	with usage.span(session="s1", turn=1):
+		usage.meter(purpose="main", model="m",
+		            usage_obj=make_usage(input_tokens=100),
+		            attempt=1, ok=True, elapsed_ms=5, kind="stream")
+	assert "另" not in usage.turn_line(usage.read_turn("s1", 1))
+
