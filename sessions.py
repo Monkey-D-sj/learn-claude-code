@@ -53,6 +53,7 @@
 """
 
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -68,7 +69,13 @@ from pathlib import Path
 #
 # 附带好处:它在 WORKDIR 外面,read_file/write_file/edit_file 够不着它。
 # bash 仍然删得掉(permission_hook 也拦不住,不该指望它拦),这个接受。
-DB_PATH = Path(__file__).resolve().parent / "sessions.db"
+#
+# **AGENT_DB_PATH 这个口子是为了进程级测试**:启动独占(R2)要验的是"第二个
+# 实例拒绝启动、第一个的状态不变,第一个死了第三个能接手并清理",那必须起
+# 真进程 —— 而 pytest 换掉 SessionStore 这个**名字**(见 tests/conftest.py)
+# 对子进程没用,子进程是自己 import 的。server.py 的 AGENT_PORT 同理。
+DB_PATH = Path(os.environ.get("AGENT_DB_PATH")
+               or (Path(__file__).resolve().parent / "sessions.db"))
 
 SCHEMA_VERSION = 3
 
@@ -211,6 +218,15 @@ def _block_json(obj):
 	if hasattr(obj, "model_dump"):
 		return obj.model_dump(exclude_unset=True, mode="json", by_alias=True)
 	return str(obj)
+
+
+class TurnStateConflict(RuntimeError):
+	"""收尾时那一轮已经不是 running 了。
+
+	正常跑不到:一个会话只有攥着会话锁的那条线程在写它的轮次。真跑到只说明
+	有人已经把它写成了终态(比如进程重启时的 reap_running 收掉过它),这时候
+	**不能**当没看见 —— 见 finish_turn。
+	"""
 
 
 class SessionStore:
@@ -493,6 +509,12 @@ class SessionStore:
 
 		error_message 只在失败时有值:正常跑完那条路径传 None,别传空字符串
 		—— "没有错误原因"和"错误原因是空"在页面上是两回事。
+
+		**条件更新命中 0 行 = 抛,不是打一行日志。** 那说明这一轮在库里已经是
+		终态了(别人收过它),而此刻事务里那份上下文是**按"它还在跑"算出来的**
+		—— 提交上去就是拿一份旧账盖掉终态任务的工作上下文,而且没有任何地方
+		看得出来。抛出会让 _tx 回滚,上下文一个字不动;调用方拿到的是一句
+		明确的失败,而不是"存成功了但状态没改"。
 		"""
 		now = time.time()
 		text = json.dumps(messages, ensure_ascii=False, default=_block_json)
@@ -500,15 +522,55 @@ class SessionStore:
 			# 轮末这一次不带 compacted:本轮压过的话,检查点那一次已经
 			# 把 last_compacted_at 写上了,这里再写一遍只会把它推后。
 			self._put_context(conn, sid, text, now, compacted=False)
-			# 条件更新:只有还在 running 的才收尾。这一版只有一个写者
-			# (攥着会话锁的那条线程),正常跑不到 0 行;真跑到了说明
-			# 有人已经把它写成终态 —— 那声张一声,别静默盖掉。
 			changed = conn.execute(
 				"UPDATE turns SET status = ?, finished_at = ?, updated_at = ?,"
 				" error_message = ? WHERE id = ? AND status = 'running'",
 				(status, now, now, error_message, turn_id)).rowcount
-		if not changed:
-			print(f"[sessions] turn {turn_id} 收尾时已经不是 running,状态没改")
+			if not changed:
+				raise TurnStateConflict(
+					f"turn {turn_id} 收尾时已经不是 running —— 这一轮在库里"
+					f"已经是终态,这份上下文没有写进去")
+
+	def reap_running(self) -> int:
+		"""把上次进程死掉时留下的 running 轮收成终态。启动时调一次。
+
+		为什么需要:一轮的状态是它自己那条线程在最后写上的,进程被杀就没有
+		那一次。库里于是留着一条永远 running 的行 —— 而页面画的正是库里这个
+		status(见 ui/index.html 的 renderTurn),那个轮次框会一直显示"运行中",
+		刷新也刷不掉。
+
+		**为什么在 server 的 __main__ 里调,而不是在这儿(__init__)**:库是
+		import 时就打开的(server.py 的 STORE)。pytest、那堆一次性检查脚本、
+		REPL 都会 import 这个模块,写在 __init__ 里等于"任何一次 import 都可能
+		改你的库"。启动时恢复是一个明确的动作,就该待在一个明确的地方。
+
+		**边界,直说**:同一个库上开第二个实例,它会把第一个实例正在跑的那一轮
+		收掉(第一个随后收尾时条件更新匹配 0 行,打上面那行 "收尾时已经不是
+		running")。没有心跳列就分不出"死进程留下的"和"别人正在跑的";这一版
+		靠"一个库一个 server"这条前提兜住 —— dev.py 的"端口有人在应答就拒绝
+		启动"把最常见的那条第二条路也堵上了。真要更硬,下一步是启动时拿一个
+		排他文件锁。
+
+		**不碰 session_contexts**:那一份还是开轮之前的样子,下一轮正该从那儿
+		接着跑。顺手在这儿"补一笔"等于悄悄丢掉一整轮历史 —— 这个方法只改轮
+		自己的状态。
+
+		finished_at 必须和 status 写在同一条 UPDATE 里,这是表上那个 CHECK
+		要求的(status 不是 running 时它必须非空)。那条 CHECK 在这儿是朋友:
+		谁以后漏掉它,SQLite 直接抛,而不是写进一条半合法的行。
+
+		状态用 failed 而不是新加一个 interrupted:docs/session-design.md 的
+		"重启"那一节的终局是 interrupted,但 SQLite 改不了 CHECK,要重建 turns
+		表、还得连 turn_messages 那条外键一起搬。这一版就地收成 failed 加一句
+		说得清的原因。
+		"""
+		now = time.time()
+		with self._tx() as conn:
+			return conn.execute(
+				"UPDATE turns SET status = 'failed', finished_at = ?,"
+				" updated_at = ?, error_message = ?"
+				" WHERE status = 'running'",
+				(now, now, "进程重启,这一轮没有跑完")).rowcount
 
 	@staticmethod
 	def _put_context(conn, sid: str, text: str, now: float, compacted: bool) -> None:

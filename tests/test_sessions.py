@@ -147,14 +147,18 @@ def test_中途检查点与轮末收尾(db, store):
 	# 轮末那次不带 compacted,不能把"压过"这个时间抹掉
 	assert final[1] == checkpoint[1], (final, checkpoint)
 
-	# 重复收尾:条件更新打 0 行,终态不动,并且要吱一声
-	noisy = io.StringIO()
-	with contextlib.redirect_stdout(noisy):
+	# 重复收尾:条件更新打 0 行 —— 那是"这一轮在库里已经是终态"。它现在
+	# **抛**,不再只是打一行日志:不抛的话整个事务会照常提交,而那一半是按
+	# "它还在跑"算出来的上下文,提交上去就是拿旧账盖掉终态任务的工作上下文。
+	with pytest.raises(sessions.TurnStateConflict):
 		store.finish_turn(sid, turn["id"], "failed", "晚了", [])
-	assert "已经不是 running" in noisy.getvalue(), noisy.getvalue()
+	# 终态一个字没动(不是被打成 failed)
 	assert raw(db, "SELECT status, error_message FROM turns") == [("completed", None)]
-	# 记录现状:上下文那半是无条件写的,所以重复收尾仍会覆盖它
-	assert store.load_context(sid) == []
+	# 上下文也一个字没动:还是那份最终历史,连版本号和"压过"的时间都留着 ——
+	# 事务回滚了,不是"写了一半"
+	assert store.load_context(sid) == [{"role": "user", "content": "最终历史"}]
+	again = raw(db, "SELECT version, last_compacted_at FROM session_contexts")[0]
+	assert (again[0], again[1]) == (final[0], final[1]), (again, final)
 
 
 def test_失败收尾_错误原因落库(db, store):
@@ -163,6 +167,53 @@ def test_失败收尾_错误原因落库(db, store):
 	store.finish_turn(sid, turn["id"], "failed", "模型超时", [{"role": "user"}])
 	assert raw(db, "SELECT status, error_message FROM turns") == [("failed", "模型超时")]
 	assert store.load_context(sid) == [{"role": "user"}]
+
+
+def test_重启收尾_只动还在跑的轮_不碰上下文(db, store):
+	"""进程被杀之后,启动时那一下:running 的行收成失败,已完成的原样不动。
+
+	这条盯的是三个具体的错法:漏写 finished_at(表上那个 CHECK 会抛)、
+	WHERE 写宽了把已完成的轮一起吃掉,以及"顺手"连 session_contexts 也改一笔
+	—— 那份是开轮之前的历史,下一轮正该从那儿接着跑,改了等于悄悄丢一轮。
+	"""
+	done = store.create_session("项目记忆", "用户记忆")["id"]
+	dead = store.create_session("项目记忆", "用户记忆")["id"]
+	finished = store.begin_turn(done, "跑完的")
+	store.finish_turn(done, finished["id"], "completed", None,
+	                  [{"role": "user", "content": "跑完的历史"}])
+	store.begin_turn(dead, "被打断的")
+	store.save_context(dead, [{"role": "user", "content": "开轮时的历史"}])
+
+	done_before = raw(db, "SELECT status, updated_at, finished_at, error_message"
+	                      " FROM turns WHERE session_id = ?", (done,))
+	ctx_before = raw(db, "SELECT messages_json, version, updated_at"
+	                     " FROM session_contexts WHERE session_id = ?", (dead,))
+
+	assert store.reap_running() == 1
+	assert store.reap_running() == 0          # 幂等:第二遍没有 running 可收了
+
+	# 已完成那条整行没被动过(updated_at 也没动)
+	assert raw(db, "SELECT status, updated_at, finished_at, error_message"
+	               " FROM turns WHERE session_id = ?", (done,)) == done_before
+	dead_row = raw(db, "SELECT status, finished_at, error_message FROM turns"
+	                   " WHERE session_id = ?", (dead,))[0]
+	assert dead_row[0] == "failed", dead_row
+	# 非 running 就必须有 finished_at,这是表上 CHECK 要的
+	assert dead_row[1] is not None, dead_row
+	assert dead_row[2] == "进程重启,这一轮没有跑完", dead_row
+
+	# 上下文一个字都不许动
+	assert raw(db, "SELECT messages_json, version, updated_at"
+	               " FROM session_contexts WHERE session_id = ?",
+	           (dead,)) == ctx_before
+	assert store.load_context(dead) == [{"role": "user", "content": "开轮时的历史"}]
+
+	# 页面看的就是这个:list_turns 里那一轮得报 failed 带原因
+	one = store.list_turns(dead)["turns"]
+	assert len(one) == 1, one
+	assert (one[0]["status"], one[0]["error_message"]) \
+		== ("failed", "进程重启,这一轮没有跑完"), one[0]
+	assert one[0]["finished_at"] is not None, one[0]
 
 
 def test_删会话_级联清干净_不碰邻居(db, store):

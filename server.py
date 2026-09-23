@@ -53,6 +53,8 @@ Turn 终态放同一个事务。数据库事务一律不包住模型请求和工
 """
 
 import json
+import os
+import sys
 import threading
 import uuid
 from itertools import count
@@ -60,21 +62,48 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+import dblock
 from agent import TurnOutcome, agent_loop
 from app import MODEL, build_system, make_compactor
 from config import MAX_ROUNDS, MEMORY_PATH, USER_MEMORY_PATH
 from context import ContextCompactor
 from hooks import trigger_hooks
-from sessions import SessionStore
+from sessions import DB_PATH, SessionStore, TurnStateConflict
 from tools import build_tools
 from tools.memory import load_memory
 from tools.todo import TodoManager
 import usage
 
-PORT = 8765
+# 端口可以用环境变量顶掉(AGENT_PORT),理由同 sessions.DB_PATH:进程级测试
+# 要起真的服务,不能占着你的 8765。默认值没变 —— ui/index.html 里还有一份
+# 写死的 8765(改要一起改),dev.py 也认 8765。
+PORT = int(os.environ.get("AGENT_PORT") or "8765")
 PAGE = Path(__file__).parent / "ui" / "index.html"
 
-STORE = SessionStore()
+# **这个库的排他锁和 STORE 都不是 import 时装上的**,理由见 open_store()。
+#
+# STORE 先摆一个 None:测试里 monkeypatch 换掉它(见 tests/test_ask.py 的
+# soon fixture),真跑起来由 main() 装。
+STORE: "SessionStore | None" = None
+DB_LOCK: "dblock.DbLock | None" = None
+
+
+def open_store():
+	"""拿到这个库的排他锁,然后才建会话库(含迁移)。返回那把锁。
+
+	**顺序是这一步的全部意义**:SessionStore.__init__ 会跑迁移,而迁移是往
+	库里**写**(至少 PRAGMA journal_mode,真要升级时还有 DDL)。第二个实例
+	如果先 import 建了 STORE、再发现自己拿不到锁,库已经被动过了 —— 而"没
+	拿到锁的实例一个字都不许写"正是启动独占要保证的事。
+
+	所以模块级不再是 `STORE = SessionStore()`:import 这个模块(测试、一次性
+	检查脚本、REPL)不该有能力打开、更不该有能力迁移你的会话库。同一个理由
+	把 reap_running 从 __init__ 挪到了 __main__(见它的注释),这是第二半。
+	"""
+	global STORE, DB_LOCK
+	DB_LOCK = dblock.acquire(DB_PATH)
+	STORE = SessionStore()
+	return DB_LOCK
 
 # 每个会话一把锁。**只增不删**:删掉的瞬间,等在它上面的线程手里还攥着
 # 旧那把,而下一个请求拿到的是新的 —— 两把锁护同一份状态,等于没护。
@@ -793,5 +822,32 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+	# 顺序是:排他锁 → 迁移 → 清理 → 收请求。
+	#
+	# 第一件就是拿锁:拿不到直接退出,**在这之前一个字节都不写库**。这是
+	# "第二个实例不能改第一个实例正在跑的任务"的唯一保证 —— 端口不算保证,
+	# 换个端口、或者 Windows 上 SO_REUSEADDR 那种语义,都能两个进程绑同一个库。
+	try:
+		open_store()
+	except dblock.AlreadyRunning as e:
+		print(str(e))
+		print("一个库只能有一个 server —— 两个一起跑会互相改状态:")
+		print("后来的那个一启动就会把所有 running 的轮收成失败,而它分不出"
+		      "那是别人正在跑的。")
+		print("先把那个关掉(dev.py 里叫它别起新的那个情况也一样),再起这个。")
+		sys.exit(1)
+
+	# 收拾上一次没跑完的轮:进程被杀时那一轮就没有最后那次状态写,库里会
+	# 留着一条永远 running 的行,页面上的轮次框也就一直显示"运行中"。放在
+	# 这儿而不是 SessionStore.__init__ 里,理由见 reap_running 的注释。
+	# 现在有排他锁兜着,"留下的"确实只可能是死进程留下的。
+	reaped = STORE.reap_running()
+	if reaped:
+		print(f"上次没跑完的 {reaped} 轮已标记为失败")
 	print(f"http://localhost:{PORT}/")
-	ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+	try:
+		ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+	finally:
+		# 正常退出也交还那把锁(进程死掉时内核也会放,这一步只是"早一点" +
+		# 让 Ctrl+C 之后能立刻再起一个)。
+		DB_LOCK.release()
