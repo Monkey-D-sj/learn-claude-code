@@ -669,19 +669,58 @@
     pointer-events: none; filter: drop-shadow(0 11px 13px #47779a39);
   }
   #pet[hidden] { display: none; }
+  .pet-actions {
+    position: absolute; top: -38px; left: calc(50% + var(--menu-shift, 0px)); transform: translate(-50%, 6px);
+    display: flex; gap: 3px; padding: 4px; white-space: nowrap;
+    background: #ffffffed; border: 1px solid #d5eafa; border-radius: 999px;
+    box-shadow: 0 6px 18px #78a9c02b;
+    opacity: 0; visibility: hidden; pointer-events: none;
+    transition: opacity .18s, transform .18s, visibility .18s;
+  }
+  #pet:hover .pet-actions, #pet:focus-within .pet-actions, #pet.menu-open .pet-actions {
+    opacity: 1; visibility: visible; pointer-events: auto; transform: translate(-50%, 0);
+  }
+  .pet-actions button {
+    border: 0; border-radius: 999px; padding: 4px 9px;
+    background: transparent; color: #4f7fa6; font: 11px var(--prose); cursor: pointer;
+  }
+  .pet-actions button:hover, .pet-actions button:focus-visible { background: #e6f4ff; outline: none; }
   .pet-bubble {
     max-width: 185px; min-width: 115px; margin: 0 0 -1px; padding: 9px 12px;
     border-radius: 14px 14px 14px 3px; background: #fff; border: 1px solid #d5eafa;
     color: #547994; font-size: 12px; line-height: 1.45; text-align: center;
     box-shadow: 0 6px 18px #78a9c02b; pointer-events: auto;
   }
-  .pet-figure { border: 0; background: transparent; padding: 0; cursor: pointer; pointer-events: auto; }
+  .pet-figure { border: 0; background: transparent; padding: 0; cursor: grab; pointer-events: auto; touch-action: none; }
   .pet-figure img { display: block; width: 184px; height: auto; animation: pet-bob 3.8s ease-in-out infinite; }
   .pet-figure:hover img { transform: rotate(-4deg) scale(1.05); animation: none; }
-  .pet-figure:focus-visible, #pet-toggle:focus-visible, #theme-select:focus-visible { outline: 3px solid #84bce8; outline-offset: 3px; }
+  #pet.dragging .pet-figure { cursor: grabbing; }
+  #pet.dragging .pet-figure img { animation: none; opacity: .85; }
+  .pet-figure:focus-visible, #pet-toggle:focus-visible, #theme-select:focus-visible,
+  .pet-actions button:focus-visible { outline: 3px solid #84bce8; outline-offset: 3px; }
   #pet.happy .pet-figure img { animation: pet-hop .6s ease-in-out 2; }
-  @keyframes pet-bob { 0%,100% { transform: translateY(0) } 50% { transform: translateY(-7px) } }
+  #pet.eating .pet-figure img { animation: pet-eat .45s ease-in-out 5; }
+  #pet.dancing .pet-figure img { animation: pet-dance .65s ease-in-out 4; }
+  .pet-spark {
+    position: absolute; left: 50%; top: 40%; z-index: 2;
+    font-size: 19px; pointer-events: none;
+    animation: pet-spark 1.15s ease-out forwards;
+  }
+  @keyframes pet-bob {
+    0%,100% { transform: translate(0, 0) rotate(-1deg) }
+    50% { transform: translate(4px, -8px) rotate(1.5deg) }
+  }
   @keyframes pet-hop { 0%,100% { transform: translateY(0) rotate(0) } 50% { transform: translateY(-20px) rotate(-5deg) } }
+  @keyframes pet-eat { 0%,100% { transform: rotate(0) scale(1) } 50% { transform: rotate(-6deg) scale(1.06) } }
+  @keyframes pet-dance {
+    0%,100% { transform: translateY(0) rotate(0) }
+    25% { transform: translate(-10px, -13px) rotate(-12deg) }
+    75% { transform: translate(10px, -13px) rotate(12deg) }
+  }
+  @keyframes pet-spark {
+    from { opacity: 1; transform: translate(0, 0) scale(.7) }
+    to { opacity: 0; transform: translate(var(--drift), -75px) scale(1.2) }
+  }
   :root[data-theme="dark"] {
     color-scheme: dark;
     --bg: #0c1727;
@@ -760,6 +799,10 @@
     box-shadow: 0 7px 20px #06142266;
   }
   :root[data-theme="dark"] #pet { filter: drop-shadow(0 11px 15px #020d1c9c); }
+  :root[data-theme="dark"] .pet-actions { background: #213a51; border-color: #47718d; box-shadow: 0 7px 20px #06142266; }
+  :root[data-theme="dark"] .pet-actions button { color: #d5ebfb; }
+  :root[data-theme="dark"] .pet-actions button:hover,
+  :root[data-theme="dark"] .pet-actions button:focus-visible { background: #31516b; }
   @media (max-width: 900px) {
     #side { width: 194px; }
     #log .inner { padding-bottom: 200px; }
@@ -775,7 +818,9 @@
     #new::before { content: "+"; font-size: 22px; }
     .sess { justify-content: center; min-height: 37px; font-size: 0; }
     .sess::before { content: "✦"; font-size: 17px; }
-    #head { padding: 0 15px; height: 58px; }
+    #head { padding: 0 12px; height: 58px; gap: 6px; }
+    #head .name { font-size: 13px; white-space: nowrap; }
+    #theme-select, #pet-toggle { padding: 5px 8px; font-size: 11px; }
     #hint { display: none; }
     #log .inner { padding: 18px 10px 165px; }
     .turn { padding: 15px; border-radius: 15px; }
@@ -941,7 +986,9 @@
     background: #e5e5e5; color: #191919;
   }
   @media (prefers-reduced-motion: reduce) {
-    .pet-figure img, #pet.happy .pet-figure img { animation: none; }
+    .pet-figure img, #pet.happy .pet-figure img,
+    #pet.eating .pet-figure img, #pet.dancing .pet-figure img { animation: none; }
+    .pet-spark { display: none; }
   }
 </style>
 </head>
@@ -982,8 +1029,14 @@
 </main>
 
 <div id="pet" role="group" aria-label="鲸鱼娘桌宠">
-  <div class="pet-bubble" id="pet-speech" aria-live="polite">今天也一起认真探索吧～</div>
-  <button class="pet-figure" id="pet-figure" type="button" aria-label="摸摸小鲸">
+  <div class="pet-actions" id="pet-actions" role="group" aria-label="和小鲸互动">
+    <button type="button" data-pet-action="pet">摸摸</button>
+    <button type="button" data-pet-action="feed">喂饭</button>
+    <button type="button" data-pet-action="dance">跳舞</button>
+    <button type="button" data-pet-action="home">归位</button>
+  </div>
+  <div class="pet-bubble" id="pet-speech" aria-live="polite">点我互动，也能拖着走～</div>
+  <button class="pet-figure" id="pet-figure" type="button" aria-label="摸摸小鲸；可以拖动" aria-controls="pet-actions" aria-expanded="false">
     <img src="/assets/whale-girl.png" alt="抱着饭碗的鲸鱼娘小鲸" draggable="false">
   </button>
 </div>
@@ -1035,29 +1088,151 @@ const petSpeech = document.getElementById("pet-speech");
 const petAssetOrigin = location.pathname === "/" ? location.origin : (API || location.origin);
 petFigure.querySelector("img").src = petAssetOrigin + "/assets/whale-girl.png";
 
-const petLines = [
-  "今天也一起认真探索吧～",
-  "摸摸收到！小鲸充满电啦 ✨",
-  "遇到难题就交给我们吧！",
-  "让我想想……先吃一口饭 🍚",
-  "咕噜咕噜，灵感浮上来啦～"
-];
-let petLine = 0;
+const petActions = document.getElementById("pet-actions");
+const petMotions = ["happy", "eating", "dancing"];
+const petReactions = {
+  pet: {motion: "happy", line: "摸摸收到！再来一下～", spark: "💙", duration: 1500},
+  feed: {motion: "eating", line: "好吃！小鲸又有力气啦 🍚", spark: "🍚", duration: 2400},
+  dance: {motion: "dancing", line: "看我转个圈！✨", spark: "✨", duration: 2800}
+};
+let petMotionTimer = null;
+let petDrag = null;
+let suppressPetClick = false;
+
+function openPetMenu(open) {
+  if (open) alignPetMenu();
+  pet.classList.toggle("menu-open", open);
+  petFigure.setAttribute("aria-expanded", String(open));
+}
+
+function alignPetMenu() {
+  if (getComputedStyle(pet).display === "none") return;
+  const rect = pet.getBoundingClientRect();
+  const width = petActions.offsetWidth;
+  const centered = rect.left + rect.width / 2 - width / 2;
+  const safe = Math.max(8, Math.min(centered, innerWidth - width - 8));
+  petActions.style.setProperty("--menu-shift", `${safe - centered}px`);
+}
+
+function petSpark(symbol) {
+  for (let i = 0; i < 4; i++) {
+    const spark = document.createElement("span");
+    spark.className = "pet-spark";
+    spark.textContent = symbol;
+    spark.style.setProperty("--drift", `${(i - 1.5) * 24}px`);
+    spark.style.animationDelay = `${i * 80}ms`;
+    pet.appendChild(spark);
+    setTimeout(() => spark.remove(), 1600);
+  }
+}
+
+function playPetAction(action) {
+  const reaction = petReactions[action];
+  if (!reaction) return;
+  petSpeech.textContent = reaction.line;
+  pet.classList.remove(...petMotions);
+  void pet.offsetWidth;
+  pet.classList.add(reaction.motion);
+  petSpark(reaction.spark);
+  clearTimeout(petMotionTimer);
+  petMotionTimer = setTimeout(() => pet.classList.remove(...petMotions), reaction.duration);
+}
+
+function placePet(x, y) {
+  const maxX = Math.max(8, innerWidth - pet.offsetWidth - 8);
+  const maxY = Math.max(44, innerHeight - pet.offsetHeight - 8);
+  pet.style.right = "auto";
+  pet.style.bottom = "auto";
+  pet.style.left = `${Math.max(8, Math.min(x, maxX))}px`;
+  pet.style.top = `${Math.max(44, Math.min(y, maxY))}px`;
+  alignPetMenu();
+}
+
+function keepPetInView() {
+  if (!pet.style.left || getComputedStyle(pet).display === "none") return;
+  placePet(parseFloat(pet.style.left), parseFloat(pet.style.top));
+}
+
+function resetPetPosition() {
+  pet.style.removeProperty("left");
+  pet.style.removeProperty("top");
+  pet.style.removeProperty("right");
+  pet.style.removeProperty("bottom");
+  localStorage.removeItem("agent.pet.position");
+  alignPetMenu();
+  playPetAction("pet");
+  petSpeech.textContent = "回到右下角啦～";
+}
+
+try {
+  const savedPosition = JSON.parse(localStorage.getItem("agent.pet.position") || "null");
+  if (Number.isFinite(savedPosition?.x) && Number.isFinite(savedPosition?.y)) {
+    pet.style.right = "auto";
+    pet.style.bottom = "auto";
+    pet.style.left = `${savedPosition.x}px`;
+    pet.style.top = `${savedPosition.y}px`;
+    requestAnimationFrame(keepPetInView);
+  }
+} catch (_) { /* 旧位置无效时回到默认右下角 */ }
+petFigure.querySelector("img").addEventListener("load", keepPetInView);
+window.addEventListener("resize", () => { keepPetInView(); alignPetMenu(); });
+themeSelect.addEventListener("change", () => requestAnimationFrame(keepPetInView));
+
 function showPet(visible) {
   pet.hidden = !visible;
   petToggle.textContent = visible ? "收起小鲸" : "召唤小鲸";
   petToggle.setAttribute("aria-expanded", String(visible));
   localStorage.setItem("agent.pet.visible", String(visible));
+  if (!visible) openPetMenu(false);
+  else requestAnimationFrame(() => { keepPetInView(); alignPetMenu(); });
 }
 showPet(localStorage.getItem("agent.pet.visible") !== "false");
 petToggle.addEventListener("click", () => showPet(pet.hidden));
+petActions.addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-pet-action]");
+  if (!button) return;
+  if (button.dataset.petAction === "home") resetPetPosition();
+  else playPetAction(button.dataset.petAction);
+});
 petFigure.addEventListener("click", () => {
-  petLine = (petLine + 1) % petLines.length;
-  petSpeech.textContent = petLines[petLine];
-  pet.classList.remove("happy");
-  void pet.offsetWidth;
-  pet.classList.add("happy");
-  setTimeout(() => pet.classList.remove("happy"), 1300);
+  if (suppressPetClick) return;
+  openPetMenu(true);
+  playPetAction("pet");
+});
+petFigure.addEventListener("pointerdown", (event) => {
+  if (event.button !== 0) return;
+  const rect = pet.getBoundingClientRect();
+  petDrag = {id: event.pointerId, x: event.clientX, y: event.clientY,
+    left: rect.left, top: rect.top, moved: false};
+  petFigure.setPointerCapture(event.pointerId);
+});
+petFigure.addEventListener("pointermove", (event) => {
+  if (!petDrag || event.pointerId !== petDrag.id) return;
+  const dx = event.clientX - petDrag.x;
+  const dy = event.clientY - petDrag.y;
+  if (!petDrag.moved && Math.hypot(dx, dy) < 6) return;
+  petDrag.moved = true;
+  pet.classList.add("dragging");
+  openPetMenu(false);
+  placePet(petDrag.left + dx, petDrag.top + dy);
+  event.preventDefault();
+});
+function finishPetDrag(event) {
+  if (!petDrag || event.pointerId !== petDrag.id) return;
+  if (petDrag.moved) {
+    suppressPetClick = true;
+    localStorage.setItem("agent.pet.position", JSON.stringify({
+      x: parseFloat(pet.style.left), y: parseFloat(pet.style.top)
+    }));
+    setTimeout(() => { suppressPetClick = false; }, 0);
+  }
+  petDrag = null;
+  pet.classList.remove("dragging");
+}
+petFigure.addEventListener("pointerup", finishPetDrag);
+petFigure.addEventListener("pointercancel", finishPetDrag);
+document.addEventListener("pointerdown", (event) => {
+  if (!pet.contains(event.target)) openPetMenu(false);
 });
 
 let turn = null;
