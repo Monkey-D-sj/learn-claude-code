@@ -263,6 +263,31 @@
     white-space: nowrap;
   }
 
+  /* ---- 参数太长的那一行 ----
+     短的一行到底(上面那条);长的包成这个,折叠时长得跟短的一模一样,
+     展开给格式化的完整 JSON。
+
+     **只包参数,不包整个 .call。** 工具输出是后面那条消息按 tool_use_id
+     挂到 .call 上的 —— 包进来它就跟着被折叠了,参数一收起输出凭空消失,
+     而且不报错。
+     summary 就是那一行本体(还是 .tool),三角额外加在它前面,所以长了之后
+     整行右移 13px —— 跟 details.result 同一个做法,看着是一套。 */
+  details.args > summary {
+    list-style: none;
+    cursor: pointer;
+    margin-bottom: 4px;
+  }
+  details.args > summary::-webkit-details-marker { display: none; }
+  details.args > summary::before {
+    content: "▸";
+    display: inline-block;
+    width: 13px;
+    flex: none;
+    color: var(--faint);
+  }
+  details.args[open] > summary::before { content: "▾"; }
+  details.args > summary:hover .args { color: var(--fg); }
+
   /* ---- 工具输出 ---- */
   details.result {
     border-left: 2px solid var(--line);
@@ -286,7 +311,8 @@
   }
   details.result[open] > summary::before { content: "▾"; }
   details.result > summary:hover { color: var(--fg); }
-  details.result pre {
+  details.result pre,
+  details.args > pre {
     margin: 8px 0 10px;
     padding: 10px 12px;
     background: var(--surface);
@@ -1206,6 +1232,43 @@ function headline(text) {
                .slice(0, 2).join(" / ").slice(0, 140);
 }
 
+// 参数一行放不下就做成可展开的。120 是按屏幕量的:12.5px 等宽一行大约放得下
+// 百来个字符,再往上就是被 CSS 截掉了 —— 截掉的是显示,数据一直在,所以给它
+// 一个展开的口子。
+const ARGS_INLINE_MAX = 120;
+
+// 工具调用那一行。**重放和直播两条路都得走这儿。**
+//
+// 短的一行到底;长的包成 details.args:折叠时还是那一行(截断交给 CSS),
+// 展开给格式化过的 JSON —— edit_file 那种带 old_string / new_string 的,
+// 一行读不了,格式化了才叫看完整。
+//
+// 这个函数只画参数那一块,返回的 .call 是给调用方接着挂工具输出用的
+// (见下面 tool_result 那一段)。两条路各画一遍的话,下次改一处漏一处,
+// 而漏的会是直播那条 —— 重放看着是对的。
+function renderToolCall(name, input) {
+  const call = el("div", "call");
+  const json = JSON.stringify(input);
+
+  const row = el("div", "tool");
+  row.appendChild(el("span", "name", name));
+  row.appendChild(el("span", "args", json));
+  if (json.length <= ARGS_INLINE_MAX) {
+    call.appendChild(row);
+    return call;
+  }
+
+  const d = document.createElement("details");
+  d.className = "args";
+  const summary = document.createElement("summary");
+  summary.className = "tool";
+  for (const node of [...row.childNodes]) summary.appendChild(node);
+  d.appendChild(summary);
+  d.appendChild(el("pre", null, JSON.stringify(input, null, 2)));
+  call.appendChild(d);
+  return call;
+}
+
 function renderTurn(t) {
   const box = turnBox(t.id, t.turn_no);
   setState(t.id, t.status, t.error_message);
@@ -1255,11 +1318,7 @@ function renderMessage(box, m, calls) {
         if ((b.thinking || "").trim()) box.appendChild(renderThinking({ text: b.thinking }));
         break;
       case "tool_use": {
-        const call = el("div", "call");
-        const row = el("div", "tool");
-        row.appendChild(el("span", "name", b.name));
-        row.appendChild(el("span", "args", JSON.stringify(b.input)));
-        call.appendChild(row);
+        const call = renderToolCall(b.name, b.input);
         calls.set(b.id, call);
         box.appendChild(call);
         break;
@@ -2099,11 +2158,7 @@ function render(ev) {
     if (!settleLive(ev.turn_id, "thinking", fresh)) add(fresh);
 
   } else if (ev.kind === "tool_call") {
-    call = el("div", "call");
-    const row = el("div", "tool");
-    row.appendChild(el("span", "name", ev.name));
-    row.appendChild(el("span", "args", JSON.stringify(ev.input)));
-    call.appendChild(row);
+    call = renderToolCall(ev.name, ev.input);
     add(call);
 
   } else if (ev.kind === "tool_result") {
