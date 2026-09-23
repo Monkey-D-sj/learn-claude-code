@@ -656,12 +656,32 @@ class Handler(BaseHTTPRequestHandler):
 		self._send_json({"id": row["id"], "title": row["title"]})
 
 	def _post_delete(self, sid: str):
-		# 正在跑的会话不许删:那一轮还攥着锁、还要写回 messages,删了它下次
-		# 写回就是外键错误,而用户看到的是"聊到一半的东西没了"。
-		if is_running(sid):
+		"""删会话。**跟执行抢同一把会话锁** —— 这是 R4 修的那件事。
+
+		以前是先问 is_running()、再删,而问和删之间没有互斥区间:
+		"删除线程看到空闲 → 执行线程取得锁并开轮 → 删除线程把会话删掉",
+		于是那一轮开始写回时命中的是一个不存在的会话(外键错误),而用户
+		看到的是"聊到一半的东西没了"。
+
+		现在两条路都必须先攥住同一个 sid 的那把锁:删除拿不到就返回冲突
+		(确实有一轮在跑),拿到了就等于"从这一刻起不会有新的轮开起来"。
+		检查和操作在同一个互斥区间里,中间没有缝。
+
+		顺序也反过来了:先拿锁,再查存在性。先查的话,查完到拿锁之间会话
+		可能已经被别的删除请求删掉了 —— 而那种"删一个已经不在的东西"报
+		200 挺好(幂等),报 404 也行,但绝不能是"查到了、删的时候没有"。
+		"""
+		lock = session_lock(sid)
+		if not lock.acquire(blocking=False):
 			self.send_error(409, "this session has a turn running")
 			return
-		STORE.delete_session(sid)
+		try:
+			if not STORE.session_exists(sid):
+				self.send_error(404, "no such session")
+				return
+			STORE.delete_session(sid)
+		finally:
+			lock.release()
 		# 进程里那两份(LOCKS/TODOS)不跟着收:它们只增不删,理由见上面。
 		# 剩下几个没人用的 dict,在本机工具里不值得为它引入删除的竞态。
 		self._send_json({"ok": True})
@@ -749,6 +769,18 @@ class Handler(BaseHTTPRequestHandler):
 			self.send_error(409, "this session already has a turn running")
 			return
 		try:
+			# 拿到锁之后再查一次存在性 —— 上面那次(pre-lock)是给明显不合法
+			# 的 id 一个快一点的 404;这一次才是权威的:删除要拿同一把锁,
+			# 所以"锁在我手里"就等于"此刻没人能把它删掉"。少了这一下,
+			# 删除先拿到锁那条路径上,这一轮会走到 begin_turn 才撞外键,
+			# 用户拿到的是一句 500 "cannot start turn" —— 而事实是会话
+			# 已经没了。
+			if not STORE.session_exists(sid):
+				self.send_error(404, "no such session")
+				return
+			# 上一轮的结果没存进库的话,先把那份补上再开新的一轮。补不进去就
+			# 不开 —— 503 而不是 200:这不是"这个会话忙",是"后端现在不能
+			# 接着往下跑"。用户重发一次就再试一遍。
 			if not self._flush_unsaved(sid):
 				self.send_error(503, "previous turn result is not saved yet")
 				return
