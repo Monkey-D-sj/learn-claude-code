@@ -34,8 +34,10 @@ from agent import TurnOutcome
 class _FakeHandler:
 	"""让 _post_ask 按非绑定方法调起来(不建 socket、不走路由)。"""
 
-	# 这两步是按 handler 调的,接到真实现上去
+	# 这几步是按 handler 调的,接到真实现上去
 	_run_turn = server.Handler._run_turn
+	_drive = server.Handler._drive
+	_checkpoint = server.Handler._checkpoint
 	_flush_unsaved = server.Handler._flush_unsaved
 
 	def __init__(self, body=None):

@@ -243,8 +243,13 @@ class TurnOutcome:
 	error: str | None = None
 
 
-def _drop(kind: str, role: str, content) -> None:
-	"""没给 record 时的占位。子 agent 没有会话库可记。"""
+def _drop(kind: str, role: str, content, tool_use_id: str | None = None) -> None:
+	"""没给 record 时的占位。子 agent 没有会话库可记。
+
+	tool_use_id 收下不用:它跟有库那条路上的 close_exec 是同一个参数,
+	签名必须对得上 —— 不然子 agent 那一轮会在调 record 时炸 TypeError,
+	而它炸的地方在工具循环中间。
+	"""
 
 
 # 工具结果往事件里塞多少。bash 的门槛是 400000 字符,原样发出去一条命令
@@ -289,7 +294,9 @@ def round_warn(rounds: int, max_rounds: int) -> str:
 
 def agent_loop(messages: list, active_request: str, system: str, tools: list,
                model: str, max_rounds: int, compactor, emit, ask,
-               record=_drop, checkpoint=None, stream: bool = True) -> TurnOutcome:
+               record=_drop, checkpoint=None, stream: bool = True,
+               begin_exec=None, reserve_round=None, rounds_start: int = 0,
+               rounds_since_todo_start: int = 0) -> TurnOutcome:
 	"""跑一轮完整的 agent 循环,返回这一轮的结果(TurnOutcome)。
 
 	只负责机制。提示词、工具集、模型、轮数上限、压缩器都从外面传进来 ——
@@ -342,9 +349,22 @@ def agent_loop(messages: list, active_request: str, system: str, tools: list,
 	import context
 
 	handlers = {t.name: t.handler for t in tools}
+	# 哪些工具有副作用 —— 只有它们值得在动手前多写一条标记,理由见
+	# tools/base.py 的 side_effect 和 sessions.begin_tool_exec。
+	# getattr 兜一下默认值:测试里的工具替身不一定带这个字段,而"没有声明"
+	# 按有副作用处理(跟 ToolDesc 的默认值同一个方向)。
+	side_effects = {t.name for t in tools if getattr(t, "side_effect", True)}
 	wire = [t.to_wire() for t in tools]
-	rounds_since_todo = 0
-	rounds = 0
+	rounds_since_todo = rounds_since_todo_start
+	# 从哪儿接着数:恢复过来的那一轮不是从 0 开始的,而额度是接着用的。
+	rounds = rounds_start
+	# 压缩器只回报"这一轮真压过了",存不存由下面那一处决定 —— 保存的
+	# 所有权要在一个地方,否则"压过之后存的那次"和"每个回合存的那次"会
+	# 在同一个回合里各写一遍,水位和版本各说各话。
+	compacted_here = [False]
+
+	def _mark_compacted(_messages) -> None:
+		compacted_here[0] = True
 
 	while True:
 		# 在循环顶部查,不在底部。此处 messages 必定停在一个完整回合上
@@ -360,21 +380,49 @@ def agent_loop(messages: list, active_request: str, system: str, tools: list,
 				f"round limit of {max_rounds} reached")
 		rounds += 1
 
+		# 额度先落库,再发请求。**顺序不能反**:反过来的话,崩在"请求发出去了、
+		# 快照还没存"之间时,库里那次调用像没发生过 —— 恢复就等于白送一笔。
+		# 预留了就计上,哪怕请求还没真正发出去(保守,见 sessions.reserve_round)。
+		#
+		# 判据在库里,不在内存:内存那个 rounds 是从快照恢复来的,而快照可能
+		# 比真实进度旧。库里这个数只增不减,谁也改不回去。
+		if reserve_round is not None and not reserve_round():
+			emit({"kind": "note", "source": "round budget exhausted", "text": ""})
+			return TurnOutcome(
+				"failed",
+				f"Stopped: the original round budget was already used up "
+				f"(this call would be #{rounds} of {max_rounds}), task incomplete.",
+				f"round budget of {max_rounds} exhausted")
+
 		# 发送前压缩。必须赶在 call_api 之前:上一轮的工具结果已经追加
 		# 进来但还没发出去,这时压掉才省得下钱;发完之后再压,钱已经花过。
 		# 位置也只能在这儿 —— 此处 messages 停在完整回合上,切在 tool_use
 		# 和它的 tool_result 之间下次请求直接 400。
 		#
-		# 切片赋值,不能用 messages = ...。
+		# 切片赋值,不能用 messages = ...。messages 是调用方传进来的那个
+		# list 对象(server.py 手里的那份),而 prepare 内部会构造新列表返回
+		# —— snip_compact / compact_history 都是。写成 = 的话本地名指向了
+		# 新列表,调用方那份还停在旧的上面:这一回合的 assistant 回复和工具
+		# 结果全写进了新列表,调用方看不见,下轮提问时整段工作凭空消失,
+		# 而且不报错(连续两条 user 是合法的)。切片赋值改的是原对象的内容,
+		# prepare 返回同一个还是新的都对。
+		compacted_here[0] = False
+		messages[:] = compactor.prepare(messages, active_request, _mark_compacted)
+		# **每个完整回合存一次。** 位置就是这儿:上一轮的工具结果已经追加
+		# 进来、编号和待办提醒也都并好了,而下一次请求还没发 —— 正是"两边
+		# 都停下来看,这一份是自洽的"那个点。
 		#
-		# messages 是调用方传进来的那个 list 对象(server.py 手里的那份),
-		# 而 prepare 内部会构造新列表返回 —— snip_compact / compact_history
-		# 都是。写成 = 的话本地名指向了新列表,调用方那份还停在旧的上面:
-		# 这一回合的 assistant 回复和工具结果全写进了新列表,调用方看不见,
-		# 下轮提问时整段工作凭空消失,而且不报错(连续两条 user 是合法的)。
+		# 存的是**活的那个 list**;调用方必须当场序列化,不能留着(循环接着
+		# 还会往它上面追加)。
 		#
-		# 切片赋值改的是原对象的内容,prepare 返回同一个还是新的都对。
-		messages[:] = compactor.prepare(messages, active_request, checkpoint)
+		# 压缩那次也算:它是这个回合里唯一会整体改写列表的档位,不在这儿一起
+		# 存,就要为它单开一个写入点 —— 而"两个地方各存一次"正是这一版要
+		# 收掉的东西。压没压过由 prepare 回报(见 _mark_compacted),存不存
+		# 由这里说了算。
+		if checkpoint is not None:
+			checkpoint(messages,
+			           {"rounds": rounds, "rounds_since_todo": rounds_since_todo},
+			           compacted_here[0])
 
 		# 轮数快用完了,提前说一声。判据是"这一次之后还剩几次"(rounds 已自增
 		# 过):0 就是最后一次,那一次的提醒最要紧 —— 它必须让模型给出答复,
@@ -523,6 +571,19 @@ def agent_loop(messages: list, active_request: str, system: str, tools: list,
 			# 被 hook 拦下来的那次也有结果(拦截理由),所以 tool_result
 			# 在每条路径上都要发,不然页面上会留一个没有下文的调用。
 			emit({"kind": "tool_call", "name": block.name, "input": block.input})
+			# 两阶段标记的前一半:**动手之前**先落一条,而且只给有副作用的
+			# 工具落(只读的重发一次无害,不必多一条写)。
+			#
+			# 它在这个位置是全部意义所在 —— 在 hook 之前、在 handler 之前。
+			# 崩在 handler 中间时,库里那条标记就是"这条一定开始过、结果未知"
+			# 的唯一证据;没有它,"开始过"和"压根没开始"长得一样,恢复时只能
+			# 整批转人工核对。
+			#
+			# 它是严格写(写不进去抛 PersistError),所以**不能**放进下面那个
+			# try:那个 try 是给工具 handler 的,它把任何异常变成一句工具结果
+			# 然后接着跑 —— 而"标记没落库还继续动手"正好是这一条要防的事。
+			if begin_exec is not None and block.name in side_effects:
+				begin_exec(block.id, block.name, block.input)
 			blocked = trigger_hooks("PreToolUse", block, ask)
 			if blocked:
 				output = str(blocked)
@@ -563,7 +624,8 @@ def agent_loop(messages: list, active_request: str, system: str, tools: list,
 			# 号一旦拼上就**不该再被改写**:正文尾巴是它唯一的落脚点,而第
 			# 1~4 档压缩改写正文。第 1 档已经用 _split_marker 摘下来再拼回去,
 			# 2~4 档现在是注释掉的 —— 重开之前每一处都得补同样的处理。
-			row_id = record("tool_result", "user", [result])
+			row_id = record("tool_result", "user", [result],
+			                tool_use_id=block.id)
 			if row_id is not None:
 				result["content"] = context.stamp_tag(output, f"m{row_id:05d}")
 			results.append(result)

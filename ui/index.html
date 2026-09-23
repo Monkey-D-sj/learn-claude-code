@@ -198,6 +198,38 @@
   .turn[data-status="running"] .thead .state { color: var(--tool); }
   .turn[data-status="failed"]  .thead .state { color: var(--err); }
   .turn[data-status="unsaved"] .thead .state { color: var(--err); }
+  /* 中断既不是"跑错了"也不是"跑完了":它是"停在了一个还能接着用的地方"。
+     用琥珀色跟 running 区分开 —— 两个都表示"还没结束",但一个是活的,一个
+     是死的,而区别就在这里。 */
+  .turn[data-status="interrupted"] .thead .state { color: var(--tool); }
+
+  /* ---- 中断与续跑 ----
+     它不是错误框:里面有一个真能按的按钮,按下去这一轮会接着跑。 */
+  .interrupt {
+    border: 1px solid #3a2f1a;
+    background: #17130c;
+    border-radius: 8px;
+    padding: 10px 12px;
+    margin: 8px 0;
+    font: 12.5px/1.65 var(--mono);
+    color: var(--fg);
+  }
+  .interrupt .why { color: var(--tool); margin-bottom: 6px; }
+  .interrupt .tail { color: var(--dim); margin: 6px 0 0; }
+  .interrupt .tail code {
+    background: var(--raised); border-radius: 4px; padding: 0 4px;
+    color: var(--fg);
+  }
+  .interrupt .row { display: flex; gap: 8px; margin-top: 10px; }
+  .interrupt button {
+    padding: 3px 12px; background: var(--raised); color: var(--fg);
+    border: 1px solid var(--line); border-radius: 6px;
+    font: 12px var(--mono); cursor: pointer;
+  }
+  .interrupt button:hover:not(:disabled) {
+    background: #1d2430; border-color: #2f3a4d;
+  }
+  .interrupt button:disabled { color: var(--faint); cursor: default; }
 
   /* 一轮的花费小结。排在正文**下面**,不跟着抬头 —— 它是读完这一轮之后
      才想知道的数,不是开始读之前。抬头留轮号和状态,这儿留钱,不打架。
@@ -1305,7 +1337,7 @@ function add(node, target) {
 // 见 loadTurns。
 
 const STATE_TEXT = { running: "运行中", completed: "完成", failed: "失败",
-                     unsaved: "未入库" };
+                     unsaved: "未入库", interrupted: "中断" };
 
 function turnBox(id, no) {
   let box = TURNS.get(id);
@@ -1393,6 +1425,9 @@ async function loadLegacy(sid) {
 //
 // 返回"建起来了没有":pollTick 要靠它判断"要不要整个重建"。这里失败是静默
 // return 的(后端不在而已),所以只能由返回值说出去,不能靠调用方猜。
+// 最近一次读回来的那一份轮次(判断"哪一轮是最后一轮"要用它)
+let LAST_TURNS = null;
+
 async function loadTurns(sid) {
   let data;
   try {
@@ -1481,6 +1516,13 @@ function renderTurn(t) {
 
   if (t.status === "failed" && t.error_message) {
     box.appendChild(el("div", "error", t.error_message));
+  }
+  // 中断:这是唯一一种"用户还得做个决定"的终态,所以画的是两个按钮。
+  // 只画给**最后一轮** —— 更早的那些中断轮次(用户当时选了放弃之外的路)
+  // 早就有下文了,画出来只会让人以为还能点。
+  if (t.status === "interrupted") {
+    const last = LAST_TURNS && LAST_TURNS[LAST_TURNS.length - 1];
+    if (!last || last.id === t.id) interruptBox(t.id, t.error_message);
   }
   // 保存失败的那一轮,库里还停在 running(终态那次写没成功)——光看库里的
   // 状态,刷新之后页面只会显示"运行中",而真相是它已经跑完、只是没存上。
@@ -2331,6 +2373,161 @@ function saveFailureBox(ev) {
   return box;
 }
 
+// 读一条 NDJSON 流(新提问和"继续一轮"用的是同一种响应),一条条喂给 render。
+//
+// 逐步读,不 await res.text() —— 那样要等整轮跑完才拿到内容,就没有
+// "看着它干活"这回事了。
+//
+// 用户那句话不在这儿画:服务端会发一条 you 事件过来(见 render)。自己先画
+// 一遍的话,重放时那句话说不出是从哪来的 —— 它从来没进过事件流。
+async function pumpStream(sid, res) {
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  ownsStream = true;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      // 最后一段可能只到一半,留在 buf 里等下一块 —— 直接切会把一行
+      // JSON 拦腰截断,JSON.parse 就炸了。
+      const lines = buf.split("\n");
+      buf = lines.pop();
+      for (const line of lines) {
+        if (line.trim()) feed(sid, JSON.parse(line));
+      }
+    }
+    if (buf.trim()) feed(sid, JSON.parse(buf));
+  } catch (err) {
+    // 不是错误,是"这一轮被从外面打断了" —— 最典型的就是后端重启(dev.py 改完
+    // 代码重启、或者你手动停了服务)。所以是灰色旁注而不是红字。带上 err:这个
+    // catch 也接着 JSON.parse 的 SyntaxError,把文本丢了就查不出是哪种。
+    if (sid === current) {
+      add(el("div", "note",
+        "[连接] 这一轮读到一半连接断了(" + err + ")。正在等后端回来,回来了会自己接上"),
+        stream);
+    }
+  }
+  ownsStream = false;
+}
+
+// ---------------------------------------------------------------- 中断与续跑
+//
+// 中断这一格画的是**两个按钮**,不是一句话。理由是这一格出现的时候用户
+// 什么都还没决定:库里停在最后一个完整回合上,接着跑和放弃都还在选项里,
+// 而这个决定只有他知道。
+//
+// 三个细节都不能省:
+//
+//   一、**按钮的可用性问服务端,不在页面这边猜。** 能不能继续取决于版本、
+//       尾部记录、兼容性签名、剩余额度 —— 那些都在库里。页面自己判一个
+//       "看起来可以"出来,结果是按下去被拒绝(或者更糟:按下去了但其实
+//       不该继续)。
+//   二、**已经开始、结果未知的操作要列出来。** 那是用户唯一没法自己知道的
+//       东西,而它决定了"我现在敢不敢接着跑"。列的是名字和参数,不是一句
+//       "可能有操作" —— 后者等于没说。
+//   三、**放弃 ≠ 撤销。** 这句话必须写在按钮旁边。不写的话,用户会以为
+//       放弃能把世界恢复成出事之前的样子,而它只是把这一页翻过去。
+
+function interruptBox(turnId, text) {
+  const box = TURNS.get(turnId);
+  if (!box) return;
+  const wrap = el("div", "interrupt");
+  wrap.appendChild(el("div", "why", text || "这一轮被中断了。"));
+  const row = el("div", "row");
+  const again = el("button", null, "继续");
+  const drop = el("button", null, "放弃这次");
+  row.append(again, drop);
+  wrap.appendChild(row);
+  box.appendChild(wrap);
+  follow();
+
+  const sid = current;
+  fetch(API + "/session/" + sid + "/turn/" + turnId + "/review")
+    .then(r => r.ok ? r.json() : null)
+    .then(data => {
+      const info = data && data.info;
+      if (!info) {
+        again.disabled = drop.disabled = true;
+        wrap.appendChild(el("div", "note", "问不着后端,先刷新一下页面"));
+        return;
+      }
+      const unknown = info.unknown_tools || [];
+      if (unknown.length) {
+        const tail = el("div", "tail");
+        tail.appendChild(el("div", null,
+          "这些操作**已经开始、结果未知**,而且没有被回滚(接着跑之前先确认它们的效果):"));
+        for (const u of unknown.slice(0, 8)) {
+          const line = el("div", null, "· " + u.name + " ");
+          line.appendChild(el("code", null, JSON.stringify(u.input)));
+          tail.appendChild(line);
+        }
+        if (unknown.length > 8) {
+          tail.appendChild(el("div", null, "· 还有 " + (unknown.length - 8) + " 条,见服务端日志"));
+        }
+        wrap.appendChild(tail);
+      }
+      if (info.tail && info.tail.length) {
+        wrap.appendChild(el("div", "tail",
+          "水位之后还有 " + info.tail.length + " 条没纳入快照的记录,所以不能直接续跑"));
+      }
+      if (!info.resumable) {
+        again.disabled = true;
+        wrap.appendChild(el("div", "note",
+          "不能继续:" + (info.detail || info.reason) + " —— 只能放弃这次"));
+      }
+      again.onclick = () => actOnTurn(sid, turnId, "resume", info.version, again, drop, wrap);
+      drop.onclick = () => actOnTurn(sid, turnId, "abandon", info.version, again, drop, wrap);
+    })
+    .catch(err => {
+      again.disabled = drop.disabled = true;
+      wrap.appendChild(el("div", "note", "问不着后端:" + err));
+    });
+}
+
+async function actOnTurn(sid, turnId, action, version, again, drop, wrap) {
+  again.disabled = drop.disabled = true;
+  let res;
+  try {
+    res = await fetch(API + "/session/" + sid + "/turn/" + turnId + "/" + action, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ version }),
+    });
+  } catch (err) {
+    wrap.appendChild(el("div", "note", backendHint(err)));
+    again.disabled = drop.disabled = false;
+    return;
+  }
+
+  if (action === "abandon") {
+    const data = await res.json().catch(() => ({}));
+    wrap.appendChild(el("div", "note", data.ok
+      ? "已放弃。已经做过的操作**没有被回滚**,那段说明已经写进上下文,接着聊的时候模型看得见。"
+      : "放弃不了:" + (data.detail || data.reason || res.status)));
+    if (data.ok) { wrap.querySelector(".row").remove(); await loadTurns(sid); }
+    return;
+  }
+
+  if (!res.ok) {
+    // 并发:另一个标签页抢先继续/放弃了。刷新就能看到最新的状态,所以
+    // 不在这儿猜,直接把服务端那句带出来。
+    const data = await res.json().catch(() => ({}));
+    wrap.appendChild(el("div", "note",
+      "继续不了:" + (data.detail || data.reason || res.status)));
+    await loadTurns(sid);
+    return;
+  }
+
+  // 继续这一轮走的是跟新提问**同一条**流:一串 ndjson 事件,读完为止。
+  // 所以画法完全一样,包括最后那条 reply。
+  if (sid === current) setState(turnId, "running");
+  wrap.querySelector(".row")?.remove();
+  await pumpStream(sid, res);
+  await pollTick();
+}
+
 function render(ev) {
   // 先归位,再画。带 turn_id 的按 id 找容器 —— 轮询可能从半截接上,那时
   // 屏幕上连这一轮的盒子都还没有,得现建;没有 turn_id 的是旧版记录,
@@ -2390,6 +2587,9 @@ function render(ev) {
     // 人话和复制按钮。判断用 ev.saved,不用 ev.status —— 后者是给页面看的
     // 显示值,前者才是"存没存上"这件事本身。
     if (ev.saved === false) add(saveFailureBox(ev));
+    // 中断:这一轮没有正常收尾,而库里留着能接着跑的状态。画那两个按钮 ——
+    // 光显示"中断"两个字的话,用户能做的只有刷新页面看着它发呆。
+    if (ev.interrupted && ev.turn_id) interruptBox(ev.turn_id, ev.text);
 
   } else {
     // 认不出来的也显示,别默默吞掉 —— 将来加了新 kind,页面上至少
@@ -2465,51 +2665,20 @@ form.addEventListener("submit", async (e) => {
   }
 
   if (!res.ok) {
-    // 409 的含义跟以前不同了:以前是"有一轮在跑",现在是"**这个会话**有
-    // 一轮在跑" —— 别的会话照跑不误。
+    // 409 有两种,含义都不是"后端坏了":这个会话有一轮在跑,或者它有一个
+    // **还没处理的中断任务** —— 后者要先把按钮画出来,否则用户看到一句
+    // "先处理它"却找不到那个能点的地方(那一轮在页面上是中断状态,刷新
+    // 之后由 /turns 那一路画)。所以这里补一次 loadTurns。
     box.value = query;
-    add(el("div", "error", "后端返回 " + res.status +
-        (res.status === 409 ? "(这个会话上一轮还在跑)"
-         : res.status === 404 ? "(这个会话不在了,新建一个再发)" : "")));
+    const why = res.status === 409 ? "(这个会话上一轮还在跑,或者有中断的任务没处理)"
+      : res.status === 404 ? "(这个会话不在了,新建一个再发)" : "";
+    add(el("div", "error", "后端返回 " + res.status + why));
+    if (res.status === 409) await loadTurns(sid);
     setComposer(true);
     return;
   }
 
-  // 逐块读,不 await res.text() —— 那样要等整轮跑完才拿到内容,
-  // 就没有"看着它干活"这回事了。
-  //
-  // 用户那句话不在这儿画:服务端会发一条 you 事件过来(见 render)。自己
-  // 先画一遍的话,重放时那句话说不出是从哪来的 —— 它从来没进过事件流。
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buf = "";
-  ownsStream = true;
-
-  try {
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      // 最后一段可能只到一半,留在 buf 里等下一块 —— 直接切会把一行
-      // JSON 拦腰截断,JSON.parse 就炸了。
-      const lines = buf.split("\n");
-      buf = lines.pop();
-      for (const line of lines) {
-        if (line.trim()) feed(sid, JSON.parse(line));
-      }
-    }
-    if (buf.trim()) feed(sid, JSON.parse(buf));
-  } catch (err) {
-    // 不是错误,是"这一轮被从外面打断了" —— 最典型的就是后端重启(dev.py 改完
-    // 代码重启、或者你手动停了服务)。所以是灰色旁注而不是红字。带上 err:这个
-    // catch 也接着 JSON.parse 的 SyntaxError,把文本丢了就查不出是哪种。
-    if (sid === current) {
-      add(el("div", "note",
-        "[连接] 这一轮读到一半连接断了(" + err + ")。正在等后端回来,回来了会自己接上"),
-        stream);
-    }
-  }
-  ownsStream = false;
+  await pumpStream(sid, res);
 
   // 收尾:这一轮的事件可能没画全(中途切走过),补一下,顺带把 running 带回来。
   // 服务端是先放锁再关连接,所以读到 EOF 时问它,一般已经是 false —— 不会白转

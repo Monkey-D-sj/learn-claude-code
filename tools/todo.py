@@ -123,4 +123,6 @@ def make_todo_write(todo: TodoManager) -> ToolDesc:
 			"required": ["todos"],
 		},
 		handler=run_todo_write,
+		# 只改这个会话内存里那份清单,不动工作区。
+		side_effect=False,
 	)

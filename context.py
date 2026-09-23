@@ -346,16 +346,28 @@ def compress_range(messages: list, start: str, end: str, summary: str) -> str:
 	swept = [t for message in span for t in message_tags(message)
 	         if not low <= int(t[1:]) <= high]
 
+	# 这条消息带 "(reference only)" 标记。摘要里常混着工具输出的原文(命令输出、
+	# 文件内容),那是不可信内容 —— 不标清楚,模型会跟着摘要里那些字走。标记的
+	# 名字三处必须一致:这儿、第 4 档的 summary_message()、app.py 的 SYSTEM。
+	#
+	# [start-end] 前缀也不能省:它是 recall 的唯一入口。号还在库里,但上下文里
+	# 没有这两个数字,那段原文就再没有线索指向它 —— 号在,路断了。
 	messages[owner:last + 1] = [{
 		"role": "user",
-		"content": f"[{start}-{end}] 摘要:{summary}",
+		"content": f"[{start}-{end}] Summary (reference only):{summary}",
 	}]
 	report = (f"已压缩 {start}-{end}:{last - owner + 1} 条消息换成一条摘要。"
 	          f"原文还在库里,按号能查回来。")
 	if swept:
 		report += (f"(同一轮里还有 {len(swept)} 条结果跟着一起圈进来了 —— "
 		           f"它们和号段里的结果出自同一次回复,分不开。)")
-	return report
+	# 摘要正文再回一份。模型那边并不缺它(上一条号段消息里已经写进去了),这一份
+	# 是给**人**看的:前端把工具结果收成一个折叠块,折叠时只露头两行非空行 ——
+	# 不回正文的话,点开也只有"已压缩"一句,这次调用唯一的产物(参数里那个
+	# summary)在页面上根本不存在。隔一个空行,是为了让摘要的头一行跟着露在
+	# 折叠那两行里。代价是这段摘要在上下文里出现两次,一次几行,比它顶掉的那
+	# 一大段小得多。
+	return f"{report}\n\n摘要:{summary}"
 
 
 class ContextCompactor:
@@ -1003,9 +1015,10 @@ class ContextCompactor:
 	def summary_message(label: str, request: str, summary: str, transcript: Path) -> dict:
 		"""把摘要打包成一条 user 消息 —— 压缩后整个对话就只剩这一条。
 
-		标签名(Current user request / Conversation summary)跟 app.py 的
-		SYSTEM 里写的必须一致,改一处就得改两处。SYSTEM 就是靠这两个标签
-		告诉模型"哪个是要执行的任务、哪个只是资料"的。
+		标签(Current user request / Conversation summary)告诉模型"哪个是要执行
+		的任务",而"(reference only)"这个标记告诉它"哪个只是资料" —— 后者跟
+		app.py 的 SYSTEM 里那句按标记说话的,还有 compress_range() 那条号段消息
+		上的标记,三处必须一致,改一处就得改三处。SYSTEM 只认标记,不认标签名。
 
 		request 用原文而不是摘要:摘要是有损的,而当前这条指令是唯一不能
 		丢的东西 —— 它必须一字不差地活过压缩。

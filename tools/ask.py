@@ -120,4 +120,7 @@ def make_ask_tool(ask_user) -> ToolDesc:
 		input_schema=_SCHEMA,
 		# partial 之后签名正好剩 (question, options) 两个,跟 _SCHEMA 对齐。
 		handler=partial(run_ask, ask_user),
+		# 问一句不动机器。但「卡在一条没答完的提问上」被进程打断是另一回事,
+		# 那种尾部由恢复判定单独处理,别混进这个标志。
+		side_effect=False,
 	)

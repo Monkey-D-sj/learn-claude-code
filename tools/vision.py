@@ -170,4 +170,7 @@ vision = ToolDesc(
 		"required": ["path", "question"],
 	},
 	handler=run_vision,
+	# 只读:重发一次无害,所以不用两阶段标记(见 tools/base.py 的 side_effect)。
+	side_effect=False,
 )
+

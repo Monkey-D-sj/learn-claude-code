@@ -8,6 +8,7 @@ from tools.grep import grep
 from tools.memory import memory_tool, user_memory_tool
 from tools.read import read_file
 from tools.skill import skill
+from tools.skill_manage import skill_manage_tool
 from tools.subagent import task
 from tools.todo import TodoManager, make_todo_write
 from tools.vision import vision
@@ -26,7 +27,7 @@ from tools.write import write_file
 #   compress 绑当前那份 messages,由 agent_loop 每轮 bind
 #   recall   绑这个会话的取回器(库 + 会话 id + 压缩器),由 server.py 每轮 bind
 BASE_TOOLS = [
-	bash, read_file, write_file, edit_file, glob, grep, skill, vision,
+	bash, read_file, write_file, edit_file, glob, grep, skill, skill_manage_tool, vision,
 	memory_tool, user_memory_tool, task, compress, recall,
 ]
 

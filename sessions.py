@@ -77,7 +77,7 @@ from pathlib import Path
 DB_PATH = Path(os.environ.get("AGENT_DB_PATH")
                or (Path(__file__).resolve().parent / "sessions.db"))
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # 每条一个语句,不写成一个大字符串走 executescript。
 # 理由:executescript 在遇到已挂起的事务时会先隐式 COMMIT —— 那会把
@@ -194,9 +194,106 @@ _MIGRATION_3 = (
 	"ALTER TABLE sessions ADD COLUMN user_snapshot TEXT NOT NULL DEFAULT ''",
 )
 
+# v4 是 checkpoint 那一版:恢复要的三样东西 —— 两阶段标记、快照元数据、
+# 一个能表达"进程被打断"的 turn 状态。
+_MIGRATION_4 = (
+	# ---- 工具执行的两阶段标记 ----
+	#
+	# 一条工具记录的**开始**和**结果**分成两次写,中间夹着 handler 的执行。
+	# 这么分是因为副作用没法回滚:崩在 handler 中间时,唯一能救命的证据是
+	# "它开始了"这一条。只有结果那一条的话,"开始过、结果未知"和"压根没开始"
+	# 在库里长得一模一样,恢复时只能保守地把整批工具转成人工核对。
+	#
+	# 只给有副作用的工具写(见 tools/base.py 的 side_effect):只读的重发一次
+	# 无害,不必多一条写,也不必进核对范围。
+	#
+	# tool_use_id 当主键是白拿的幂等:sessions 那套"允许有限次数重试同一份
+	# 写入"要求重试不产生第二行,而协议里的 tool_use_id 本来就只有一份。
+	#
+	# message_id 指向 tool_messages 里那条结果(行号),finished_at 为空 =
+	# 开始过但结果没落库 —— 恢复判定读的就是这个组合。
+	"""
+	CREATE TABLE tool_execs (
+		tool_use_id TEXT PRIMARY KEY,
+		turn_id     TEXT NOT NULL REFERENCES turns(id) ON DELETE CASCADE,
+		name        TEXT NOT NULL,
+		input_json  TEXT NOT NULL,
+		started_at  REAL NOT NULL,
+		finished_at REAL,
+		message_id  INTEGER
+	)
+	""",
+	"CREATE INDEX tool_execs_turn ON tool_execs(turn_id)",
+
+	# ---- 快照的恢复元数据 ----
+	#
+	# 放在 session_contexts 上,因为这三样都是"这份快照的属性",不是会话的:
+	# 哪个 turn 存的、存到这一轮的第几条消息、当时的运行状态。
+	#
+	# covered_message_no 是**水位**:这份正文已经涵盖到哪个 message_no。
+	# 恢复时判"有没有尾部"就是拿它跟 turn_messages 比。它跟全库行号无关,
+	# 是这一轮里的序号。
+	#
+	# checkpoint_turn_id 可以为空(旧数据、或者建会话那一行),空 = 这份快照
+	# 不属于任何一轮,不能当恢复基础。
+	"ALTER TABLE session_contexts ADD COLUMN checkpoint_turn_id TEXT",
+	"ALTER TABLE session_contexts ADD COLUMN covered_message_no INTEGER"
+	" NOT NULL DEFAULT 0",
+	"ALTER TABLE session_contexts ADD COLUMN runtime_json TEXT NOT NULL DEFAULT ''",
+
+	# ---- turns 重建:多一个状态,多两列 ----
+	#
+	# 加 interrupted 是**必须**的,不是好看:重启后收尾和"关键记录存不上"
+	# 这两种中断,跟模型自己报错、工具报错收成 failed 是两码事 —— 前者可以
+	# 续跑,后者不该续。混在一个值里,页面和恢复接口就只能猜。
+	#
+	# SQLite 改不了 CHECK,只能重建。重建的坑全在 DROP 那一步:开
+	# foreign_keys 时 DROP TABLE 会先隐式 DELETE,而 turn_messages 是
+	# ON DELETE CASCADE —— 那一下会把**所有原始消息删光**,而且不报错。
+	# 所以这条迁移在**关掉外键的另一个连接**里跑,见 _migrate 里的
+	# NEEDS_FK_OFF 分支;跑完在同一个事务里 foreign_key_check,不干净就回滚。
+	#
+	# 表的形状照抄 v1(列序、UNIQUE、CHECK 一个不少),只多 interrupt_reason
+	# 和 model_rounds_started。少了 UNIQUE 就等于把发号的兜底拆了。
+	"""
+	CREATE TABLE turns_rebuild (
+		id            TEXT PRIMARY KEY,
+		session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+		turn_no       INTEGER NOT NULL CHECK (turn_no > 0),
+		status        TEXT NOT NULL CHECK (status IN (
+			'running', 'completed', 'failed', 'interrupted')),
+		created_at    REAL NOT NULL,
+		updated_at    REAL NOT NULL,
+		finished_at   REAL,
+		error_message TEXT,
+		interrupt_reason TEXT,
+		model_rounds_started INTEGER NOT NULL DEFAULT 0,
+		UNIQUE (session_id, turn_no),
+		CHECK ((status =  'running' AND finished_at IS NULL)
+		    OR (status <> 'running' AND finished_at IS NOT NULL))
+	)
+	""",
+	# 旧行的两列取默认:中断原因只有中断过的那一轮才有,已完成的轮次
+	# 编一个原因出来就是伪造事实。
+	"INSERT INTO turns_rebuild (id, session_id, turn_no, status, created_at,"
+	" updated_at, finished_at, error_message, interrupt_reason,"
+	" model_rounds_started)"
+	" SELECT id, session_id, turn_no, status, created_at, updated_at,"
+	" finished_at, error_message, NULL, 0 FROM turns",
+	"DROP TABLE turns",
+	"ALTER TABLE turns_rebuild RENAME TO turns",
+)
+
 # 下标 = 目标版本 - 1。加一次改动就往后接一个,并把 SCHEMA_VERSION 加一。
 # 每一项是一串 SQL 字符串,逐条执行。
-MIGRATIONS = (_MIGRATION_1, _MIGRATION_2, _MIGRATION_3)
+MIGRATIONS = (_MIGRATION_1, _MIGRATION_2, _MIGRATION_3, _MIGRATION_4)
+
+# 必须在**关掉外键的连接**里跑的那几条迁移。目前只有 v4,理由见它上面
+# 那段(turns 重建:开着外键 DROP TABLE 会顺着 CASCADE 删光原始消息)。
+#
+# 写成一张表而不是散在 _migrate 里判版本号:哪条迁移需要特殊的开法,是
+# 那条迁移自己的性质,新增一条时加在这儿,而不是回去改 _migrate 的分支。
+NEEDS_FK_OFF = (4,)
 
 
 def _block_json(obj):
@@ -229,9 +326,64 @@ class TurnStateConflict(RuntimeError):
 	"""
 
 
+def _tool_use_id_of(content_json: str) -> str | None:
+	"""从一条 tool_result 的正文里取出 tool_use_id。取不到给 None。
+
+	给 checkpoints 的"尾部里有什么"用:页面要能说清尾巴上那条结果是对
+	哪一次调用的。只认协议形状(数组 + 第一块 tool_use_id),别的形状一律
+	当取不到 —— 这里不是解析器,猜错比说不知道更糟。
+	"""
+	try:
+		blocks = json.loads(content_json)
+	except ValueError:
+		return None
+	if isinstance(blocks, list) and blocks and isinstance(blocks[0], dict):
+		value = blocks[0].get("tool_use_id")
+		return value if isinstance(value, str) else None
+	return None
+
+class PersistError(RuntimeError):
+	"""一条**恢复关键**的记录没写进库。
+
+	它跟"页面少画一条"是两回事,所以不能混在返回 None 那条路里(那条是
+	热路径:写不进去拉倒,页面上少一条而已)。这里失败的含义是:模型接下来
+	要看到的东西缺了一块 —— 再往下跑,模型会基于一份缺了东西的历史做决定,
+	或者工具已经动了机器而库里没有痕迹。
+
+	**必须一路传出去,不许被 except Exception 吃掉。** agent_loop 里那个
+	包的 try 是给工具 handler 用的(把工具的异常变成一条工具结果),它不能
+	把这条也变成一句工具输出然后接着跑 —— 那正是"改错了静默毁历史"的
+	最坏版本。所以调用点要放在那个 try 外面。
+	"""
+
+
+class CheckpointConflict(RuntimeError):
+	"""这份快照不能作为恢复基础。
+
+	三种来源:版本对不上(页面看到的是旧的)、快照不属于这个 turn、水位
+	之后还有没纳进来的尾部记录。三个都要拒绝,而且要说得出是哪一个 ——
+	"恢复失败"这四个字对用户没有用。
+	"""
+
+
+# 中断原因是**机器读**的,所以是短码不是句子;给人看的那句在
+# turns.error_message 里。分开存是因为页面要根据它决定画什么按钮,而
+# 拿中文句子去 fitz 匹配字符串,迟早会以"改了一次文案,按钮就没了"收场。
+#
+# 三类分开有实际后果:进程重启(可以续跑)和关键记录存不上(要核对)在
+# 恢复判定里走的是两条不同的路,而"模型自己报错"根本不进这个字段 ——
+# 那是 failed,不是 interrupted。
+INTERRUPT_PROCESS_RESTART = "process_restart"
+INTERRUPT_PERSIST_FAILED = "persist_failed"
+INTERRUPT_CHECKPOINT_FAILED = "checkpoint_failed"
+
+
 class SessionStore:
 	def __init__(self, path: Path = DB_PATH):
 		self._lock = threading.Lock()
+		# 路径留着:v4 那条迁移要用**另一个连接**跑(见 NEEDS_FK_OFF),
+		# 而那个连接得自己知道库在哪儿。
+		self._path = path
 		# isolation_level=None 是必须的,不是顺手写的。
 		#
 		# 默认(deferred)模式下,sqlite3 会在第一条 DML 时**隐式开一个事务**
@@ -297,11 +449,48 @@ class SessionStore:
 				f"换新版代码再打开它")
 
 		for target in range(version + 1, SCHEMA_VERSION + 1):
+			if target in NEEDS_FK_OFF:
+				self._migrate_no_fk(target)
+				continue
 			with self._tx() as conn:
 				for step in MIGRATIONS[target - 1]:
 					conn.execute(step)
 				# PRAGMA 不能带参数占位符;target 是我们自己 range 出来的整数。
 				conn.execute(f"PRAGMA user_version = {target}")
+
+	def _migrate_no_fk(self, target: int) -> None:
+		"""跑一条必须关掉外键的迁移:另开一个连接,foreign_keys 保持默认的 OFF。
+
+		**为什么不能就地 PRAGMA foreign_keys = OFF:** 它是 no-op —— 整个
+		迁移外面套着 BEGIN IMMEDIATE,而 SQLite 明确说事务里改这个开关不生效。
+		真跑起来的话,v4 里那句 DROP TABLE turns 会先隐式删一遍行,顺着
+		turn_messages 的 ON DELETE CASCADE 把**所有原始消息**删光,而且
+		一句错都不报。这是这一条分支存在的全部理由。
+
+		外键关掉之后没人替我们盯着完整性了,所以**在 COMMIT 之前**显式
+		foreign_key_check:有问题就抛,让事务回滚 —— 提交之后再发现就只能
+		人工修库了。PRAGMA user_version 也在同一个事务里写。
+
+		主连接此刻没有开着的事务(每条迁移各自一个),所以这个连接拿得到
+		写锁。timeout 跟主连接一样,撞上别人的写锁时行为也一致。
+		"""
+		conn = sqlite3.connect(self._path, timeout=5.0, isolation_level=None)
+		try:
+			conn.execute("BEGIN IMMEDIATE")
+			try:
+				for step in MIGRATIONS[target - 1]:
+					conn.execute(step)
+				bad = conn.execute("PRAGMA foreign_key_check").fetchall()
+				if bad:
+					raise RuntimeError(
+						f"迁移 v{target} 之后外键对不上(前几条:{bad[:3]})—— 已回滚")
+				conn.execute(f"PRAGMA user_version = {target}")
+				conn.execute("COMMIT")
+			except BaseException:
+				conn.execute("ROLLBACK")
+				raise
+		finally:
+			conn.close()
 
 	# ---- 读路径 / 轮末写路径:会抛,调用方接得住 ----
 
@@ -396,7 +585,8 @@ class SessionStore:
 		with self._tx(immediate=False) as conn:
 			turns = conn.execute(
 				"SELECT id, turn_no, status, created_at, updated_at,"
-				" finished_at, error_message FROM turns"
+				" finished_at, error_message, interrupt_reason,"
+				" model_rounds_started FROM turns"
 				" WHERE session_id = ? ORDER BY turn_no", (sid,)).fetchall()
 			messages = conn.execute(
 				"SELECT m.turn_id, m.message_no, m.kind, m.role,"
@@ -419,7 +609,9 @@ class SessionStore:
 			"turns": [{
 				"id": row[0], "turn_no": row[1], "status": row[2],
 				"created_at": row[3], "updated_at": row[4], "finished_at": row[5],
-				"error_message": row[6], "messages": by_turn.get(row[0], []),
+				"error_message": row[6], "interrupt_reason": row[7],
+				"model_rounds_started": row[8],
+				"messages": by_turn.get(row[0], []),
 			} for row in turns],
 			"cursor": cursor,
 		}
@@ -491,13 +683,361 @@ class SessionStore:
 		"""中途存一个上下文检查点。压缩之后存,是给"这一轮跑到一半进程没了"
 		留的:那时下次读到的至少是压过的那份,不是压之前那份发不出去的。
 
-		它**不是**本轮的唯一一次保存 —— 轮末还有一次(finish_turn),那次
-		才是权威的。所以调用方在这上面栽了不必掀翻整轮,见 server.py。
+		**不带归属和水位** —— 那两样是 save_checkpoint 的事,这条老路
+		(压缩器回调、测试)就照旧只写正文,已有的元数据原样留着:每次
+		压缩都把水位清零的话,一份好端端的快照会被自己变成"没有水位、
+		不可恢复"。
 		"""
 		now = time.time()
 		text = json.dumps(messages, ensure_ascii=False, default=_block_json)
 		with self._tx() as conn:
 			self._put_context(conn, sid, text, now, compacted)
+
+	def save_checkpoint(self, sid: str, turn_id: str, covered_no: int,
+	                    messages: list, runtime: dict,
+	                    compacted: bool = False) -> int:
+		"""存一份完整回合快照:正文 + 归属 + 覆盖水位 + 运行状态,一个事务。
+
+		四个东西必须同一笔提交:只写了正文没写水位,那份快照就说不清自己
+		涵盖到哪儿,恢复时只能整份不信;只写了水位没写正文,水位就指向一份
+		还没落地的历史。分开写的话中间那个窗口里,库里的状态是**自相矛盾**
+		的,而恢复判定恰好就靠这几个字段互相印证。
+
+		返回新的 version —— 页面拿它当"我看到的是第几版",恢复请求要带回来
+		比对(见 resume_turn 的 expected_version)。
+
+		不在这儿判"内容变没变":去重是调用方的事(它才知道上一次存的是
+		什么时候那份),而这里错一次就是漏存一个水位。
+		"""
+		now = time.time()
+		text = json.dumps(messages, ensure_ascii=False, default=_block_json)
+		payload = json.dumps(runtime, ensure_ascii=False)
+		with self._tx() as conn:
+			self._put_context(conn, sid, text, now, compacted, turn_id=turn_id,
+			                  covered=covered_no, runtime=payload)
+			return conn.execute(
+				"SELECT version FROM session_contexts WHERE session_id = ?",
+				(sid,)).fetchone()[0]
+
+	def begin_tool_exec(self, turn_id: str, tool_use_id: str, name: str,
+	                    tool_input) -> None:
+		"""两阶段标记的前一半:有副作用的工具在动手**之前**先落一条。
+
+		**严格写,写不进去抛 PersistError。** 顺序在这儿就是全部的意义:
+		标记落地了才动手,于是"库里有标记"⇒"那一刻它真的开始过了"。
+		反过来(先动手再记)等于事后补账,而崩溃恰好发生在补账之前时,库里
+		那句"没做过任何事"就是假的 —— 恢复会照着一个假事实自动重跑。
+
+		ON CONFLICT 那支是幂等:调用方允许重试同一份写入(docs 里那条
+		"允许有限次数重试同一份数据库写入"),重试不该插出第二行。把
+		finished_at 和 message_id 一并清空,是因为同一份写入重试意味着
+		这一次尝试还没有结果。
+		"""
+		text = json.dumps(tool_input, ensure_ascii=False, default=_block_json)
+		now = time.time()
+		try:
+			with self._lock:
+				self._conn.execute(
+					"INSERT INTO tool_execs (tool_use_id, turn_id, name,"
+					" input_json, started_at, finished_at, message_id)"
+					" VALUES (?, ?, ?, ?, ?, NULL, NULL)"
+					" ON CONFLICT(tool_use_id) DO UPDATE SET"
+					"   started_at = excluded.started_at,"
+					"   finished_at = NULL, message_id = NULL",
+					(tool_use_id, turn_id, name, text, now))
+		except Exception as e:
+			raise PersistError(
+				f"工具 {name} 的执行标记没落库,所以没有执行它:"
+				f"{type(e).__name__}: {e}") from e
+
+	def reserve_round(self, turn_id: str, max_rounds: int) -> bool:
+		"""发出一次模型请求之前,先把"这一轮用掉了一次"记到库里。
+
+		为什么要落库,而不是接着用内存里的计数:恢复时**不能靠快照**。快照
+		是回合边界上存的,而崩溃完全可能发生在"请求已经发出去、快照还没存"
+		之间 —— 那时光看快照,那一次调用像没发生过,恢复就等于白送一笔额度。
+
+		所以这个数独立于快照,只增不减,预留了就计上:哪怕请求还没真正发出去
+		进程就没了,也算用掉(保守,但省下的是一次重复扣费都算不出的账)。
+
+		返回 False 表示额度已经用完(或者这一轮已经不是 running 了)。
+		条件写在 UPDATE 的 WHERE 里而不是"先查后写":查和写之间会挤进另一个
+		请求,而两个请求同时看到"还剩 1 次"时,两边都会发出去。
+		"""
+		with self._tx() as conn:
+			changed = conn.execute(
+				"UPDATE turns SET model_rounds_started ="
+				" model_rounds_started + 1, updated_at = ?"
+				" WHERE id = ? AND status = 'running'"
+				" AND model_rounds_started < ?",
+				(time.time(), turn_id, max_rounds)).rowcount
+			return bool(changed)
+
+	def mark_interrupted(self, sid: str, turn_id: str, reason: str,
+	                     message: str) -> bool:
+		"""把一轮标成 interrupted。**只动 turns,一个字都不写上下文。**
+
+		不碰 session_contexts 是这一条的要点:走到这儿说明那份快照是我们
+		能信的最后一份,而手上这份内存里的历史恰恰是**没验证过**的(它可能
+		缺了一条没写进库的工具结果)。顺手存下去,等于拿一份没有证据支持
+		的历史盖掉最后一个可信点。
+
+		**不抛。** 调用这条路径的原因通常就是库写不进去了,那时该给页面一句
+		说得清的话,而不是再掀翻一层 —— 所以返回 False,由调用方决定怎么
+		告诉用户(库里会留着 running,下次启动的 reap 会接手)。
+		"""
+		now = time.time()
+		try:
+			with self._tx() as conn:
+				changed = conn.execute(
+					"UPDATE turns SET status = 'interrupted', finished_at = ?,"
+					" updated_at = ?, error_message = ?, interrupt_reason = ?"
+					" WHERE id = ? AND session_id = ? AND status = 'running'",
+					(now, now, message, reason, turn_id, sid)).rowcount
+			return bool(changed)
+		except Exception as e:
+			print(f"[sessions] 中断状态没写进库: {type(e).__name__}: {e}")
+			return False
+
+	def unresolved_interrupt(self, sid: str) -> dict | None:
+		"""这个会话里有没有还没处理的中断任务(有的话给最新的那一轮)。
+
+		拿它挡新提问:一个会话同时只有一个"最后一个完整回合",而中断的那
+		一轮正指着它。这时候开新的一轮,新任务第一次 checkpoint 就会把那份
+		唯一能恢复的状态覆盖掉 —— 而用户还没决定是继续还是放弃。
+
+		所以:先处理它。这不算麻烦,因为处理就两个按钮。
+		"""
+		with self._lock:
+			row = self._conn.execute(
+				"SELECT id, turn_no, interrupt_reason, error_message FROM turns"
+				" WHERE session_id = ? AND status = 'interrupted'"
+				" ORDER BY turn_no DESC LIMIT 1", (sid,)).fetchone()
+		if row is None:
+			return None
+		return {"turn_id": row[0], "turn_no": row[1],
+		        "interrupt_reason": row[2], "error_message": row[3]}
+
+	# ---- 恢复 ----
+
+	def checkpoint_info(self, sid: str, turn_id: str, max_rounds: int,
+	                    signature: str) -> dict:
+		"""这一轮能不能续跑,以及不能的话是卡在哪儿。**只读,不改任何东西。**
+
+		页面把它画的"继续"按钮,是拿这个函数的结果决定的 —— 所以每条拒绝
+		都要带得走的理由,而不是一个 False。
+
+		判据全部照 docs/checkpoint-implementation.md 第 8.2 节,一条不落。
+		其中最能省事、也最不能省的是**尾部规则**:只要这一轮还有 message_no
+		大于水位的记录,就不给直接续跑 —— 因为那些记录意味着"水位之后还发生
+		过事",而"见过的事"和"做过的事"在库里是两回事(有 tool_use 不等于
+		执行过,没结果也不等于没执行)。v1 不猜,交给人工核对。
+
+		signature 由调用方算(模型名、system、工具、工作目录、相关源码指纹的
+		合体):恢复一个用**另一套提示词、另一个模型**跑了一半的任务,比不恢复
+		更糟 —— 模型会拿着一份不是自己的历史继续做决定。发现不一致就拒绝,
+		而不是静默换成新的接着跑。
+		"""
+		with self._lock:
+			turn = self._conn.execute(
+				"SELECT status, turn_no, model_rounds_started,"
+				" interrupt_reason, error_message FROM turns"
+				" WHERE id = ? AND session_id = ?", (turn_id, sid)).fetchone()
+			if turn is None:
+				return {"resumable": False, "reason": "no_such_turn",
+				        "detail": "这一轮不在这个会话里", "tail": []}
+			ctx = self._conn.execute(
+				"SELECT messages_json, version, updated_at, checkpoint_turn_id,"
+				" covered_message_no, runtime_json, last_compacted_at"
+				" FROM session_contexts WHERE session_id = ?", (sid,)).fetchone()
+			last_no = self._conn.execute(
+				"SELECT COALESCE(MAX(turn_no), 0) FROM turns WHERE session_id = ?",
+				(sid,)).fetchone()[0]
+			tail = self._conn.execute(
+				"SELECT m.message_no, m.kind, m.role, m.content_json"
+				" FROM turn_messages m WHERE m.turn_id = ? AND m.message_no > ?"
+				" ORDER BY m.message_no",
+				(turn_id, ctx[4] if ctx else 0)).fetchall()
+			unresolved = self._conn.execute(
+				"SELECT name, input_json, started_at FROM tool_execs"
+				" WHERE turn_id = ? AND finished_at IS NULL"
+				" ORDER BY started_at", (turn_id,)).fetchall()
+
+		status, turn_no, rounds_used, reason, error = turn
+		info = {
+			"turn_id": turn_id, "turn_no": turn_no, "status": status,
+			"interrupt_reason": reason, "error_message": error,
+			"rounds_used": rounds_used, "max_rounds": max_rounds,
+			"checkpoint": None if ctx is None else {
+				"version": ctx[1], "updated_at": ctx[2],
+				"turn_id": ctx[3], "covered_message_no": ctx[4],
+				"last_compacted_at": ctx[6],
+			},
+			"tail": [{"message_no": r[0], "kind": r[1],
+			          "tool_use_id": _tool_use_id_of(r[3])} for r in tail],
+			"unknown_tools": [
+				{"name": r[0], "input": json.loads(r[1]),
+				 "started_at": r[2]} for r in unresolved
+			],
+		}
+
+		def no(reason_code: str, detail: str) -> dict:
+			info.update(resumable=False, reason=reason_code, detail=detail)
+			return info
+
+		if status != "interrupted":
+			# 包括 running:那条要么是本进程正在跑(锁在别人手里),要么是
+			# 上一个进程留下的、还没被 reap 收过 —— 两种都不许从恢复入口进。
+			return no("not_interrupted", f"这一轮现在是 {status}")
+		if turn_no != last_no:
+			return no("has_later_turn", "这一轮之后会话里又开过新的轮次")
+		if ctx is None:
+			return no("no_snapshot", "这个会话没有快照")
+		if ctx[3] != turn_id:
+			return no("not_owner",
+			          "库里那份快照属于另一次执行,不能当这一轮的恢复基础")
+		if not ctx[4]:
+			return no("no_watermark", "这份快照没有覆盖水位")
+		if tail:
+			return no("unresolved_tail",
+			          f"水位之后还有 {len(tail)} 条没有纳入快照的记录,"
+			          f"其中可能有已经执行过、结果未知的操作")
+		if unresolved:
+			# 两阶段标记里"开始了、没有结果"的那些。它们可能没有留下任何
+			# 原始消息(崩在 handler 里、结果还没写),所以上一条查不到它们 ——
+			# 少了这一条,一条已经跑了一半的 bash 会看起来完全没发生过,
+			# 而恢复会把它连同别的工具一起重跑。
+			return no("unknown_tool_result",
+			          f"有 {len(unresolved)} 个操作已经开始、结果未知:" +
+			          "、".join(f"{r[0]}({r[1]})" for r in unresolved[:3]))
+		if rounds_used >= max_rounds:
+			return no("rounds_exhausted",
+			          f"原来的回合上限已经用掉({rounds_used}/{max_rounds})")
+		try:
+			runtime = json.loads(ctx[5]) if ctx[5] else None
+		except ValueError:
+			runtime = None
+		if not isinstance(runtime, dict) or "signature" not in runtime:
+			return no("no_runtime", "这份快照没有可用的运行状态")
+		if signature and runtime["signature"] != signature:
+			return no("incompatible",
+			          "模型、提示词、工具或代码已经跟当时不一样了")
+		info.update(resumable=True, reason="ok", detail="可以继续",
+		            runtime=runtime, version=ctx[1])
+		return info
+
+	def resume_turn(self, sid: str, turn_id: str, expected_version: int,
+	                    messages: list, control_text: str, runtime: dict) -> dict:
+		"""把一个中断的轮次重新变成 running,连带把"我回来了"写进历史。
+
+		五个动作一个事务:版本比对、把控制记录追加进原始消息、更新快照
+		(正文 + 水位 + 运行状态)、清掉终态、状态回到 running。
+
+		**为什么控制记录必须在这个事务里**:它自己也是一条原始消息,单独晚一步
+		写的话,它会立刻变成"水位之后的尾部" —— 于是刚刚恢复好的任务,下一眼
+		看起来又不可恢复了。
+
+		版本比对用 expected_version,不信页面上先前显示的那份:页面看到的
+		快照可能已经过期(用户在另一个标签页里放弃了、或者它已经被恢复过一次),
+		而这里的每一个判断都要落在**当前**这份数据上。
+		"""
+		now = time.time()
+		block = [{"type": "text", "text": control_text}]
+		with self._tx() as conn:
+			ctx = conn.execute(
+				"SELECT version, checkpoint_turn_id, covered_message_no"
+				" FROM session_contexts WHERE session_id = ?", (sid,)).fetchone()
+			if ctx is None:
+				raise CheckpointConflict("这个会话没有快照")
+			if ctx[0] != expected_version:
+				raise CheckpointConflict(
+					f"快照版本对不上(库里是 v{ctx[0]},请求带的是"
+					f" v{expected_version})—— 刷新页面看看最新状态")
+			if ctx[1] != turn_id:
+				raise CheckpointConflict("库里那份快照不属于这一轮")
+			last = conn.execute(
+				"SELECT COALESCE(MAX(message_no), 0) FROM turn_messages"
+				" WHERE turn_id = ?", (turn_id,)).fetchone()[0]
+			if last > ctx[2]:
+				raise CheckpointConflict(
+					f"水位之后还有 {last - ctx[2]} 条记录没有核对,不能直接续跑")
+			no = last + 1
+			conn.execute(
+				"INSERT INTO turn_messages (turn_id, message_no, kind, role,"
+				" content_json, created_at) VALUES (?, ?, 'control', 'user',"
+				" ?, ?)",
+				(turn_id, no, json.dumps(block, ensure_ascii=False), now))
+			text = json.dumps([*messages, {"role": "user", "content": block}],
+			                  ensure_ascii=False, default=_block_json)
+			self._put_context(conn, sid, text, now, False, turn_id=turn_id,
+			                  covered=no,
+			                  runtime=json.dumps(runtime, ensure_ascii=False))
+			changed = conn.execute(
+				"UPDATE turns SET status = 'running', finished_at = NULL,"
+				" updated_at = ?, error_message = NULL, interrupt_reason = NULL"
+				" WHERE id = ? AND session_id = ? AND status = 'interrupted'",
+				(now, turn_id, sid)).rowcount
+			if not changed:
+				raise TurnStateConflict(
+					"这一轮已经不是中断状态了(可能已经被别人恢复或者放弃过)")
+			version = conn.execute(
+				"SELECT version FROM session_contexts WHERE session_id = ?",
+				(sid,)).fetchone()[0]
+		return {"message_no": no, "version": version,
+		        "messages": [*messages, {"role": "user", "content": block}]}
+
+	def abandon_turn(self, sid: str, turn_id: str, expected_version: int,
+	                 note: str, messages: list) -> dict:
+		"""放弃一次中断的任务:收成 failed,并把"哪些结果不确定"写进历史。
+
+		写进历史这一步不是客套。不写的话,模型下一轮会拿到一份**看起来干净**
+		的上下文,以为自己知道世界现在长什么样 —— 而实际上有几个操作做没做
+		成谁也不知道。那句话是给模型看的,内容由调用方组织,里面要点出操作
+		的原文和"结果未知"。
+
+		同样带版本、同样在事务里:放弃和恢复是两条互斥的路,两条都落在
+		session_contexts.version 上,所以谁先谁后写得清清楚楚。
+		"""
+		now = time.time()
+		block = [{"type": "text", "text": note}]
+		with self._tx() as conn:
+			ctx = conn.execute(
+				"SELECT version, checkpoint_turn_id, covered_message_no"
+				" FROM session_contexts WHERE session_id = ?", (sid,)).fetchone()
+			if ctx is None or ctx[0] != expected_version:
+				raise CheckpointConflict("快照版本对不上 —— 刷新页面看看最新状态")
+			if ctx[1] is not None and ctx[1] != turn_id:
+				raise CheckpointConflict("库里那份快照不属于这一轮")
+			last = conn.execute(
+				"SELECT COALESCE(MAX(message_no), 0) FROM turn_messages"
+				" WHERE turn_id = ?", (turn_id,)).fetchone()[0]
+			# **有尾部也允许放弃**,跟恢复那条路正相反:尾巴上挂着“进行到一半、
+			# 结果未知”的记录时,放弃是唯一出路,把它也拦掉等于让这个会话永远
+			# 卡住。水位跳过那几行是有意的 —— 它们没有被装进快照,而“它们是什么”
+			# 由调用方写进那段说明里(见 server._interrupt_note):不是丢下不管,
+			# 是换一种方式交代。
+			no = last + 1
+			conn.execute(
+				"INSERT INTO turn_messages (turn_id, message_no, kind, role,"
+				" content_json, created_at) VALUES (?, ?, 'control', 'user',"
+				" ?, ?)",
+				(turn_id, no, json.dumps(block, ensure_ascii=False), now))
+			text = json.dumps([*messages, {"role": "user", "content": block}],
+			                  ensure_ascii=False, default=_block_json)
+			self._put_context(conn, sid, text, now, False, turn_id=turn_id,
+			                  covered=no)
+			changed = conn.execute(
+				"UPDATE turns SET status = 'failed', finished_at = ?,"
+				" updated_at = ?, error_message = ? WHERE id = ?"
+				" AND session_id = ? AND status = 'interrupted'",
+				(now, now, note, turn_id, sid)).rowcount
+			if not changed:
+				raise TurnStateConflict("这一轮已经不是中断状态了")
+			version = conn.execute(
+				"SELECT version FROM session_contexts WHERE session_id = ?",
+				(sid,)).fetchone()[0]
+		return {"message_no": no, "version": version,
+		        "messages": [*messages, {"role": "user", "content": block}]}
 
 	def finish_turn(self, sid: str, turn_id: str, status: str,
 	                error_message: str | None, messages: list) -> None:
@@ -521,7 +1061,17 @@ class SessionStore:
 		with self._tx() as conn:
 			# 轮末这一次不带 compacted:本轮压过的话,检查点那一次已经
 			# 把 last_compacted_at 写上了,这里再写一遍只会把它推后。
-			self._put_context(conn, sid, text, now, compacted=False)
+			#
+			# **带上水位**,而且水位取这一轮最大那条 —— 收尾这份正文是
+			# 权威的最终历史,把水位留在最后一次回合检查点那个位置的话,
+			# 快照正文里就会出现几条"水位之后"的记录。终态的轮次反正不给
+			# 恢复(status 检查挡着),但留着这种自相矛盾的元数据,下一个人
+			# 读它的时候要重新推一遍才敢用。
+			covered = conn.execute(
+				"SELECT COALESCE(MAX(message_no), 0) FROM turn_messages"
+				" WHERE turn_id = ?", (turn_id,)).fetchone()[0]
+			self._put_context(conn, sid, text, now, compacted=False,
+			                  turn_id=turn_id, covered=covered)
 			changed = conn.execute(
 				"UPDATE turns SET status = ?, finished_at = ?, updated_at = ?,"
 				" error_message = ? WHERE id = ? AND status = 'running'",
@@ -559,21 +1109,28 @@ class SessionStore:
 		要求的(status 不是 running 时它必须非空)。那条 CHECK 在这儿是朋友:
 		谁以后漏掉它,SQLite 直接抛,而不是写进一条半合法的行。
 
-		状态用 failed 而不是新加一个 interrupted:docs/session-design.md 的
-		"重启"那一节的终局是 interrupted,但 SQLite 改不了 CHECK,要重建 turns
-		表、还得连 turn_messages 那条外键一起搬。这一版就地收成 failed 加一句
-		说得清的原因。
+		状态用 interrupted,不再是 failed。**这一版才敢改**:v1 里 SQLite
+		改不了 CHECK,只能就地收成 failed 加一句原因,于是"进程被杀"和
+		"模型自己报错"在库里长得一样 —— 而恢复入口正需要区分这两者:前者
+		可以续,后者不该续。现在 turns 表在 v4 里重建过,CHECK 收得下
+		interrupted 了。
+
+		interrupt_reason 存机器读的短码(见文件上面那几个常量),error_message
+		存给人看的那句。两个都要:页面拿前者决定画不画"继续",拿后者显示原因。
 		"""
 		now = time.time()
 		with self._tx() as conn:
 			return conn.execute(
-				"UPDATE turns SET status = 'failed', finished_at = ?,"
-				" updated_at = ?, error_message = ?"
+				"UPDATE turns SET status = 'interrupted', finished_at = ?,"
+				" updated_at = ?, error_message = ?, interrupt_reason = ?"
 				" WHERE status = 'running'",
-				(now, now, "进程重启,这一轮没有跑完")).rowcount
+				(now, now, "进程重启,这一轮没有跑完",
+				 INTERRUPT_PROCESS_RESTART)).rowcount
 
 	@staticmethod
-	def _put_context(conn, sid: str, text: str, now: float, compacted: bool) -> None:
+	def _put_context(conn, sid: str, text: str, now: float, compacted: bool,
+	                 turn_id: str | None = None, covered: int = 0,
+	                 runtime: str | None = None) -> None:
 		"""写工作上下文,version 加一。
 
 		用 upsert 而不是 UPDATE:UPDATE 打空行不报错,而这个文件里最怕的
@@ -583,22 +1140,46 @@ class SessionStore:
 
 		last_compacted_at 走 COALESCE:没压过就保留上一次压的时间。直接写
 		NULL 的话,轮末这次保存会把"三分钟前压过"这个事实抹掉。
+
+		turn_id / runtime 给 None 时原样留着(save_context 那条老路、轮末收尾、
+		放弃都走这一支):"不知道"必须写成"别动",不能写成空。水位清零等于把
+		一份好快照自己变成不可恢复的;运行状态清空则会让"这一轮当时跑在第几
+		回合、在干哪件事"这些信息,在收尾那一下凭空消失。
+
+		所以只有真正知道这几样的调用方(save_checkpoint / resume_turn)才传值。
 		"""
+		if turn_id is None or runtime is None:
+			row = conn.execute(
+				"SELECT checkpoint_turn_id, covered_message_no, runtime_json"
+				" FROM session_contexts WHERE session_id = ?", (sid,)).fetchone()
+			if row is not None:
+				if turn_id is None:
+					turn_id, covered = row[0], row[1]
+				if runtime is None:
+					runtime = row[2]
 		conn.execute(
 			"INSERT INTO session_contexts (session_id, messages_json, version,"
-			" updated_at, last_compacted_at) VALUES (?, ?, 1, ?, ?)"
+			" updated_at, last_compacted_at, checkpoint_turn_id,"
+			" covered_message_no, runtime_json) VALUES (?, ?, 1, ?, ?, ?, ?, ?)"
 			" ON CONFLICT(session_id) DO UPDATE SET"
 			"   messages_json = excluded.messages_json,"
 			"   version = session_contexts.version + 1,"
 			"   updated_at = excluded.updated_at,"
 			"   last_compacted_at = COALESCE(excluded.last_compacted_at,"
-			"                                session_contexts.last_compacted_at)",
-			(sid, text, now, now if compacted else None))
+			"                                session_contexts.last_compacted_at),"
+			"   checkpoint_turn_id = excluded.checkpoint_turn_id,"
+			"   covered_message_no = excluded.covered_message_no,"
+			"   runtime_json = excluded.runtime_json",
+			(sid, text, now, now if compacted else None, turn_id, covered,
+			 runtime))
+
+
 
 	# ---- 热路径:从不起异常 ----
 
 	def append_turn_message(self, turn_id: str, message_no: int, kind: str,
-	                        role: str, content) -> int | None:
+	                        role: str, content, strict: bool = False,
+	                        close_exec: str | None = None) -> int | None:
 		"""记一条原始消息,返回它的行号(写不进去给 None)。
 
 		message_no 由调用方发(它是内存里数的),所以失败会留下一个空号。
@@ -616,16 +1197,36 @@ class SessionStore:
 
 		失败返回 None 而不是 0:0 是个合法行号吗?不是(INTEGER PRIMARY KEY
 		 ︎从 1 起),但 None 的意思更明确 —— "没有这一行"。
+
+		strict=True 走另一档:写不进去抛 PersistError,而不是打印一行。
+		它给的是**恢复关键**的那三种记录(assistant 响应、工具结果、控制
+		消息)—— 缺了它们,模型接下来看到的历史就是缺的,再往下跑是拿
+		一份残史做决定。热路径那条(页面上少一条)照旧返回 None。
+
+		close_exec 给的是 tool_use_id:同一个事务里顺手把 tool_execs 上那条
+		两阶段标记收口。**必须同一个事务** —— 分两次写的话,中间那个窗口里
+		库里的状态是"开始了、没结果",而结果其实已经落库了;恢复判定会为此
+		把这轮判进人工核对(结果未知),明明它有结果。宁可一起写,让状态只有
+		两种:没开始,或者开始了并且有结果。
 		"""
 		try:
 			text = json.dumps(content, ensure_ascii=False, default=_block_json)
-			with self._lock:
-				cursor = self._conn.execute(
+			with self._tx() as conn:
+				cursor = conn.execute(
 					"INSERT INTO turn_messages (turn_id, message_no, kind, role,"
 					" content_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
 					(turn_id, message_no, kind, role, text, time.time()))
+				if close_exec is not None:
+					conn.execute(
+						"UPDATE tool_execs SET finished_at = ?, message_id = ?"
+						" WHERE tool_use_id = ? AND turn_id = ?",
+						(time.time(), cursor.lastrowid, close_exec, turn_id))
 				return cursor.lastrowid
 		except Exception as e:
+			if strict:
+				raise PersistError(
+					f"这条 {kind} 记录没落库({type(e).__name__}: {e}),"
+					f"停在这儿:再往下跑,模型手里的历史就缺了这一块") from e
 			print(f"[sessions] 轮次消息没落库: {type(e).__name__}: {e}")
 			return None
 

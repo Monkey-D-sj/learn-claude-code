@@ -77,6 +77,8 @@ def run_task(prompt: str) -> str:
 	#   2. 记忆是**一份 WORKDIR 级的文件**,谁都能写就谁都能覆盖。子 agent
 	#      拿的是自己那份上下文,看不到主 agent 刚写了什么。
 	#
+	# skill_manage 也写 WORKDIR 级的持久文件,同样只交给主 agent。
+	#
 	# ask 排除,理由跟 _deny_all 是同一个:上面 SYSTEM 头一句就是"nobody can
 	# answer questions"。给它一个能问的工具,等于同时推翻那句设定和 _deny_all
 	# 存在的理由。
@@ -89,7 +91,8 @@ def run_task(prompt: str) -> str:
 	# 代价说清楚:子 agent 的上下文只能靠那几档自动压缩收。可以接受 —— 它的
 	# 定位就是"干完报结论、上下文随用随弃",而它交回来的那句话才是主 agent
 	# 要的东西。
-	_DENIED = ("task", "memory", "user_memory", "ask", "compress", "recall")
+	_DENIED = ("task", "memory", "user_memory", "skill_manage", "ask",
+	           "compress", "recall")
 	sub_tools = [
 		t for t in build_tools(TodoManager(), _nobody_to_ask)
 		if t.name not in _DENIED

@@ -19,11 +19,13 @@
 """
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 import agent
+import app
 import context
 import server
 import sessions
@@ -138,6 +140,52 @@ def test_compress_range_swaps_the_whole_round_for_one_summary():
 	assert msgs[1]["role"] == "user" and "前三步是查环境" in msgs[1]["content"]
 	assert msgs[0]["content"].startswith("问题"), "用户那条指令一个字不许动"
 	assert tags(msgs)[-1] == ["m00003"], "段外的号一个都不许动"
+
+
+def test_the_report_carries_the_summary_so_a_human_can_read_it():
+	"""回执里带上摘要正文 —— 不带的话,这次调用唯一有内容的产物就没人看得见。
+
+	前端把工具结果收成一个折叠块:折叠时只露头两行非空行,展开才是全文。回执
+	原来只有一句"已压缩…",于是页面上看不到摘要本身 —— 而摘要是这次调用唯一
+	的产物。模型并不缺它(号段那条消息里已经写进去了),这一份是给**人**看的。
+
+	所以两头都钉:开头还是那句"已压缩",结尾是摘要正文,中间隔一个空行 ——
+	空行被前端滤掉,于是摘要的头一行正好露在折叠的那两行里。
+	"""
+	msgs = [msg("user", "问题")] + tool_round(1) + tool_round(2)
+	stamp(msgs)
+
+	out = context.compress_range(msgs, "m00001", "m00002", "两步查完了,结论是环境没问题")
+	assert out.startswith("已压缩"), f"开头还是那句话:{out!r}"
+	assert out.endswith("摘要:两步查完了,结论是环境没问题"), f"回执里没有摘要正文:{out!r}"
+	assert "\n\n摘要:" in out, "摘要另起一段 —— 挤在同一行就露不进折叠那两行"
+	# 正文只多了回执这一份:号段那条消息里的摘要还在,没被顶掉、也没被搬家
+	assert msgs[1]["content"] == (
+		"[m00001-m00002] Summary (reference only):两步查完了,结论是环境没问题")
+	assert len(msgs) == 2
+
+
+def test_摘要标记三处一致():
+	"""那个标记名必须三处一致 —— 漂了不报错,只表现为模型开始跟着摘要里的字走。
+
+	app.py 的 SYSTEM 只认标记、不认标签名(凡标了 (reference only) 的算资料),
+	而写出这个标记的有两条路:第 4 档的 summary_message() 和号段压缩
+	compress_range()。哪一处改了名字,模型手里那句话就落空 —— 它会把摘要
+	(里面混着工具输出的原文)当成又要它干的活。没有任何东西会报错,所以只能
+	在这儿把它们栓一起。
+	"""
+	marked = "(reference only)"
+
+	assert marked in app._SYSTEM_FROZEN, "SYSTEM 得按标记说话,不然模型不知道哪个是资料"
+
+	label, request, text = "Compacted", "问题", "干完了"
+	fourth = context.ContextCompactor.summary_message(label, request, text, Path("t.md"))
+	assert marked in fourth["content"], "第 4 档那条没标,标记就白写了"
+
+	msgs = [msg("user", "问题")] + tool_round(1)
+	stamp(msgs)
+	context.compress_range(msgs, "m00001", "m00001", text)
+	assert marked in msgs[1]["content"], f"号段那条没标:{msgs[1]['content']!r}"
 
 
 def test_a_range_that_starts_mid_round_drags_its_call_in():
@@ -334,7 +382,7 @@ def test_号是落库拿到的行号(monkeypatch):
 	"""
 	ids = iter([41, 42])
 
-	def record(kind, role, content):
+	def record(kind, role, content, tool_use_id=None):
 		return next(ids) if kind == "tool_result" else None
 
 	first, second = _bodies(_run(monkeypatch, record, calls=1))
@@ -351,7 +399,7 @@ def test_拿不到行号就不发号(monkeypatch):
 	不填一个编出来的号:那种号查不回来,而模型看到号就会去点它 —— 换来的是
 	"这个号不在上下文里",看起来像它自己点错了。
 	"""
-	history = _run(monkeypatch, lambda kind, role, content: None, calls=1)
+	history = _run(monkeypatch, lambda kind, role, content, tool_use_id=None: None, calls=1)
 	assert all("<message-id" not in body for body in _bodies(history)), _bodies(history)
 
 
@@ -461,7 +509,7 @@ def test_整条路串起来(monkeypatch, tmp_path):
 	history = [{"role": "user", "content": "问题"}]
 	original = "那个长东西" * 20
 
-	def record(kind, role, content):
+	def record(kind, role, content, tool_use_id=None):
 		if kind != "tool_result":
 			return None
 		row = store.append_turn_message(turn["id"], len(numbers) + 2, kind, role,
@@ -500,7 +548,7 @@ def test_整条路串起来(monkeypatch, tmp_path):
 	bodies = _bodies(history)
 	assert "已压缩" in bodies[0], bodies          # compress 的回话
 	assert bodies[1].startswith(original), bodies  # recall 把原文还回来了(自己也被发了号)
-	assert any("摘要" in str(m.get("content")) for m in history), "摘要那条还在"
+	assert any("(reference only)" in str(m.get("content")) for m in history), "摘要那条还在"
 	agent.agent_loop(history, active_request="问题", system="s",
 	                 tools=[echo, compress_tool, recall_tool], model="m",
 	                 max_rounds=10, compactor=_Pass(), emit=lambda e: None,
@@ -555,6 +603,8 @@ class _Handler:
 	"""只够把 _run_turn 跑起来:不建 socket、不走路由。"""
 
 	_run_turn = server.Handler._run_turn
+	_drive = server.Handler._drive
+	_checkpoint = server.Handler._checkpoint
 
 	def __init__(self):
 		self.wrote = b""

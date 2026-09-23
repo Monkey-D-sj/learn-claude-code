@@ -52,6 +52,7 @@ Turn 终态放同一个事务。数据库事务一律不包住模型请求和工
 多会话白做;而不拿会话锁去跑一轮,两条线会同时改同一份 history。
 """
 
+import hashlib
 import json
 import os
 import sys
@@ -65,10 +66,12 @@ from urllib.parse import parse_qs, urlsplit
 import dblock
 from agent import TurnOutcome, agent_loop
 from app import MODEL, build_system, make_compactor
-from config import MAX_ROUNDS, MEMORY_PATH, USER_MEMORY_PATH
+from config import MAX_ROUNDS, MEMORY_PATH, USER_MEMORY_PATH, WORKDIR
 from context import ContextCompactor
 from hooks import trigger_hooks
-from sessions import DB_PATH, SessionStore, TurnStateConflict
+from sessions import (DB_PATH, INTERRUPT_CHECKPOINT_FAILED,
+                      INTERRUPT_PERSIST_FAILED, CheckpointConflict,
+                      PersistError, SessionStore, TurnStateConflict)
 from tools import build_tools
 from tools.memory import load_memory
 from tools.compress import bind_recall, make_recall
@@ -88,6 +91,10 @@ PET_IMAGE = Path(__file__).parent / "ui" / "assets" / "whale-girl.png"
 # soon fixture),真跑起来由 main() 装。
 STORE: "SessionStore | None" = None
 DB_LOCK: "dblock.DbLock | None" = None
+
+# 代码指纹的缓存(见 _code_fingerprint)。进程活着的期间代码不会变 ——
+# 要变就得重启,那时这份缓存也跟着没了。
+_CODE_FP: "str | None" = None
 
 
 def open_store():
@@ -256,7 +263,7 @@ def recording_emit(sid: str, emit, turn: dict):
 	return wrapped
 
 
-def make_recorder(turn_id: str):
+def make_recorder(turn_id: str, start_no: int = 1):
 	"""造一个"记一条原始消息"的回调,交给 agent 循环。
 
 	turn_id 由服务端绑死在这儿,循环那头只管说"产生了什么" —— 它不知道
@@ -268,11 +275,37 @@ def make_recorder(turn_id: str):
 	**返回值必须原样交出去。** 它就是那一行的行号,而循环拿它当号拼在结果
 	正文的尾巴上(tools/compress.py 的 recall 按这个号查回原文)。吞掉它的话号发不出来
 	—— 表现是模型看不见任何号、compress 和 recall 一起变成哑的,而且不报错。
+
+	**这里一律严格写**(strict=True):循环记的三种(assistant 响应、工具结果、
+	控制消息)都是恢复关键的那三种,少一条,模型接下来看到的历史就是缺的。
+	写不进去就抛 PersistError,一路传到 _run_turn 把这一轮标成 interrupted ——
+	而不是像页面事件那样"少一条就算了"。热路径那一档(events)没变。
+
+	start_no 是**恢复**用的:续跑那一轮接着库里最大的号往下发。不接着发
+	(比如又从 2 开始)会撞 UNIQUE(turn_id, message_no) —— 那是报错,还算
+	好的;更坏的是号重复之后,模型手里那个 m 号指向了**另一条**消息,而且
+	不报错。
+
+	.last_no 是这一轮的**覆盖水位**:已经落库的最大 message_no。快照存的时候
+	把它一起写上(见 _checkpoint),恢复判定就靠它跟 turn_messages 比出"还有
+	没有尾部"。所以它必须严格跟着成功的写入走 —— 写失败了要抛,不能把它
+	往前推。
 	"""
-	counter = count(2)
-	def record(kind: str, role: str, content) -> int | None:
-		return STORE.append_turn_message(turn_id, next(counter), kind, role, content)
-	return record
+	next_no = count(start_no + 1)
+
+	class Recorder:
+		def __init__(self):
+			self.last_no = start_no
+
+		def __call__(self, kind: str, role: str, content,
+		             tool_use_id: str | None = None) -> int:
+			no = next(next_no)
+			row = STORE.append_turn_message(turn_id, no, kind, role, content,
+			                                strict=True, close_exec=tool_use_id)
+			self.last_no = no
+			return row
+
+	return Recorder()
 
 
 def quiet(emit):
@@ -407,6 +440,116 @@ def make_ask_text(emit, sid: str, turn_id: str):
 	return ask_text
 
 
+def _interrupted_text(marked: bool) -> str:
+	"""中断那句话说给用户听。分两种:标上了没有,因为能做的事不一样。"""
+	if marked:
+		return ("这一轮被中断了(关键记录没存进库,不能再往下跑)。库里停在"
+		        "上一个完整回合的检查点,可以继续,也可以放弃。")
+	return ("这一轮被中断了,而且中断状态也没写进库(库现在写不进去)。"
+	        "这一轮在库里还是 running,下次启动会被收成中断。别再改工作区,"
+	        "先看看库为什么写不进去。")
+
+
+def _code_fingerprint() -> str:
+	"""相关源文件的内容指纹。
+
+	**不用 git HEAD 代表代码版本**:这个仓库的工作区经常有未提交的改动,
+	而"改了代码、重启、点继续"正是最需要拦住的一种不兼容。指纹取的是
+	真正会影响 agent 行为的那几个文件,读一次缓存一份 —— 进程活着的期间
+	代码不会变(要变就得重启,那时缓存也跟着没了)。
+	"""
+	global _CODE_FP
+	if _CODE_FP is None:
+		digest = hashlib.sha256()
+		for name in ("agent.py", "app.py", "context.py", "sessions.py",
+		             "server.py", "tools/__init__.py"):
+			try:
+				digest.update(Path(__file__).resolve().parent.joinpath(
+					name).read_bytes())
+			except OSError:
+				digest.update(b"?")
+		_CODE_FP = digest.hexdigest()[:16]
+	return _CODE_FP
+
+
+def recovery_signature(system: str, tools: list) -> str:
+	"""恢复兼容性签名:模型、提示词、工具、工作目录、代码,合成一个短串。
+
+	存进快照,恢复时再算一遍比对。它**不是**校验和(不保证内容没坏),
+	它回答的是另一个问题:这一轮接着跑,模型看到的还是当时那一套吗。
+	不一致就拒绝、把原因显示出来,而不是静默换一套继续。
+	"""
+	material = json.dumps({
+		"protocol": 1,
+		"model": MODEL,
+		"system": system,
+		"tools": [[t.name, t.to_wire()] for t in tools],
+		"cwd": str(WORKDIR),
+		"code": _code_fingerprint(),
+	}, sort_keys=True, ensure_ascii=False)
+	return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
+
+
+def _signature_tools():
+	"""算签名用的工具集:只要 schema,不要任何每轮才有的东西。
+
+	所以 ask 和 todo 随便给个不动的实现 —— 它们的 schema 跟谁绑着无关。
+	少写这一句的话,算签名就得多造一条响应流出来,而那意味着签名这件事
+	被绑在了"正在跑的一轮"上。
+	"""
+	return build_tools(TodoManager(), lambda question, options: None)
+
+
+def restore_todos(sid: str, items) -> tuple[int, int]:
+	"""把快照里的待办清单装回这个会话。返回(装回去几条,丢掉几条)。
+
+	**要校验,不能直接塞进 manager。** 这份内容来自库里,而库里的东西
+	原则上是**不可信资料**(它最初来自模型的一次工具调用)。直接赋值等于
+	绕过了 TodoManager.update 那一整套校验,往后每一次 render 都在拿
+	一份没人检查过的结构去拼字符串。
+
+	丢掉的东西不吭声是不行的:那是"我再打开这个会话,清单少了两条" ——
+	所以数字交回调用方,由它发一条事件说清楚。
+	"""
+	todo = todo_for(sid)
+	kept, dropped = [], 0
+	for item in items if isinstance(items, list) else []:
+		if isinstance(item, dict) and isinstance(item.get("content"), str) \
+				and item.get("status") in ("pending", "in_progress", "completed"):
+			kept.append({"content": item["content"], "status": item["status"]})
+		else:
+			dropped += 1
+	todo.items = kept
+	return len(kept), dropped
+
+
+def _interrupt_note(info: dict) -> str:
+	"""放弃时写进上下文的那段话。
+
+	**它必须引用库里的证据,不能凭印象写。** 这段话的唯一用处是让模型
+	下一轮知道"这个世界有一块是不确定的";说得比证据更狠(把所有工具都
+	说成可能跑了)会让它缩手缩脚,说得比证据更轻(说成"什么都没发生")
+	会让它踩在别人的半成品上继续做。
+
+	所以:已经开始、没有结果的那些工具,连名字和参数一起列出来 —— 那是
+	库里的行;而"可能已经生效、没有被回滚"这句必须写,否则模型会默认
+	那些操作是干净的。
+	"""
+	lines = [f"用户结束了这次被中断的任务(第 {info.get('turn_no')} 轮)。"]
+	unknown = info.get("unknown_tools") or []
+	if unknown:
+		lines.append("以下操作**已经开始执行、但没有留下结果**,它们做没做成"
+		             "无法确定,而且**没有被回滚**:")
+		for item in unknown:
+			lines.append(f"- {item['name']}({json.dumps(item['input'], ensure_ascii=False)})")
+		lines.append("继续之前先确认它们的实际效果(读文件、看状态),不要假设"
+		             "它们没发生,也不要重复执行。")
+	else:
+		lines.append("没有已经开始却没有结果的操作。")
+	lines.append("这是用户的选择,不是失败原因;接着做别的事情时把它当成背景。")
+	return "\n".join(lines)
+
+
 def _save_failure_text(conflict: bool, detail: str) -> str:
 	"""保存失败那句人话。两种情况分开说 —— 它们要用户做的事不一样。"""
 	if conflict:
@@ -439,6 +582,14 @@ def trim_dangling_tool_use(history: list) -> int:
 	return before - len(history)
 
 
+	# 续跑时写给模型的那句。它得说清两件事:这是接着跑(不是新任务),
+	# 以及不要重做已经做完的部分 —— 否则模型看到一段没头没尾的历史,
+	# 最自然的反应是从头再来一遍,而那些工具是有副作用的。
+RESUME_NOTE = ("服务在这一轮中断的地方继续了(同一个任务,不是新任务)。"
+               "前面已经完成的部分仍然有效,不要去重做它们;"
+               "从当前状态接着往下做,或者直接给出结论。")
+
+
 class Handler(BaseHTTPRequestHandler):
 	def _cors(self):
 		"""同机来源就回一个 Allow-Origin,别的什么都不回。
@@ -451,9 +602,9 @@ class Handler(BaseHTTPRequestHandler):
 		if origin and is_local_origin(origin):
 			self.send_header("Access-Control-Allow-Origin", origin)
 
-	def _send_json(self, obj) -> None:
+	def _send_json(self, obj, status: int = 200) -> None:
 		body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-		self.send_response(200)
+		self.send_response(status)
 		self.send_header("Content-Type", "application/json; charset=utf-8")
 		self.send_header("Content-Length", str(len(body)))
 		self.send_header("Cache-Control", "no-store")
@@ -490,6 +641,9 @@ class Handler(BaseHTTPRequestHandler):
 			self._get_events(parts[1], query)
 		elif len(parts) == 3 and parts[0] == "session" and parts[2] == "turns":
 			self._get_turns(parts[1])
+		elif (len(parts) == 5 and parts[0] == "session" and parts[2] == "turn"
+		      and parts[4] == "review"):
+			self._get_review(parts[1], parts[3])
 		else:
 			self.send_error(404)
 
@@ -658,6 +812,12 @@ class Handler(BaseHTTPRequestHandler):
 			self._post_session()
 		elif len(parts) == 3 and parts[0] == "session" and parts[2] == "delete":
 			self._post_delete(parts[1])
+		elif (len(parts) == 5 and parts[0] == "session" and parts[2] == "turn"
+		      and parts[4] == "resume"):
+			self._post_resume(parts[1], parts[3])
+		elif (len(parts) == 5 and parts[0] == "session" and parts[2] == "turn"
+		      and parts[4] == "abandon"):
+			self._post_abandon(parts[1], parts[3])
 		else:
 			self.send_error(404)
 
@@ -703,6 +863,158 @@ class Handler(BaseHTTPRequestHandler):
 		# 进程里那两份(LOCKS/TODOS)不跟着收:它们只增不删,理由见上面。
 		# 剩下几个没人用的 dict,在本机工具里不值得为它引入删除的竞态。
 		self._send_json({"ok": True})
+
+	def _review_info(self, sid: str, tid: str) -> dict:
+		"""算一份"这一轮现在什么状况"。锁内调用,页面和两个入口都用它。
+
+		签名现算:比对的是**现在**这套模型/提示词/工具/代码,所以它必须
+		在请求这一侧算,不能存起来复用 —— 存起来就等于拿旧代码跟旧快照比,
+		永远一致。
+		"""
+		system = build_system(*STORE.get_memory_snapshots(sid))
+		return STORE.checkpoint_info(sid, tid, MAX_ROUNDS,
+		                             recovery_signature(system,
+		                                                _signature_tools()))
+
+	def _get_review(self, sid: str, tid: str):
+		"""这一轮的中断详情:页面拿它画"继续 / 放弃"和那段证据清单。
+
+		**只读。** 点开看看不该改变任何东西 —— 用户可能只是想先搞清楚
+		发生过什么再决定。
+		"""
+		if not STORE.session_exists(sid):
+			self.send_error(404, "no such session")
+			return
+		self._send_json({"ok": True, "info": self._review_info(sid, tid)})
+
+	def _post_resume(self, sid: str, tid: str):
+		"""继续一次被中断的任务。
+
+		顺序是:锁 → 补写上一轮欠的 → **在锁内重新算一遍**可恢复性 →
+		版本比对 → 写状态 → 跑。
+
+		重新算那一遍不能省。页面显示"可以继续"是几秒前的事,而这中间
+		可能有人在另一个标签页里放弃了它、或者它已经被恢复过一次 ——
+		那时候再拿页面传来的判断往下走,就是在一个已经变了的状态上执行。
+		锁在手里只保证"从现在起没人能再改",不保证"从我算完到现在没人改过",
+		所以每次判断都要落在**当前**这份数据上,而版本号就是那道闸。
+		"""
+		body = self._json_body('{"version": 1}')
+		if body is None:
+			return
+		try:
+			expected = int(body.get("version"))
+		except (TypeError, ValueError):
+			self.send_error(400, "version must be an integer")
+			return
+
+		lock = session_lock(sid)
+		if not lock.acquire(blocking=False):
+			self.send_error(409, "this session already has a turn running")
+			return
+		try:
+			if not STORE.session_exists(sid):
+				self.send_error(404, "no such session")
+				return
+			if not self._flush_unsaved(sid):
+				self.send_error(503, "previous turn result is not saved yet")
+				return
+			info = self._review_info(sid, tid)
+			if not info.get("resumable"):
+				self._send_json({"ok": False, "reason": info.get("reason"),
+				                 "detail": info.get("detail"),
+				                 "info": info}, 409)
+				return
+			runtime = info["runtime"]
+			snapshot = STORE.load_context(sid)
+			try:
+				started = STORE.resume_turn(sid, tid, expected, snapshot,
+				                            RESUME_NOTE, runtime)
+			except (CheckpointConflict, TurnStateConflict) as e:
+				self._send_json({"ok": False, "reason": "conflict",
+				                 "detail": str(e)}, 409)
+				return
+
+			# 待办清单是从库里装回来的,而这个进程可能刚起来(内存里那份
+			# 是空的)。装不回去的条数要说出来 —— 悄悄少两条,模型下一轮
+			# 就会按一份少了东西的清单干活。
+			kept, dropped = restore_todos(sid, runtime.get("todos"))
+			turn = {"id": tid, "turn_no": info["turn_no"]}
+			self.send_response(200)
+			self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+			self.send_header("Cache-Control", "no-store")
+			self._cors()
+			self.end_headers()
+			emit = recording_emit(sid, ndjson_emit(self.wfile), turn)
+			if dropped:
+				emit_quietly(emit, {"kind": "note", "source": "store",
+				                    "text": f"待办清单里有 {dropped} 条认不出来,"
+				                            f"只装回了 {kept} 条"})
+			emit_quietly(emit, {"kind": "note", "source": "resume",
+			                    "text": f"从第 {info['turn_no']} 轮的检查点继续"
+			                            f"(用了 {info['rounds_used']}/{MAX_ROUNDS} 回合预算)"})
+			# 起跑线三个数各有各的来处,也不能互相替代:
+			#   rounds_start  取快照里那个数和库里那个数的**较大值** ——
+			#                 库里的数只增不减(每次请求前预留),而快照可能
+			#                 比真实进度旧。取小的那侧等于白送额度。
+			#   start_no      record 接着库里最大的号往下发,不能从头开始
+			self._drive(sid, turn, started["messages"], 
+			            STORE.get_memory_snapshots(sid),
+			            runtime.get("active_request") or "",
+			            record=make_recorder(tid,
+			                                 start_no=started["message_no"]),
+			            emit=emit,
+			            start_rounds=max(int(runtime.get("rounds") or 0),
+			                             int(info.get("rounds_used") or 0)),
+			            rounds_since_todo=int(runtime.get("rounds_since_todo") or 0),
+			            first_time=False)
+		finally:
+			lock.release()
+
+	def _post_abandon(self, sid: str, tid: str):
+		"""放弃一次中断的任务。
+
+		**不可续跑的时候更要能放弃** —— 那正是唯一出路。所以这里不查
+		resumable,只要求"它确实是中断状态"。
+
+		放弃 ≠ 撤销:文件改过的还在。所以写进上下文的那段话是从库里的证据
+		生成的(见 _interrupt_note),页面那边也要照这个口径说,不能画成
+		"回到之前"。
+		"""
+		body = self._json_body('{"version": 1}')
+		if body is None:
+			return
+		try:
+			expected = int(body.get("version"))
+		except (TypeError, ValueError):
+			self.send_error(400, "version must be an integer")
+			return
+
+		lock = session_lock(sid)
+		if not lock.acquire(blocking=False):
+			self.send_error(409, "this session already has a turn running")
+			return
+		try:
+			if not STORE.session_exists(sid):
+				self.send_error(404, "no such session")
+				return
+			info = self._review_info(sid, tid)
+			if info.get("status") != "interrupted":
+				self._send_json({"ok": False, "reason": info.get("reason"),
+				                 "detail": info.get("detail") or
+				                           "这一轮不是中断状态", "info": info}, 409)
+				return
+			snapshot = STORE.load_context(sid)
+			try:
+				out = STORE.abandon_turn(sid, tid, expected,
+				                         _interrupt_note(info), snapshot)
+			except (CheckpointConflict, TurnStateConflict) as e:
+				self._send_json({"ok": False, "reason": "conflict",
+				                 "detail": str(e)}, 409)
+				return
+			self._send_json({"ok": True, "version": out["version"]})
+		finally:
+			lock.release()
 
 	def _post_answer(self):
 		"""回答一条挂起的问题。确认和提问都走这儿,靠槽自己的 mode 分派。
@@ -802,6 +1114,26 @@ class Handler(BaseHTTPRequestHandler):
 			if not self._flush_unsaved(sid):
 				self.send_error(503, "previous turn result is not saved yet")
 				return
+			# 有还没处理的中断任务时,不开新的一轮。理由见 unresolved_interrupt:
+			# 那份中断的快照是这个会话**唯一**的恢复点,而新任务的第一次
+			# checkpoint 就会把它盖掉。用户先点继续或者放弃,再问新的。
+			#
+			# 没有这个闸的话,表现是:进程重启 → 用户没注意那一轮的提示,
+			# 直接问了下一个问题 → 上一轮的工作上下文被覆盖,而页面上那轮
+			# 还写着"中断、可以继续",点下去发现恢复不了。不如一开始就拦住。
+			pending = STORE.unresolved_interrupt(sid)
+			if pending is not None:
+				# **这条消息只能用 ASCII。** send_error 的第二段是 HTTP 状态行
+				# 里的 reason phrase,而状态行是按 latin-1 编码写出去的 ——
+				# 一个中文就会让 send_response 抛 UnicodeEncodeError,浏览器
+				# 那边看到的是"连接被断开、没有任何响应"(实测栽的就是这个)。
+				# 人话放在页面那边:它按这个 409 再读一次轮次,把中断那一轮
+				# 连同两个按钮画出来。
+				self.send_error(
+					409, "this session has an unfinished interrupted turn"
+					     f" (turn {pending['turn_id']}, no {pending['turn_no']}):"
+					     " resume or abandon it first")
+				return
 			self._run_turn(sid, query)
 		finally:
 			lock.release()
@@ -839,8 +1171,62 @@ class Handler(BaseHTTPRequestHandler):
 		# emit 落库 + 进流;交给循环的那份是安静版(页面走了也不掀翻这一轮)。
 		# make_ask 拿的必须是不安静的那份,理由见 quiet() 的注释。
 		emit = recording_emit(sid, raw, turn)
+		# 用户那条 begin_turn 已经写进 turn_messages 了(它是开轮那个短事务的
+		# 一部分);这里只把它接到要发给模型的上下文尾巴上。
+		#
+		# 这一步留在**这里**而不是 _drive 里:恢复那条路要的是另一份历史
+		# (从快照读出来的),它不该再被追加一次用户输入 —— 追加了的话,
+		# "继续"就变成了一条新的用户提问,而这个会话的历史里会多出一句
+		# 用户从没说过的话。
+		history.append({"role": "user", "content": query})
+		# 这一条走安静版:页面正好在这时关掉的话,不安静的那版会抛
+		# OSError,把整轮带走 —— 而"切走了照跑"要的正好相反。
+		emit_quietly(emit, {"kind": "you", "text": query})
+		self._drive(sid, turn, history, memories, query,
+		            record=make_recorder(turn["id"]), emit=emit)
+
+	def _drive(self, sid: str, turn: dict, history: list, memories: tuple,
+	           active_request: str, record, emit,
+	           start_rounds: int = 0, rounds_since_todo: int = 0,
+	           first_time: bool = True) -> None:
+		"""跑这一轮,然后收尾。**新提问和恢复走的是同一条路。**
+
+		两边不同的只有:历史从哪儿来、号从几号接着发、计数从多少接着数、
+		以及要不要再触发一次 UserPromptSubmit —— 全在这几个参数里。别处
+		一模一样,所以必须共用:任何一处"收尾不一样",迟早会长成两种自己
+		会漂的行为,而恢复那条路平时没人走,漂了也看不出来。
+
+		整段的顺序(收尾那段尤其别动):
+			跑循环 → 成功就 finish_turn(上下文和终态同事务)
+			       → 关键记录存不上就 mark_interrupted(只动 turns)
+			       → 最后才发 reply
+		"""
 		silent = quiet(emit)
-		record = make_recorder(turn["id"])
+		tools = build_tools(todo_for(sid),
+		                    # 提问器绑在这一轮这条流上,所以每轮现造。
+		                    # 跟 ask= 那份不同:那个的答案是是/否(权限),
+		                    # 这个是一段文字(模型提问)。
+		                    make_ask_text(emit, sid, turn["id"]))
+		system = build_system(*memories)
+		# 恢复兼容性签名:把"模型当时看到的这一套"压成一个短串,写进快照。
+		# 恢复时拿现在的再算一遍比对 —— 中间换过模型、改过提示词、动过
+		# 工具集或代码,恢复出来的就不是同一个任务了,那种"接着跑"比停下
+		# 来更糟:模型会拿着一份不是自己的历史继续做决定。
+		frozen = {
+			"format": 1,
+			"active_request": active_request,
+			"model": MODEL,
+			"max_rounds": MAX_ROUNDS,
+			"cwd": str(WORKDIR),
+			"signature": recovery_signature(system, tools),
+		}
+
+		def checkpoint(messages: list, loop_state: dict, compacted: bool) -> None:
+			# 循环只知道自己那两个数(第几回合、多久没更新待办),别的都从
+			# 这儿补 —— 它不知道也不该知道模型名、system、工作目录这些。
+			self._checkpoint(sid, turn, record, messages,
+			                 {**frozen, **loop_state,
+			                  "todos": todo_for(sid).items}, compacted)
 
 		# 兜底那份:正常路径下会被覆盖。事先摆一个失败,是为了万一控制流
 		# 以预料之外的方式跳出去,收尾时手里也有个说得通的终态,而不是
@@ -850,14 +1236,14 @@ class Handler(BaseHTTPRequestHandler):
 		# 放在 try 外面,是因为 finally 要写它们,而 finally 在任何一条路径上
 		# 都会跑到 —— 只写在 except 里的话,正常跑完那条路上它们是未定义的。
 		saved, save_error = True, ""
+		# 中断是第三种收尾,跟"跑失败"和"没存上"都不一样:它意味着**库里
+		# 有一份值得接着用的状态**,而手上这份内存里的历史不可信。
+		interrupted, interrupt_reason = False, ""
 		try:
-			trigger_hooks("UserPromptSubmit", query)
-			# 用户那条 begin_turn 已经写进 turn_messages 了(它是开轮那个
-			# 短事务的一部分);这里只把它接到要发给模型的上下文尾巴上。
-			history.append({"role": "user", "content": query})
-			# 这一条走安静版:页面正好在这时关掉的话,不安静的那版会抛
-			# OSError,把整轮带走 —— 而"切走了照跑"要的正好相反。
-			emit_quietly(emit, {"kind": "you", "text": query})
+			# 只有新提问才触发 —— 恢复时再触发一遍,等于把用户那条指令
+			# 又提交了一次,而它的 hook 可能不是纯观察的。
+			if first_time:
+				trigger_hooks("UserPromptSubmit", active_request)
 
 			# 归属:这一轮里所有的 API 调用都带上 session / turn。压缩器和 vision
 			# 都在这一层里面,所以它们自动跟着 —— 传参是传不到工具 handler 里的
@@ -870,54 +1256,76 @@ class Handler(BaseHTTPRequestHandler):
 			compactor = make_compactor(silent)
 			with usage.span(session=sid, turn=turn["id"]):
 				with bind_recall(make_recall(STORE, sid, compactor)):
-					outcome = agent_loop(history,
-					                     active_request=query,
-					                     system=build_system(*memories),
-					                     tools=build_tools(
-						                         todo_for(sid),
-						                         # 提问器绑在这一轮这条流上,所以每轮现造。
-						                         # 跟 ask= 那份不同:那个的答案是是/否
-						                         # (权限),这个是一段文字(模型提问)。
-						                         make_ask_text(emit, sid, turn["id"])),
-					                     model=MODEL,
-					                     max_rounds=MAX_ROUNDS,
-					                     compactor=compactor,
-					                     ask=make_ask(emit, sid, turn["id"], record),
-					                     emit=silent,
-					                     record=record,
-					                     checkpoint=lambda messages: self._checkpoint(sid, messages, emit))
+					outcome = agent_loop(
+						history,
+						active_request=active_request,
+						system=system,
+						tools=tools,
+						model=MODEL,
+						max_rounds=MAX_ROUNDS,
+						compactor=compactor,
+						ask=make_ask(emit, sid, turn["id"], record),
+						emit=silent,
+						record=record,
+						checkpoint=checkpoint,
+						# 两阶段标记的前一半。只给有副作用的工具写,哪些
+						# 算有副作用由循环自己按 ToolDesc 判断(agent.py 里
+						# 的 side_effects)。
+						begin_exec=lambda uid, name, data:
+							STORE.begin_tool_exec(turn["id"], uid, name, data),
+						# 调用前先占额度,理由见 sessions.reserve_round。
+						reserve_round=lambda:
+							STORE.reserve_round(turn["id"], MAX_ROUNDS),
+						rounds_start=start_rounds,
+						rounds_since_todo_start=rounds_since_todo)
+		except PersistError as e:
+			# 恢复关键的一条记录没落库(assistant 响应、工具结果、控制消息、
+			# 或者回合快照)。**停在这儿,而且绝不把内存里这份历史存下去** ——
+			# 它已经缺了一块,存下去等于拿一份残史盖掉最后一个可信快照。
+			# 库里那一轮标 interrupted,恢复入口据此决定能不能续、要不要核对。
+			interrupted, interrupt_reason = True, f"{type(e).__name__}: {e}"
+			outcome = TurnOutcome("interrupted", f"Stopped: {e}", interrupt_reason)
 		except Exception as e:
 			# 兜底:异常不该把 history 一起带走,也不该让流断在半截
 			# 而没有下文 —— 前端会一直转圈。这一轮记 failed。
 			outcome = TurnOutcome("failed", f"Error: {type(e).__name__}: {e}",
 			                      f"{type(e).__name__}: {e}")
 		finally:
-			dropped = trim_dangling_tool_use(history)
-			if dropped:
-				emit_quietly(emit, {"kind": "note", "source": "round",
-				                    "text": f"这一轮被打断,{dropped} 条没有结果的消息没有存"})
-			try:
-				# 最终上下文和 Turn 终态同一个事务。分两次写的话,中间那个
-				# 窗口里下一轮会读到少了一整轮的历史,而且不报错。
-				STORE.finish_turn(sid, turn["id"], outcome.status, outcome.error,
-				                  history)
-			except Exception as e:
-				# **模型跑出什么,和这一轮存没存上,是两件事。** 这里只改后
-				# 一件:保存失败不能跟着 outcome.status 一起发出去 —— 页面会
-				# 把它画成普通的"完成",而库里那一轮还是 running、工作上下文
-				# 还是旧的,用户接着问就静默地少了一整轮。
-				saved, save_error = False, f"{type(e).__name__}: {e}"
-				# 状态冲突单独说:那不是"库坏了",是这一轮在库里已经是终态
-				# (被 reap 收过)。它重试也没用(finish_turn 会一直抛),所以
-				# 不进 UNSAVED 那道闸 —— 进了的话这个会话就永远问不下去了。
-				conflict = isinstance(e, TurnStateConflict)
-				if not conflict:
-					UNSAVED[sid] = {"turn_id": turn["id"],
-					                "status": outcome.status,
-					                "error": outcome.error,
-					                "messages": history}
+			if interrupted:
+				# 只动 turns。上下文一个字都不写 —— 手上这份历史没验证过,
+				# 而库里那份是最后一个可信点(见 mark_interrupted)。
+				marked = STORE.mark_interrupted(sid, turn["id"],
+				                                INTERRUPT_PERSIST_FAILED,
+				                                interrupt_reason)
 				emit_quietly(emit, {"kind": "note", "source": "store",
-				                    "text": _save_failure_text(conflict, save_error)})
+				                    "text": _interrupted_text(marked)})
+			else:
+				dropped = trim_dangling_tool_use(history)
+				if dropped:
+					emit_quietly(emit, {"kind": "note", "source": "round",
+					                    "text": f"这一轮被打断,{dropped} 条没有结果的消息没有存"})
+				try:
+					# 最终上下文和 Turn 终态同一个事务。分两次写的话,中间那个
+					# 窗口里下一轮会读到少了一整轮的历史,而且不报错。
+					STORE.finish_turn(sid, turn["id"], outcome.status,
+					                  outcome.error, history)
+				except Exception as e:
+					# **模型跑出什么,和这一轮存没存上,是两件事。** 这里只改后
+					# 一件:保存失败不能跟着 outcome.status 一起发出去 —— 页面会
+					# 把它画成普通的"完成",而库里那一轮还是 running、工作上下文
+					# 还是旧的,用户接着问就静默地少了一整轮。
+					saved, save_error = False, f"{type(e).__name__}: {e}"
+					# 状态冲突单独说:那不是"库坏了",是这一轮在库里已经是终态
+					# (被 reap 收过)。它重试也没用(finish_turn 会一直抛),所以
+					# 不进 UNSAVED 那道闸 —— 进了的话这个会话就永远问不下去了。
+					conflict = isinstance(e, TurnStateConflict)
+					if not conflict:
+						UNSAVED[sid] = {"turn_id": turn["id"],
+						                "status": outcome.status,
+						                "error": outcome.error,
+						                "messages": history}
+					emit_quietly(emit, {"kind": "note", "source": "store",
+					                    "text": _save_failure_text(conflict, save_error)})
 
 		# reply 排在收尾**之后**发。反过来的话,页面收到 reply 时库里的
 		# status 还是 running,而它的游标已经越过这条事件 —— 刷新也补不
@@ -930,29 +1338,56 @@ class Handler(BaseHTTPRequestHandler):
 		#
 		# **status 发的是"这个页面该显示成什么",不是模型的心气。** 保存失败
 		# 时发 unsaved:发 completed 就等于告诉页面"存好了,可以接着聊",而
-		# 库里那一轮还是 running、上下文还是旧的。model_status 那份照旧发出去,
-		# 因为"执行完了"和"存上了"是两件事,用户两个都要知道。
+		# 库里那一轮还是 running、上下文还是旧的。中断发 interrupted,而且
+		# 带上原因 —— 页面据此画"继续 / 放弃"两个按钮,以及一句人话。
 		emit_quietly(emit, {"kind": "reply", "text": outcome.text,
-		                    "status": outcome.status if saved else "unsaved",
+		                    "status": ("interrupted" if interrupted
+		                               else outcome.status if saved else "unsaved"),
 		                    "model_status": outcome.status,
-		                    "saved": saved, "save_error": save_error,
+		                    "interrupted": interrupted,
+		                    "save_error": save_error, "saved": saved,
 		                    "usage": usage.turn_line(
 			                    usage.read_turn(sid, turn["id"]))})
 
-	def _checkpoint(self, sid: str, messages: list, emit) -> None:
-		"""压缩器压过之后存一个上下文检查点。
+		# 同一行也打到终端。**一处生成,两处显示**:这一行是
+		# usage.turn_line 渲染好的,页面和终端拿的是同一个字符串 —— 各写一遍
+		# 会在钱、命中率、币种这些地方慢慢分家,而那正是这一行要回答的问题。
+		#
+		# 位置在收尾之后:这一轮所有的调用都发生在上面,到这儿账才记完。
+		# 例外是"保存失败"那条路(finish_turn 抛了)—— 那也不影响这一行,
+		# 账在调用发生时就一笔笔记下了(见 usage.meter),不靠收尾补。
+		#
+		# 状态词只在**不是正常完成**时补上:终端上没有页面上那个轮次框,
+		# 一行数字孤零零地摆着,看不出这一轮是跑完了还是被打断了。
+		line = usage.turn_line(usage.read_turn(sid, turn["id"]))
+		if line:
+			mark = "" if outcome.status == "completed" and not interrupted else (
+				" · 中断" if interrupted
+				else " · 没入库" if not saved else " · 失败")
+			print(f"[第 {turn['turn_no']} 轮] {line}{mark}", flush=True)
 
-		存不上**不掀翻这一轮**:轮末那次保存(finish_turn)才是权威的,而且
-		它存的是同一个 messages——压过的形状已经在内存里了。为一次中途的
-		检查点把整轮判失败,损失比它想避免的大。但也不能一声不吭:那意味着
-		"进程现在死掉会退回压缩前那份",用户该知道。
+	def _checkpoint(self, sid: str, turn: dict, record, messages: list,
+	                runtime: dict, compacted: bool) -> None:
+		"""每个完整回合存一份快照。**存不上就抛 PersistError,这一轮停下。**
+
+		跟以前那版(压缩器回调,存不上只发一条旁注)的差别是有意的。这份
+		快照现在是恢复的唯一基础,涵盖的是"到这个完整回合为止"的历史。
+		存不上还接着跑,后面那些回合就全在"没有恢复点"的状态里 —— 进程一崩
+		丢掉的是好几个回合的工作,而且没有任何迹象。代价是:一次写失败会
+		让这一轮停下来,而以前它会跑完。这个交换在这一版是划算的,因为
+		"停下来"现在有出路了(库里那份能续跑),以前没有。
+
+		水位取 record.last_no,不另外数:它就是"这个 turn 里已经落库的最大
+		message_no",而快照正文里包含的正是这些记录。两者在同一个地方往前
+		走,才不会出现"正文里有、水位说没有"这种自相矛盾的快照。
 		"""
 		try:
-			STORE.save_context(sid, messages, compacted=True)
+			STORE.save_checkpoint(sid, turn["id"], record.last_no, messages,
+			                      runtime, compacted=compacted)
 		except Exception as e:
-			emit_quietly(emit, {"kind": "note", "source": "store",
-			                    "text": f"压缩后的上下文没存上(进程现在退出会退回压缩前那份): "
-			                            f"{type(e).__name__}: {e}"})
+			raise PersistError(
+				f"这一轮的回合快照没存上({type(e).__name__}: {e})—— 停在这儿,"
+				f"库里保留的是上一个完整回合那份") from e
 
 	def log_message(self, fmt, *args):
 		# 默认实现往 stderr 打一行每个请求。这个服务是本机自用的,前端

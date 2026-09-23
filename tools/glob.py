@@ -32,4 +32,7 @@ glob = ToolDesc(
 		"required": ["pattern"],
 	},
 	handler=run_glob,
+	# 只读:重发一次无害,所以不用两阶段标记(见 tools/base.py 的 side_effect)。
+	side_effect=False,
 )
+

@@ -332,11 +332,12 @@ def test_两块都在_空的时候也拼():
 	from app import _SYSTEM_FROZEN, build_system
 
 	empty = build_system("", "")
-	assert empty.startswith(_SYSTEM_FROZEN), "记忆是拼在末尾的,不能动前面那截"
+	assert empty.startswith(_SYSTEM_FROZEN), "基础段应是固定前缀"
 	assert f"### Project — 0/{MEMORY_MAX_ENTRIES} entries" in empty
 	assert f"### User — 0/{MEMORY_MAX_ENTRIES} entries" in empty, \
 		"空的时候也得拼,模型要看得见水位"
 	assert empty.index("### Project") < empty.index("### User")
+	assert empty.index("### User") < empty.index("## Skills"), "技能段应在 system 末尾"
 
 
 def test_条目和水位都进得去():

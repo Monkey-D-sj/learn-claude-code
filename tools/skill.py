@@ -88,4 +88,7 @@ skill = ToolDesc(
 		"required": ["name"],
 	},
 	handler=run_skill,
+	# 只读:重发一次无害,所以不用两阶段标记(见 tools/base.py 的 side_effect)。
+	side_effect=False,
 )
+

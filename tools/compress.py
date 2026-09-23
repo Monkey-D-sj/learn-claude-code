@@ -73,6 +73,10 @@ compress = ToolDesc(
 		"required": ["from_id", "to_id", "summary"],
 	},
 	handler=run_compress,
+	# 一半只读,另一半改的是**当前这份工作列表**(不是工作区),所以没有
+	# 外部副作用。它的保存边界另说:改完要等这批工具结果全部回填之后才
+	# checkpoint,不能在 handler 里存半个回合。
+	side_effect=False,
 )
 
 # ---------------------------------------------------------------- recall
@@ -162,7 +166,8 @@ recall = ToolDesc(
 		"按号取回一段被压掉的原文。什么时候用:你早先压掉过一段,后来发现还用得上"
 		"它的细节,而摘要里没写全。\n"
 		"号就是结果末尾那个 <message-id token=N>m00007</message-id> 里的 m00007;"
-		"压过的段在上下文里长这样 —— [m00003-m00012] 摘要:… —— 那两头的号也查得到"
+		"压过的段在上下文里长这样 —— [m00003-m00012] Summary (reference only):… —— "
+		"那两头的号也查得到"
 		"(它们各自代表的那一条原文还在库里)。\n"
 		"取回来的是原文本身:大块的会落盘,给你一段头尾预览和分片读的命令。它不会"
 		"把它放回上下文里 —— 要用就再查一次。"
@@ -178,4 +183,7 @@ recall = ToolDesc(
 		"required": ["message_id"],
 	},
 	handler=run_recall,
+	# 只读:重发一次无害,所以不用两阶段标记(见 tools/base.py 的 side_effect)。
+	side_effect=False,
 )
+

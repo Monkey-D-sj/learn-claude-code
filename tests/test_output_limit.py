@@ -205,7 +205,7 @@ def test_有工具调用且正常结束时照旧往下走(monkeypatch):
 		[{"role": "user", "content": "干这件活"}], active_request="干这件活",
 		system="s", tools=[tool], model="m", max_rounds=5, compactor=_Pass(),
 		emit=lambda e: None, ask=lambda question: False, stream=False,
-		record=lambda kind, role, content: None)
+		record=lambda kind, role, content, tool_use_id=None: None)
 
 	assert outcome.status == "completed", outcome.error
 	assert outcome.text == "干完了。"

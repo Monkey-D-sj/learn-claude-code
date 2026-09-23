@@ -268,6 +268,10 @@ def test_第一个没了新的实例接手并清理遗留任务(tmp_path):
 
 	with _server(db, _free_port()):
 		status = store.list_turns(sid)["turns"][0]
-		assert status["status"] == "failed", status
+		# interrupted,不再是 failed:这一版要分得开"进程被杀"和"模型自己报错"
+		# —— 前者可以点继续,后者不该续。机器读的短码在 interrupt_reason,
+		# 给人看的那句在 error_message。
+		assert status["status"] == "interrupted", status
+		assert status["interrupt_reason"] == "process_restart", status
 		assert "重启" in (status["error_message"] or ""), status
 		assert status["finished_at"] is not None, status

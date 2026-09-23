@@ -9,8 +9,10 @@
 
 import contextlib
 import io
+import json
 import sqlite3
 import threading
+import time
 
 import pytest
 
@@ -255,9 +257,13 @@ def test_重启收尾_只动还在跑的轮_不碰上下文(db, store):
 	# 已完成那条整行没被动过(updated_at 也没动)
 	assert raw(db, "SELECT status, updated_at, finished_at, error_message"
 	               " FROM turns WHERE session_id = ?", (done,)) == done_before
-	dead_row = raw(db, "SELECT status, finished_at, error_message FROM turns"
+	dead_row = raw(db, "SELECT status, finished_at, error_message,"
+	                   " interrupt_reason FROM turns"
 	                   " WHERE session_id = ?", (dead,))[0]
-	assert dead_row[0] == "failed", dead_row
+	# v4 起收成 interrupted:它不是"跑错了",是"进程没了、而这份状态还能接着用"。
+	# 页面在这一格画的是"继续 / 放弃"两个按钮,而 failed 那格没有。
+	assert dead_row[0] == "interrupted", dead_row
+	assert dead_row[3] == "process_restart", dead_row
 	# 非 running 就必须有 finished_at,这是表上 CHECK 要的
 	assert dead_row[1] is not None, dead_row
 	assert dead_row[2] == "进程重启,这一轮没有跑完", dead_row
@@ -268,11 +274,13 @@ def test_重启收尾_只动还在跑的轮_不碰上下文(db, store):
 	           (dead,)) == ctx_before
 	assert store.load_context(dead) == [{"role": "user", "content": "开轮时的历史"}]
 
-	# 页面看的就是这个:list_turns 里那一轮得报 failed 带原因
+	# 页面看的就是这个:list_turns 里那一轮得报 interrupted,而且两样都带上 ——
+	# 机器读的原因决定画哪些按钮,那句人话决定显示什么。
 	one = store.list_turns(dead)["turns"]
 	assert len(one) == 1, one
 	assert (one[0]["status"], one[0]["error_message"]) \
-		== ("failed", "进程重启,这一轮没有跑完"), one[0]
+		== ("interrupted", "进程重启,这一轮没有跑完"), one[0]
+	assert one[0]["interrupt_reason"] == "process_restart", one[0]
 	assert one[0]["finished_at"] is not None, one[0]
 
 
@@ -314,12 +322,12 @@ def test_并发开轮_turn_no_不重号(db, store):
 	assert raw(db, "SELECT COUNT(*) FROM turns") == [(8,)]
 
 
-def test_空库一次建到当前版本_就五张表(db, store):
+def test_空库一次建到当前版本_表齐了(db, store):
 	# 跟着代码走,不写死版本号 —— 写死了,每加一条迁移都得回来改一次
 	assert raw(db, "PRAGMA user_version") == [(sessions.SCHEMA_VERSION,)]
 	# sqlite_sequence 是 events 那个自增主键自带的内部表
 	assert tables(db) == ["events", "session_contexts", "sessions",
-	                      "sqlite_sequence", "turn_messages", "turns"]
+	                      "sqlite_sequence", "tool_execs", "turn_messages", "turns"]
 	sid = store.create_session("项目记忆", "用户记忆")["id"]
 	store.begin_turn(sid, "问题")
 	assert len(store.list_turns(sid)["turns"]) == 1
@@ -333,3 +341,99 @@ def test_库比代码新就拒绝启动(db):
 	with pytest.raises(RuntimeError) as exc:
 		sessions.SessionStore(db)
 	assert "v99" in str(exc.value), exc.value
+
+
+# ---------------------------------------------------------------- v4 迁移
+
+def _build_v3(db):
+	"""造一个真正的 v3 老库:用当时那三条迁移的正文建表,再塞数据。
+
+	**不借新版代码的任何路径** —— 省事的写法(把 SCHEMA_VERSION 改小再建一个
+	SessionStore)其实建出来的是"新版代码眼里的老库",而那正是被测的东西:
+	迁移要能处理**别人(旧版代码)写出来的库**。
+	"""
+	conn = sqlite3.connect(db)
+	conn.isolation_level = None
+	for steps in sessions.MIGRATIONS[:3]:
+		for step in steps:
+			conn.execute(step)
+	now = time.time()
+	conn.execute("BEGIN")
+	conn.execute("PRAGMA user_version = 3")
+	sid = "老会话"
+	tid = "老轮次"
+	conn.execute("INSERT INTO sessions (id,title,created_at,updated_at,"
+	             " memory_snapshot,user_snapshot) VALUES (?,?,?,?,?,?)",
+	             (sid, "老标题", now, now, "项目记忆", "用户记忆"))
+	conn.execute("INSERT INTO turns (id,session_id,turn_no,status,created_at,"
+	             " updated_at,finished_at,error_message)"
+	             " VALUES (?,?,?,'running',?,?,NULL,NULL)", (tid, sid, 1, now, now))
+	for no, kind, role, body in (
+			(1, "user_input", "user", "老问题"),
+			(2, "assistant_response", "assistant", "老回答")):
+		conn.execute("INSERT INTO turn_messages (turn_id,message_no,kind,role,"
+		             " content_json,created_at) VALUES (?,?,?,?,?,?)",
+		             (tid, no, kind, role, json.dumps(body, ensure_ascii=False), now))
+	conn.execute("INSERT INTO session_contexts (session_id,messages_json,version,"
+	             " updated_at,last_compacted_at) VALUES (?,?,?,?,NULL)",
+	             (sid, json.dumps([{"role": "user", "content": "老历史"}],
+	                              ensure_ascii=False), 7, now))
+	conn.execute("COMMIT")
+	conn.close()
+	return sid, tid
+
+
+def test_从v3迁到v4_数据一条不少(db, monkeypatch):
+	"""turns 重建是这条迁移里唯一危险的动作:开着外键 DROP TABLE 会顺着
+	CASCADE 把原始消息删光,而且一句错都不报。所以这里查的是"消息还在不在"。
+	"""
+	sid, tid = _build_v3(db)
+	store = sessions.SessionStore(db)
+
+	assert raw(db, "PRAGMA user_version") == [(sessions.SCHEMA_VERSION,)]
+	# turn_messages 一条不少 —— 这是"DROP 没把 CASCADE 带上"的证据
+	assert raw(db, "SELECT message_no, kind FROM turn_messages ORDER BY message_no") \
+		== [(1, "user_input"), (2, "assistant_response")]
+	assert raw(db, "SELECT title, memory_snapshot, user_snapshot FROM sessions") \
+		== [("老标题", "项目记忆", "用户记忆")]
+	# 新列取默认,不伪造历史:没中断过的轮次不该有一个原因
+	assert raw(db, "SELECT turn_no, status, interrupt_reason, model_rounds_started"
+	               " FROM turns") == [(1, "running", None, 0)]
+	# 老快照没有归属和水位:它是"不能当恢复基础"的那一类,而不是"水位是 0"
+	assert raw(db, "SELECT messages_json, version, checkpoint_turn_id,"
+	               " covered_message_no FROM session_contexts") \
+		== [(json.dumps([{"role": "user", "content": "老历史"}],
+		                ensure_ascii=False), 7, None, 0)]
+	# 外键和索引都还在
+	assert raw(db, "PRAGMA foreign_key_check") == []
+	assert tables(db) == ["events", "session_contexts", "sessions",
+	                      "sqlite_sequence", "tool_execs", "turn_messages", "turns"]
+	assert "tool_execs_turn" in [r[0] for r in raw(
+		db, "SELECT name FROM sqlite_master WHERE type='index'")]
+	# 老库照常能聊:读上下文、开新轮
+	assert store.load_context(sid) == [{"role": "user", "content": "老历史"}]
+	assert store.begin_turn(sid, "新问题")["turn_no"] == 2
+
+
+def test_迁移失败_老库原样不动(db, monkeypatch):
+	"""迁移要么整条上去,要么一个字不写。
+
+	中途挂掉而只迁了一半的库是最难查的一种:表在、列在、数据缺,而且
+	user_version 已经当成新版本了。
+	"""
+	sid, tid = _build_v3(db)
+	real = sessions.MIGRATIONS[3]
+	monkeypatch.setattr(sessions, "MIGRATIONS",
+	                    (*sessions.MIGRATIONS[:3], (*real, "DROP TABLE 没有这张表")))
+	with pytest.raises(sqlite3.OperationalError):
+		sessions.SessionStore(db)
+
+	assert raw(db, "PRAGMA user_version") == [(3,)]
+	assert "tool_execs" not in tables(db)
+	assert raw(db, "SELECT COUNT(*) FROM turn_messages") == [(2,)]
+	assert raw(db, "SELECT COUNT(*) FROM turns") == [(1,)]
+	# 表还是老样子:新列一个字都没加进去(查询会抛"没有这一列")
+	with pytest.raises(sqlite3.OperationalError):
+		raw(db, "SELECT interrupt_reason FROM turns")
+	# 而老库还能照常打开(用旧代码的路径读它)
+	assert raw(db, "SELECT status FROM turns") == [("running",)]

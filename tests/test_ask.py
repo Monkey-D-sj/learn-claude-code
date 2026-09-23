@@ -410,6 +410,11 @@ def test_服务端_整轮把提问器绑在这一轮这条流上(soon, monkeypat
 	monkeypatch.setattr(soon, "agent_loop", fake_loop)
 
 	handler = _FakeHandler()
+	# _run_turn 现在把整轮交给 _drive(新提问和恢复共用那条路),而它内部
+	# 还要调 _checkpoint —— 两个都从**这个 fixture 重新加载过的** server 上取:
+	# 普通 import 拿到的是另一份模块,它的 STORE 不是这里 monkeypatch 的那个。
+	handler._drive = soon.Handler._drive.__get__(handler)
+	handler._checkpoint = soon.Handler._checkpoint.__get__(handler)
 	soon.Handler._run_turn(handler, sid, "问题")
 
 	turn = store.list_turns(sid)["turns"][-1]
@@ -471,7 +476,7 @@ def test_服务端_text往确认的槽里塞_按拒绝处理(soon):
 def test_服务端_权限确认还走原来的形状(soon):
 	"""两种问题共用 _ask_and_wait,但 confirm 那一侧的契约不许跟着变:
 	事件里没有 options,槽里写的是 allow,返回的是 bool。"""
-	def record(kind, role, content):
+	def record(kind, role, content, tool_use_id=None):
 		pass
 
 	events, box, thread = start_ask(soon.make_ask, ("s1", "t1", record), ("问",))

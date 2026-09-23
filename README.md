@@ -10,6 +10,10 @@
 模型走 DeepSeek(`deepseek-flash`),通过 `https://api.deepseek.com/anthropic`
 这个 Anthropic 兼容端点,所以代码里直接用 `anthropic` SDK,不额外做一层适配。
 
+项目现状、生产化差距与分阶段验收标准见 [生产化评估与实施路线](docs/production-readiness.md)。
+
+Checkpoint(中断与续跑)已落地,实施与验收说明见 [Checkpoint v1 实施说明](docs/checkpoint-implementation.md);下面「中断与检查点」那一节是要点。
+
 ## 快速开始
 
 需要 Python 3.14 和 [uv](https://docs.astral.sh/uv/)。
@@ -70,7 +74,7 @@ python server.py     # 然后打开 http://localhost:8765/
 | `app.py` | SYSTEM 提示词 / `MODEL` / 压缩器工厂 —— 前端从这儿接线 |
 | `server.py` | HTTP 前端:`GET /` 给页面,`POST /ask` 回一条 NDJSON 流 |
 | `ui/index.html` | 页面。单文件,每次请求现读,改完刷新即可生效 |
-| `sessions.py` | SQLite 会话库(会话 / 轮次 / 原始消息 / 工作上下文 / 事件) |
+| `sessions.py` | SQLite 会话库(会话 / 轮次 / 原始消息 / 工作上下文 / 事件 / 工具执行标记) |
 | `usage.py` | 账本:一次 API 调用一行,append-only JSONL,写到 `.traces/usage.jsonl` |
 | `pricing.py` | 价目表(人民币、两个时段)。数据,不是代码 |
 | `report.py` | 把 `usage.jsonl` 渲染成几张表。`python report.py` |
@@ -85,8 +89,8 @@ python server.py     # 然后打开 http://localhost:8765/
 
 ## 工具
 
-`tools/__init__.py` 里 `BASE_TOOLS` 那 13 个 + `build_tools()` 现造的 2 个,合起来
-15 个,就是模型能看到的全部:
+`tools/__init__.py` 里 `BASE_TOOLS` 那 14 个 + `build_tools()` 现造的 2 个,合起来
+16 个,就是模型能看到的全部:
 
 | 工具 | 作用 |
 |---|---|
@@ -96,6 +100,7 @@ python server.py     # 然后打开 http://localhost:8765/
 | `grep` | 按内容搜,返回 `路径:行号: 内容`;命中封顶 200 条 |
 | `todo_write` | 任务清单,同时让 agent 别跑偏 |
 | `skill` | 按名字加载一份技能正文 |
+| `skill_manage` | 实时列出、创建、更新、删除项目技能 |
 | `memory` | 项目级记忆:这个仓库的约定和坑。`add` / `remove` / `update` |
 | `user_memory` | 用户级记忆:你这个人的喜好和习惯。同上三个动作 |
 | `vision` | 看一眼图片(PNG/JPEG/GIF/WebP),答一个关于它的问题。图不进上下文 |
@@ -137,6 +142,44 @@ python server.py     # 然后打开 http://localhost:8765/
 读写 `WORKDIR` 之外的文件会问你一句(页面上两个按钮)。这是 **harness** 在问;
 模型自己也能问,走的是 `ask` 工具 —— 两条通道都叫 ask 但不是一回事,见下面的
 设计取舍。
+
+## 中断与检查点
+
+进程被杀、Ctrl+C、或者关键记录写不进库,都会让一轮**停在半路**。这一版把
+"停在哪儿"变成可恢复的,而且把"不能确定的事"明确交回给人。
+
+**每个完整回合存一次快照。** `agent_loop` 在回合的顶端(上一批工具结果已经
+回填、下一次请求还没发)回调一次 `server._checkpoint`,把活的那份 `messages`
+连同**水位**(这一轮已经落库到第几条 `message_no`)和运行状态(第几回合、
+待办、原始任务、模型/提示词/工具/代码的签名)写进 `session_contexts`。
+存不上就**停下来** —— 那份快照是恢复的唯一基础,手里这份历史缺了东西,
+存下去就是拿残史盖掉最后一个可信点。
+
+**两阶段标记。** 有副作用的工具(`bash` / `write_file` / `edit_file` /
+`skill_manage` / `memory` / `task`)在动手**之前**先往 `tool_execs` 写一条
+"started",结果落库时同一个事务收口。于是崩溃之后库里分得清三种情况:
+没开始(可以安全重发)、开始了有结果(照常)、**开始了没结果**(结果未知,
+必须人来核对)。只读工具不写标记 —— 重发一次无害。
+
+`ToolDesc.side_effect` 默认 `True`:漏声明时两边的代价不对称,当有害只是多
+一条写,当无害等于让系统在你不知情的时候重跑一个刚写完文件的工具。
+
+**严格写入。** 循环记的三种记录(assistant 响应、工具结果、控制消息)写不进
+去就抛 `PersistError`,这一轮标 `interrupted` 并停下 —— 绝不把内存里那份
+历史存下去。页面上那三种终态是分开的:`failed`(跑错了,不该续)、
+`interrupted`(停在了一个还能接着用的地方)、`unsaved`(跑完了但结果没存上)。
+
+**续跑要人点。** 启动时把遗留的 `running` 收成 `interrupted`(不自动重跑),
+页面上那一轮出现「继续 / 放弃」两个按钮。能不能继续由服务端现算,五条都满足
+才行:是当前会话最后那一轮、快照归属对得上、有水位、**水位之后没有尾部记录**、
+**没有"开始了没结果"的操作**、额度没用完、签名还对得上。只认"水位之后没有
+尾部"是不够的:一条跑到一半的 `bash` 崩在执行中间时,库里**没有**对应的原始
+消息,只有那条 started 标记 —— 少了这一条判据,它会看起来从没发生过。
+
+**放弃 ≠ 撤销。** 放弃会把"哪些操作已经开始、结果未知、没有被回滚"从库里的
+证据生成一段说明写进上下文(接着聊时模型看得见),然后这一轮收成 `failed`。
+文件改过的还在,推过的还推了。有未处理的中断任务时,这个会话不许开新的一轮 ——
+那份快照是这个会话唯一的恢复点,新任务的第一次快照会把它盖掉。
 
 ## 上下文压缩
 
@@ -218,6 +261,13 @@ python server.py     # 然后打开 http://localhost:8765/
 
 清单是**启动时**拼进 system prompt 的,所以新增技能要重启;而 `SKILL.md` 正文
 每次调用都现读,改完刷新即生效。
+system prompt 的顺序是基础段 → 会话记忆 → 技能规则和清单;技能段放在末尾。
+`skill_manage(list)` 读实时清单;`create` / `update` 写入后当轮就能用 `skill` 加载,
+但 system prompt 里的名字和描述仍要重启服务才刷新。`delete` 只处理没有附属文件的技能。
+system prompt 也会告诉模型:用户明确要求保存流程时直接管理技能;否则在完成任务后,
+只有验证出可能复用的多步流程或非显然的坑,才先查实时清单。已有技能经实做发现
+错误或遗漏时更新;没有技能覆盖该流程时新建。一次性的任务细节和未经核实的文件内容
+不写成技能。
 
 ## 记忆
 

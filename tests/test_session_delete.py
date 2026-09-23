@@ -52,6 +52,8 @@ class _FakeHandler:
 	# _post_ask 里那两步都是按 handler 调的,得接到真的实现上去。_flush_unsaved
 	# 是 R3 加的:上一轮没存进库的话,它要在开新轮之前先补写。
 	_run_turn = server.Handler._run_turn
+	_drive = server.Handler._drive
+	_checkpoint = server.Handler._checkpoint
 	_flush_unsaved = server.Handler._flush_unsaved
 
 	def _json_body(self, expect):
