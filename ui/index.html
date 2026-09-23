@@ -1080,11 +1080,37 @@ function el(tag, cls, text) {
   return node;
 }
 
-// 只有本来就贴着底才自动滚。正往上翻着看历史的时候,新内容不该把你拽走。
-function follow() {
-  const near = log.scrollHeight - log.scrollTop - log.clientHeight < 120;
-  if (near) log.scrollTop = log.scrollHeight;
+// 贴不贴底是个**状态**,不是每次现算的距离。
+//
+// 原来那版每次拿"离底不到 120px"当判据,默认内容是一小口一小口来的。
+// 可流式输出里常有一步顶好几行的时候(一整段话、一张图、一个代码块),
+// 一步就跨出 120px:这一跨之后离底永远是">120px",于是再也追不上,
+// 屏幕上就停在半空 —— 而且停在那儿不动,看着像"新消息被遮住了"。
+//
+// 所以:自己的滚动动作决定 stick(滚上去就松开,滚回底就重新贴上),
+// 贴住之后不管内容一次涨多少都跟到底。force = true 是"自己发的话"这一类:
+// 主动发言就是要看结果,不管你刚才翻到哪,直接贴回去。
+let stick = true;
+
+function maxScroll() { return log.scrollHeight - log.clientHeight; }
+function nearBottom() { return maxScroll() - log.scrollTop < 120; }
+
+function follow(force) {
+  if (force) stick = true;
+  if (!stick) return;
+  log.scrollTop = log.scrollHeight;   // 超了会自动夹到 max,不用自己减
 }
+
+// 只有**人**滚的时候才改 stick。程序自己滚也会发 scroll 事件,但那时的
+// 位置必然就在底部,算出来还是 true,所以不用去区分是谁滚的。
+log.addEventListener("scroll", () => { stick = nearBottom(); }, { passive: true });
+
+// 两个不经过 add() 的变高:内容自己撑高(图片加载完、<details> 展开、
+// 排版重算),和视口自己变矮(输入框跟着字长高,把日志挤短)。
+// 这两种都会把底部推出可视区,而事件里没有任何一次 add() 来管。
+// 贴着底就补一下,松开了就什么都不做。
+new ResizeObserver(() => follow()).observe(log);
+new ResizeObserver(() => follow()).observe(stream);
 
 function add(node, target) {
   (target || turn || stream).appendChild(node);
@@ -2242,6 +2268,8 @@ form.addEventListener("submit", async (e) => {
 
   box.value = "";
   setComposer(false);
+  // 人是自己按的发送:哪怕正翻在上面看旧账,也拉回底部看这条的回应。
+  follow(true);
 
   // 必须发 application/json:这个 Content-Type 不在 CORS 的白名单里,
   // 浏览器因此必须先发预检。后端只对同机来源回 Allow-Origin,所以
