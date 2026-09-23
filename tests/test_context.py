@@ -12,6 +12,8 @@
 跟"要发多大一坨"是两回事。顺手一起改掉的话,那个判断会静默地变味。
 """
 
+import pytest
+
 import context
 
 Compactor = context.ContextCompactor
@@ -154,6 +156,12 @@ def test_snip_stays_out_when_only_the_count_is_high(tmp_path):
 	assert len(out) == 202, "一条都不许切"
 
 
+@pytest.mark.skip(reason=(
+	"第 2 档当前是关着的(见 context.prepare 里那一行「先关掉(2026-09-22,临时的)」),"
+	"而这条断言的是它开着时的行为 —— 它和上面那条 "
+	"test_snip_stays_out_when_only_the_count_is_high 是一对,合起来编码的才是"
+	"「闸门按 token 说话」这个意思。等 compress 那条路的用法定下来、四档按那时"
+	"的注释补好 _split_marker 接回去,就该把这个 skip 去掉。"))
 def test_snip_runs_once_the_context_is_heavy_enough(tmp_path):
 	"""同一个条数,token 上去了就该切 —— 闸门量的是 token。
 
