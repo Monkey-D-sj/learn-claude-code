@@ -123,6 +123,66 @@ def test_读路径_轮次_事件游标_热路径不抛(store):
 	assert store.events_since(sid, 99) == []
 
 
+def test_落一条消息_返回它在库里的行号(db, store):
+	"""返回值就是那条消息的行号 —— 上层拿它当号发给模型。
+
+	**号 = 行号**,于是"有号"等于"真的存进去了",而且水位不用自己数:
+	id 是 SQLite 的 INTEGER PRIMARY KEY,只增不减。上层那套"接着最大号发、
+	被压掉的号也算数"的补丁就是为了在没有它的时候模拟这件事。
+	"""
+	sid = store.create_session("项目记忆", "用户记忆")["id"]
+	turn = store.begin_turn(sid, "问题")
+
+	first = store.append_turn_message(turn["id"], 2, "assistant_response",
+	                                  "assistant", "回答")
+	second = store.append_turn_message(turn["id"], 3, "tool_result", "user",
+	                                   [{"type": "tool_result", "content": "输出"}])
+
+	assert first == raw(db, "SELECT id FROM turn_messages WHERE message_no = 2")[0][0]
+	assert second == raw(db, "SELECT id FROM turn_messages WHERE message_no = 3")[0][0]
+	assert second > first
+
+
+def test_没落进去的消息_返回None(store):
+	"""写不进去就没有行号。
+
+	**这一条是有用的**,不是兜底:上层拿 None 就不发号,模型看不到号也就
+	点不动这段 —— 比发一个查不回来的号强。"有号 = 查得回来"这条不变量
+	就靠它撑着。
+	"""
+	noisy = io.StringIO()
+	with contextlib.redirect_stdout(noisy):
+		assert store.append_turn_message("查无此轮", 2, "tool_result", "user",
+		                                 "x") is None
+	assert "没落库" in noisy.getvalue(), noisy.getvalue()
+
+
+def test_按号取回_只认本会话(db, store):
+	"""按行号捞回那条消息的正文 —— 模型点一个号,要拿回被压掉的原文。
+
+	**必须带会话过滤。** 行号是 `turn_messages` 这一张表上的,不带 session_id
+	的话,A 会话拿着自己上下文里的一个号,能读到 B 会话的原文 —— 而"两个会话
+	互相看不见对方"是这张表唯一的边界。查不到就返回 None,不抛。
+	"""
+	sid = store.create_session("项目记忆", "用户记忆")["id"]
+	other = store.create_session("项目记忆", "用户记忆")["id"]
+	mine_turn = store.begin_turn(sid, "问题")
+	other_turn = store.begin_turn(other, "别的会话")
+	body = [{"type": "tool_result", "content": "本会话的输出"}]
+	other_body = [{"type": "tool_result", "content": "别的会话的输出"}]
+	store.append_turn_message(mine_turn["id"], 2, "tool_result", "user", body)
+	store.append_turn_message(other_turn["id"], 2, "tool_result", "user", other_body)
+
+	ids = [row[0] for row in raw(db, "SELECT id FROM turn_messages"
+	                                 " WHERE kind = 'tool_result' ORDER BY id")]
+	mine, theirs = ids
+
+	assert store.find_message(sid, mine) == body
+	assert store.find_message(other, theirs) == other_body
+	assert store.find_message(other, mine) is None, "别人的号在本会话里必须查不到"
+	assert store.find_message(sid, 99999) is None
+
+
 def test_中途检查点与轮末收尾(db, store):
 	sid = store.create_session("项目记忆", "用户记忆")["id"]
 	turn = store.begin_turn(sid, "问题")

@@ -21,17 +21,16 @@ uv sync
 # 2. 配 key(写进 .env,已被 .gitignore 忽略)
 echo 'DEEPSEEK_API_KEY=sk-...' > .env
 
-# 3A. 终端
-python main.py
-
-# 3B. 浏览器
+# 3. 起服务
 python server.py     # 然后打开 http://localhost:8765/
 ```
 
-两个前端共用同一套提示词、工具集和压缩逻辑(接线都在 `app.py`),区别只在
-"怎么收输入、往哪块屏幕画"。
+提示词、工具集和压缩逻辑的接线都在 `app.py`,前端自己的东西(怎么收输入、
+往哪块屏幕画)在 `server.py` 和 `ui/index.html` 里。
 
-终端里输入 `q`、`exit` 或直接回车退出。
+**只有一个前端。** 原来还有一个终端 REPL(`main.py`),已经删掉了 —— 它不记库,
+所以会话活不过进程,`compress` / `recall` 那套按号取回在它手里也是哑的(号是
+库里那一行的行号,没有库就没有号)。
 
 ## 它长什么样
 
@@ -65,11 +64,10 @@ python server.py     # 然后打开 http://localhost:8765/
 | 路径 | 说明 |
 |---|---|
 | `agent.py` | `call_api()`(唯一网络出口,3 次指数退避)和 `agent_loop()` 主循环 |
-| `context.py` | `ContextCompactor` —— 四档上下文压缩,外加 `compress` 工具背后那套号段机制(1120 行) |
+| `context.py` | `ContextCompactor` —— 四档上下文压缩,外加号的拼装与号段压缩(1126 行) |
 | `config.py` | `WORKDIR`、`MAX_ROUNDS=50`、落盘目录、记忆额度 |
-| `emit.py` | 终端渲染器。叶子模块,不 import 项目内任何东西(防循环依赖) |
-| `app.py` | 两个前端共用的 SYSTEM 提示词 / `MODEL` / 压缩器工厂 |
-| `main.py` | 终端前端(REPL) |
+| `emit.py` | 把事件打成终端文字。只给子 agent 用(打在主进程的 stdout 上) |
+| `app.py` | SYSTEM 提示词 / `MODEL` / 压缩器工厂 —— 前端从这儿接线 |
 | `server.py` | HTTP 前端:`GET /` 给页面,`POST /ask` 回一条 NDJSON 流 |
 | `ui/index.html` | 页面。单文件,每次请求现读,改完刷新即可生效 |
 | `sessions.py` | SQLite 会话库(会话 / 轮次 / 原始消息 / 工作上下文 / 事件) |
@@ -87,8 +85,8 @@ python server.py     # 然后打开 http://localhost:8765/
 
 ## 工具
 
-`tools/__init__.py` 里 `BASE_TOOLS` 那 12 个 + `build_tools()` 现造的 2 个,合起来
-14 个,就是模型能看到的全部:
+`tools/__init__.py` 里 `BASE_TOOLS` 那 13 个 + `build_tools()` 现造的 2 个,合起来
+15 个,就是模型能看到的全部:
 
 | 工具 | 作用 |
 |---|---|
@@ -104,6 +102,7 @@ python server.py     # 然后打开 http://localhost:8765/
 | `ask` | 问用户一个问题,等他的回答。可以带一组选项,页面上画成按钮 |
 | `task` | 派一个子 agent,独立上下文,只回结论 |
 | `compress` | 把一段干完的活按号段压成一句话(见下面的上下文压缩) |
+| `recall` | 按号把压掉的那段原文取回来(号就是库里那一行的行号,见下面的上下文压缩) |
 
 每个工具都是一个 `ToolDesc`(dataclass):名字 + 描述 + input schema + handler。
 加工具 = 新建一个文件、写个 `ToolDesc`、在 `tools/__init__.py` 里加进
@@ -117,6 +116,10 @@ python server.py     # 然后打开 http://localhost:8765/
 在同一轮里被压缩改过),没有"造工具的那一刻"可以挂上去 —— 所以它走
 `contextvar`(`context.bind_messages`),由 `agent_loop` 在跑 handler 之前 bind。
 
+`recall` 同理,只是它绑的是**这个会话的取回器**(会话库 + 会话 id + 压缩器)——
+`server.py` 跑一轮之前 bind(`tools.recall.bind_recall`)。没绑上时代码不会崩,
+工具会如实回一句"现在没接会话库"。
+
 ## Hooks
 
 4 个事件点,回调返回非 `None` 就表示"拦住"。
@@ -129,13 +132,13 @@ python server.py     # 然后打开 http://localhost:8765/
 | `Stop` | 模型不再调工具时 | `summary_hook` 会话统计 |
 
 `permission_hook` 是唯一会**交互**的 hook:bash 命中 `DENY_LIST` 直接拒;
-读写 `WORKDIR` 之外的文件会问你一句(终端是 `Allow? [y/N]`,浏览器是页面上
-两个按钮)。这是 **harness** 在问;模型自己也能问,走的是 `ask` 工具 ——
-两条通道都叫 ask 但不是一回事,见下面的设计取舍。
+读写 `WORKDIR` 之外的文件会问你一句(页面上两个按钮)。这是 **harness** 在问;
+模型自己也能问,走的是 `ask` 工具 —— 两条通道都叫 ask 但不是一回事,见下面的
+设计取舍。
 
 ## 上下文压缩
 
-`context.py` 是项目里最厚的一块(1120 行)。设计上是四档阶梯,代价递增,每轮
+`context.py` 是项目里最厚的一块(1126 行)。设计上是四档阶梯,代价递增,每轮
 **发送之前**由 `agent_loop` 调一次 `prepare(messages, active_request, checkpoint)`:
 
 | 档 | 方法 | 干什么 | 代价 |
@@ -152,7 +155,7 @@ python server.py     # 然后打开 http://localhost:8765/
 
 ### 当前状态:只有第 1 档在跑
 
-`prepare()` 里**第 2、3、4 档是注释掉的**(`context.py:1084–1115`,2026-09-22,
+`prepare()` 里**第 2、3、4 档是注释掉的**(`context.py:1090–1123`,2026-09-22,
 标注为临时)。理由是这三档都会改写 `tool_result` 的正文,而 `compress` 那个号
 (`<message-id ...>m00007</message-id>`)现在就拼在正文末尾 —— 改写正文就会把号
 吃掉,模型手里记着的号段会指向别的消息,而且**不报错**,只表现为"它点什么都不对"。
@@ -170,9 +173,29 @@ python server.py     # 然后打开 http://localhost:8765/
 
 跟上面四档是两回事:那四档是"超线就压",这条路是"模型觉得一段活干完了,点名压掉
 它"。每条工具结果的末尾都拼着一个号,`compress(from_id, to_id, summary)` 按号段
-压 —— 摘要由模型写,原文按号还查得回来。配对检查在 `compress_range` /
-`_pairing_problem` / `_owner_index` 里(号段两端会自己吸附到完整回合,不能切在
-`tool_use` 和它的 `tool_result` 中间),切错了只回一句话、不动上下文。
+压 —— 摘要由模型写。配对检查在 `compress_range` / `_pairing_problem` /
+`_owner_index` 里(号段两端会自己吸附到完整回合,不能切在 `tool_use` 和它的
+`tool_result` 中间),切错了只回一句话、不动上下文。
+
+**号是 `sessions.db` 里那一行的行号**(`turn_messages.id`),不是自己数的计数器:
+
+```
+工具跑完 → record 落库 → 拿到行号 → 拼进结果正文的尾巴
+                                     ↓
+              模型看到 <message-id token=1240>m00007</message-id>
+```
+
+所以"有号"和"查得回来"是同一件事 —— 写不进去就没有行号,也就没有号,模型看不见
+它自然点不动。水位(号只增不减)也由 SQLite 保证,不用再自己数(原来那套
+"接着最大号发、压掉的号也算数"的补丁已经删了)。
+
+这一路上有两个工具:**`compress` 压,`recall` 按号把原文取回来**。`recall` 查的就是
+那条行号的原文,取回来时按预览那套渲染(大块落盘 + 头尾预览 + 分片读命令),不是
+原样回灌 —— 被压掉的往往就是大的,原样塞回去等于把压缩白做。
+
+**只有主循环成立。** 子 agent 的 `record` 是 `_drop`(它的结果压根不进库),所以
+那儿一条号都发不出来:`compress` 没有号可点,`recall` 也永远查不到东西 —— 两个
+都从它的工具集里摘掉了。
 
 第 4 档(当前关闭)会把当前任务原文(`active_request`)单独保留成
 `Current user request` 标签 —— 否则当前任务会连同历史一起被总结掉。
@@ -258,8 +281,7 @@ Facts and preferences from earlier sessions, fixed when this session started. Ba
 子串匹配对着当前文件找,前面增删不影响后面;撞 0 条或撞多条一律报错并列出
 候选,让它自己把说法改具体。
 
-**记忆在一个会话内不变。** 两份快照都在会话开始时冻住——终端冻在进程启动
-(一个终端进程从头到尾就是一个会话),浏览器冻在建会话那一刻、存进库里。写
+**记忆在一个会话内不变。** 两份快照在建会话那一刻冻住、存进库里。写
 进去的东西下个会话才生效,工具的返回值里会明说这一句,否则模型写完回头看自己
 上下文一个字没变,会当成没写进去然后反复重试。
 
@@ -347,13 +369,13 @@ partial 进去,而 `build_tools` 那个 `ask_user` **故意不给默认值** —
 子 agent 拿不到它,理由跟记忆那两个工具一样:它的 SYSTEM 头一句就是
 `nobody can answer questions`。
 
-**序号和下标不过线。** 页面上点了哪个按钮、终端里敲了哪个数字,都在**本地**
+**序号和下标不过线。** 页面上点了哪个按钮,那个下标留在**本地**
 换回选项原文再交出去 —— 模型看到的永远是文字。传下标的话,"第几项对应哪段
 文字"就成了两边各存一半的约定,而它会漂,漂的时候不报错。
 
 **压缩必须切片赋值。** `messages[:] = compactor.prepare(...)`,不能写
 `messages = ...`。`prepare()` 内部构造新列表返回,而 `messages` 是调用方
-(`main.py` 的 `history`)传进来的那个对象 —— 写成 `=` 的话本地名指向新列表,
+(`server.py` 手里的那份 `history`)传进来的那个对象 —— 写成 `=` 的话本地名指向新列表,
 调用方那份还停在旧的上面,这一回合的回复和工具结果全写进了新列表,调用方看不见,
 下轮提问时整段工作凭空消失,而且**不报错**(连续两条 user 是合法的)。
 
@@ -366,7 +388,7 @@ partial 进去,而 `build_tools` 那个 `ask_user` **故意不给默认值** —
 (`max_retries=0`),否则会叠成 3 × 3 = 9 个请求。
 
 **压缩器不是单例,** 必须注入。它带着一个 model,而主 agent 和子 agent 用的不是
-同一个;还得带上 `emit`,因为终端和浏览器是两块屏幕。所以 `make_compactor(emit)`
+同一个;还得带上 `emit`,因为主循环和子 agent 是两块屏幕。所以 `make_compactor(emit)`
 按前端各建一份。
 
 **记忆必须冻在会话开始时,不能每轮现读。** DeepSeek 的缓存是**自动**前缀
@@ -379,20 +401,18 @@ partial 进去,而 `build_tools` 那个 `ask_user` **故意不给默认值** —
 全吐回去。冻住之后一个会话内 system 逐字节恒定,零重算;代价只是写入下个
 会话才生效。
 
-终端那边几乎是白捡的:一个终端进程从头到尾就是一个会话,所以 `app.py` 里
-`SYSTEM = build_system(load_memory(...), load_memory(...))` 写在模块级就够了。
-浏览器那边一个进程里开着好几个会话,得按 `sid` 各冻一份,所以两份快照落在
+一个进程里开着好几个会话,得按 `sid` 各冻一份,所以两份快照落在
 `sessions.memory_snapshot` 和 `sessions.user_snapshot` 两列上(见 `_MIGRATION_2`
 和 `_MIGRATION_3`——分两条只是因为前者已经落到了一个跑着的库上,改它没用)。
 
 拼的位置也在管这件事:记忆拼在 system **末尾**。唯一会变的字节落在最后,
 按块缓存时 `tools` 和前面几段还留得住,作废的只有后面的 `messages`。
 
-**输入进来先洗一遍字符。** `main.py` 里 `query.encode("utf-8", "replace").decode("utf-8")`
+**输入进来先洗一遍字符。** `server.py` 里 `clean_query` 那句 `encode("utf-8", "replace").decode("utf-8")`
 看着像废话,但 stdin 被重定向时 Python 按 locale 解码,凑不成合法序列的字节会被
 `surrogateescape` 兜成孤代理项;那东西编不进请求体,会在 SDK 内部炸成
 `UnicodeEncodeError` —— 不是 `APIError`,捕不到。在这儿洗掉,任何来源的坏字符
-都活不到发请求。(`example.py` 另有 `readline` 的配置,`main.py` 未启用。)
+都活不到发请求。
 
 ## 已知小问题
 
@@ -400,8 +420,9 @@ partial 进去,而 `build_tools` 那个 `ask_user` **故意不给默认值** —
   (`<message-id ...>`)拼在 tool_result 正文末尾,而这几档改写正文。**这是当前
   唯一一处主动拆掉的兜底**:除非最新一批工具结果单批超线,否则上下文没有任何东西
   拦得住。重新打开前要先给每一处改正文的地方补上 `_split_marker`。
-- **`compress` 的用法还没定。** 上面那三档关着,就是在等这个决定:号是留在正文里
-  靠摘/拼保护,还是挪到别处存。定了之后再谈那三档是留、是改、还是让位。
+- **子 agent 用不了 `compress` / `recall`。** 号 = 库里那一行的行号,而它的
+  `record` 是 `_drop` —— 不进库就没有行号,没有号这两个工具都是哑的,所以直接
+  从它的工具集里摘掉了。它的上下文只能靠那几档自动压缩收。
 - **测试绿着,但那三档已经不在链上。** `tests/test_context.py` 直接调
   `snip_compact` / `micro_compact`,它们当然过 —— 缺的是"整条阶梯在 `prepare`
   里接通了没有"的用例,否则将来重新打开时没人拦得住改错。

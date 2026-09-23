@@ -145,7 +145,7 @@ def call_api(llm_client, emit, stream: bool = True, purpose: str = "main",
 			err, retryable = exc, True
 		finally:
 			# 走到这儿 partial 还留着,只有一种可能:上面三条 except 一条都没
-			# 接住 —— 一个非 APIError 跳了出去(终端那边 emit 撞上断掉的管道
+			# 接住 —— 一个非 APIError 跳了出去(emit 撞上断掉的连接
 			# 之类)。不补这一下,那笔钱就从账上消失了,而"消失了"和"没花"
 			# 在报表里长得一模一样。
 			#
@@ -221,14 +221,14 @@ class TurnOutcome:
 
 
 def _drop(kind: str, role: str, content) -> None:
-	"""没给 record 时的占位。终端前端和子 agent 没有会话库可记。"""
+	"""没给 record 时的占位。子 agent 没有会话库可记。"""
 
 
 # 工具结果往事件里塞多少。bash 的门槛是 400000 字符,原样发出去一条命令
 # 就能把页面冲垮。
 #
 # 截在发事件这一侧,不留给前端:让前端各自截的话,那 40 万字符已经先过
-# 了一遍网络,而且两个前端还得各写一份。
+# 了一遍网络,而且截的规矩还得在每个前端里各写一份。
 #
 # 4000 落在"够看清在干什么"和"不淹没屏幕"之间 —— 报错、汇总、开头几行
 # 都在里面了。要看全文本来也不该从这儿看:模型自己拿到的也是落盘预览,
@@ -292,27 +292,25 @@ def agent_loop(messages: list, active_request: str, system: str, tools: list,
 	去记终态,两者出自同一次判断。
 
 	ask 是"拿不准的时候问谁",签名 ask(question: str) -> bool。跟 emit 一样
-	必须注入:终端能 input(),浏览器不能 —— 写死一个全局的话,两个前端里
-	总有一个会在运行时卡住(浏览器那个没有 stdin)。它只被 permission_hook
+	必须注入:它得绑在"这一轮那条响应流"上(server.py 的 make_ask),写死一个
+	全局的话,几个会话会互相把问题推到别人的页面上。它只被 permission_hook
 	用,子 agent 传的是"一律拒绝",理由见 tools/subagent.py。
 
 	record 是"这一轮产生了什么",签名 record(kind, role, content)。
 	只发给库的那一份,跟 emit 是两回事:emit 是**给屏幕看的**,会截断、
 	会漏掉没有 seq 的;record 是**存档**,一字不改。所以别想从 events
-	反推原始消息 —— 截断过的东西推不回去。默认是个空函数,终端和子 agent
-	不用记。
+	反推原始消息 —— 截断过的东西推不回去。默认是个空函数,子 agent 不用记。
 
 	每一次 record 都安排在对应的 emit **前面**。这不是顺手:页面读轮次时
 	拿事件游标当分界(turns 接口返回的那个 cursor),反过来的话,卡在
 	两者中间的那次读会既没有这条消息、又已经跳过了它的事件 —— 页面上
 	凭空少一条工具结果,而且刷新也补不回来。
 
-	stream 是"这一轮要不要流式",默认要 —— 两个前端都靠它把字尽早显示出来。
-	子 agent 传 False(见 tools/subagent.py):它的 emit 是终端,而
-	terminal_emit 没有 delta 分支,碎片打进去等于丢掉,所以流式对它唯一的
-	实际影响是**把重试禁掉** —— call_api 里"吐过字就不再重试"那条跟 emit
-	收到什么无关,模型吐第一个字的那一刻起,后面一个 500 或连接超时就没得
-	重试了。
+	stream 是"这一轮要不要流式",默认要 —— 页面靠它把字尽早显示出来。
+	子 agent 传 False(见 tools/subagent.py):它的 emit 是 emit.terminal_emit,
+	而那个没有 delta 分支,碎片打进去等于丢掉,所以流式对它唯一的实际影响是
+	**把重试禁掉** —— call_api 里"吐过字就不再重试"那条跟 emit 收到什么无关,
+	模型吐第一个字的那一刻起,后面一个 500 或连接超时就没得重试了。
 	"""
 	# 放在函数里,不放模块顶上:context 反过来要 `from agent import call_api`
 	# (压缩器第 4 档要调模型),模块级导入就成了环 —— 而 tools 那个包又拽着
@@ -339,16 +337,6 @@ def agent_loop(messages: list, active_request: str, system: str, tools: list,
 				f"round limit of {max_rounds} reached")
 		rounds += 1
 
-		# 发号。**在压缩之前发**:刚追加进来的结果先拿到号,模型下一轮才点得动
-		# 它们 —— 发完号紧接着就是 prepare,这一轮压掉的那些号模型本轮已经看见了。
-		#
-		# 顺序还有一层:**发号必须在压缩之后仍然成立**。号拼在结果正文的尾巴上,
-		# 而下面几档会改写那份正文;改写的地方一旦忘了把号拼回去,号就没了,
-		# 模型点它得到的是"这个号不在上下文里"。第 1 档已经这么处理了
-		# (tool_result_budget 里的 _split_marker),2~4 档现在是注释掉的。
-		context.tag_ids(messages)
-
-		
 		# 发送前压缩。必须赶在 call_api 之前:上一轮的工具结果已经追加
 		# 进来但还没发出去,这时压掉才省得下钱;发完之后再压,钱已经花过。
 		# 位置也只能在这儿 —— 此处 messages 停在完整回合上,切在 tool_use
@@ -356,7 +344,7 @@ def agent_loop(messages: list, active_request: str, system: str, tools: list,
 		#
 		# 切片赋值,不能用 messages = ...。
 		#
-		# messages 是调用方传进来的那个 list 对象(main.py 里的 history),
+		# messages 是调用方传进来的那个 list 对象(server.py 手里的那份),
 		# 而 prepare 内部会构造新列表返回 —— snip_compact / compact_history
 		# 都是。写成 = 的话本地名指向了新列表,调用方那份还停在旧的上面:
 		# 这一回合的 assistant 回复和工具结果全写进了新列表,调用方看不见,
@@ -494,8 +482,26 @@ def agent_loop(messages: list, active_request: str, system: str, tools: list,
 				"tool_use_id": block.id,
 				"content": output,
 			}
+			# **号 = 库里那一行的行号**,由 record 的返回值给(见 sessions.
+			# append_turn_message)。所以"有号"和"查得回来"是同一件事:写不
+			# 进去就没有行号,也就没有号,模型看不见它自然点不动 —— 不会出现
+			# "点了一个查不回来的号"。
+			#
+			# 没接 record 的(子 agent)走 `_drop`,恒返回 None,结果就
+			# 保持原样 —— 它们本来也没有地方能查回来。
+			#
+			# **库里那一行不带号,这是对的。** record 是 json.dumps 的当下快照,
+			# 而号要等它返回行号才知道,所以存下去的那份结尾没有号 —— 无所谓:
+			# 查回来是按行号查,不靠在正文里搜号。上下文里这份带着号就够了,而
+			# 它会被轮末的 save_context 一起存下来,所以接着聊时号还在。
+			#
+			# 号一旦拼上就**不该再被改写**:正文尾巴是它唯一的落脚点,而第
+			# 1~4 档压缩改写正文。第 1 档已经用 _split_marker 摘下来再拼回去,
+			# 2~4 档现在是注释掉的 —— 重开之前每一处都得补同样的处理。
+			row_id = record("tool_result", "user", [result])
+			if row_id is not None:
+				result["content"] = context.stamp_tag(output, f"m{row_id:05d}")
 			results.append(result)
-			record("tool_result", "user", [result])
 			emit({"kind": "tool_result", "name": block.name,
 			      "output": clip_for_event(output)})
 

@@ -1,8 +1,11 @@
 """compress —— 模型自己决定压哪一段。
 
 号段由模型点,摘要由模型写(工具输入就是摘要)。判断切得对不对、以及真正动
-上下文的那两件事都在 context 里(tag_ids / compress_range / bind_messages),
-这个模块只管把工具接上去、把结果这句话转出来。
+上下文的那两件事都在 context 里(compress_range / bind_messages),这个模块
+只管把工具接上去、把结果这句话转出来。
+
+**号是谁发的:** agent_loop 拿落库的行号拼上去的(见 sessions.find_message)。
+不在这儿,也不在 context 里 —— 这条路上只有"读号"和"按号切段"。
 
 当前那份 messages 怎么到 handler 手上,见 context.py 里 _CURRENT_MESSAGES
 那段 —— 总之是 contextvar,不是参数也不是模块级变量。
@@ -24,7 +27,8 @@ compress = ToolDesc(
 	name="compress",
 	description=(
 		"把一段已经干完、后面不会再回头看的活压成一句话。每条工具结果的末尾都"
-		"带着它的号(<message-id token=N>m00007</message-id>),from_id / to_id "
+		"带着它的号,形如 <message-id token=1240>m00007</message-id> —— 号就是 "
+		"m00007 那一段,token= 后面是这次结果的大致花费。from_id / to_id "
 		"就填那个号。\n"
 		"号段两端会自己吸附到完整的回合:你点的是结果,连同产生它的那次调用"
 		"(以及同一次回复里别的结果)一起端走 —— 它们分不开。\n"

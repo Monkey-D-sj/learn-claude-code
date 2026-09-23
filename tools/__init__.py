@@ -7,6 +7,7 @@ from tools.glob import glob
 from tools.grep import grep
 from tools.memory import memory_tool, user_memory_tool
 from tools.read import read_file
+from tools.recall import recall
 from tools.skill import skill
 from tools.subagent import task
 from tools.todo import TodoManager, make_todo_write
@@ -24,9 +25,12 @@ from tools.write import write_file
 # compress 也是"要绑一个东西"的,但绑的那份 messages 是**每轮**都换的(甚至
 # 在同一轮里被压缩改过),没有"造工具的那一刻"可以挂上去 —— 所以它走
 # contextvar,由 agent_loop 在跑 handler 之前 bind,见 tools/compress.py。
+#
+# recall 同理,但它绑的是**这个会话的取回器**(库 + 会话 id + 压缩器),由
+# server.py 跑一轮之前 bind —— 见 tools/recall.py。
 BASE_TOOLS = [
 	bash, read_file, write_file, edit_file, glob, grep, skill, vision,
-	memory_tool, user_memory_tool, task, compress,
+	memory_tool, user_memory_tool, task, compress, recall,
 ]
 
 
@@ -35,9 +39,8 @@ def build_tools(todo: TodoManager, ask_user) -> list[ToolDesc]:
 	两个都由调用方说了算。
 
 	故意都不给默认值。默认值等于把这两个决定藏起来,而它们正是这个函数存在
-	的理由:终端传进程一份清单 + 终端那个提问器(main.py),浏览器传当前会话
-	那一份 + 绑在这一轮那条流上的提问器(server.py),子 agent 传一个新造的
-	+ 一个一律拒答的(tools/subagent.py)。
+	的理由:浏览器传当前会话那一份清单 + 绑在这一轮那条流上的提问器
+	(server.py),子 agent 传一个新造的 + 一个一律拒答的(tools/subagent.py)。
 
 	ask_user 更是一份默认值都编不出来 —— 卡在 input() 上等,浏览器那边会
 	把 HTTP 线程连同会话锁一起挂死;直接返回"没人答",那个前端里 ask 就

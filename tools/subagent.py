@@ -22,9 +22,10 @@ MODEL = "deepseek-flash"
 # 子 agent 建自己那个压缩器 —— 就是为了它的 model 能跟主 agent 不一样。
 # 这也是它不能是模块级单例的原因。
 #
-# emit 走终端,不走调用它的那个前端:子 agent 的定位就是把过程藏起来,
-# 只回一句结论(这正是它省上下文的方式)。它的中间步骤在浏览器里也看不见,
-# 跟终端一致 —— 要让它可见,得让工具的 handler 也能拿到 emit,那是另一件事。
+# emit 走 emit.terminal_emit —— 也就是**打到服务进程的 stdout 上**,不走
+# 调用它的那个页面:子 agent 的定位就是把过程藏起来,只回一句结论(这正是
+# 它省上下文的方式)。要让它显在页面上,得让工具的 handler 也能拿到 emit,
+# 那是另一件事。
 COMPACTOR = ContextCompactor(client, MODEL, TRANSCRIPT_DIR, TOOL_RESULTS_DIR,
                              terminal_emit)
 
@@ -36,9 +37,9 @@ def _deny_all(question: str) -> bool:
 
 	  1. 子 agent 的定位就是"没人能回答问题"(见上面 SYSTEM),给它开一个
 	     交互通道等于把自己那句设定推翻;
-	  2. 它跑在调用它的那个前端的线程里。父 agent 在浏览器里时,这儿要是
-	     走终端的 input(),卡住的是 server.py 的 HTTP 线程 —— 而那个会话
-	     的那把锁还攥着,页面那边只会看到一直转圈。
+	  2. 它跑在调用它的那个前端的线程里。这儿要是走 input(),卡住的是
+	     server.py 的 HTTP 线程 —— 而那个会话的那把锁还攥着,页面那边
+	     只会看到一直转圈。
 
 	所以越界的调用直接拒掉,理由(字符串)交回模型,让它自己绕路。
 	"""
@@ -79,7 +80,16 @@ def run_task(prompt: str) -> str:
 	# ask 排除,理由跟 _deny_all 是同一个:上面 SYSTEM 头一句就是"nobody can
 	# answer questions"。给它一个能问的工具,等于同时推翻那句设定和 _deny_all
 	# 存在的理由。
-	_DENIED = ("task", "memory", "user_memory", "ask")
+	#
+	# 压缩那对(compress / recall)排除:**它们都以"号"为抓手,而子 agent 发不
+	# 出号** —— 它的 record 是 `_drop`,落库那一步根本不发生,也就没有行号可
+	# 当号用。给它等于给一个点了没反应的工具:compress 会回"号不在上下文里",
+	# recall 会回"这个前端没有会话库",两句都是假话(真相是它自己没号)。
+	#
+	# 代价说清楚:子 agent 的上下文只能靠那几档自动压缩收。可以接受 —— 它的
+	# 定位就是"干完报结论、上下文随用随弃",而它交回来的那句话才是主 agent
+	# 要的东西。
+	_DENIED = ("task", "memory", "user_memory", "ask", "compress", "recall")
 	sub_tools = [
 		t for t in build_tools(TodoManager(), _nobody_to_ask)
 		if t.name not in _DENIED
@@ -103,7 +113,7 @@ def run_task(prompt: str) -> str:
 			ask=_deny_all,
 			emit=terminal_emit,
 			# 不走流式。terminal_emit 没有 delta 分支,碎片打进去等于丢掉 ——
-			# 对终端一点好处没有,代价却是**把重试禁掉**:call_api 里"吐过字就
+			# 对谁都没好处,代价却是**把重试禁掉**:call_api 里"吐过字就
 			# 不再重试"那条与 emit 收到什么无关,吐出第一个字之后再来个 500 或
 			# 连接超时,这一轮就只能整个失败交回主 agent。
 			stream=False,

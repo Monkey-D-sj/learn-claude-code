@@ -71,6 +71,7 @@ from hooks import trigger_hooks
 from sessions import DB_PATH, SessionStore, TurnStateConflict
 from tools import build_tools
 from tools.memory import load_memory
+from tools.recall import bind_recall, make_recall
 from tools.todo import TodoManager
 import usage
 
@@ -263,10 +264,14 @@ def make_recorder(turn_id: str):
 
 	message_no 从 2 开始:1 是用户那条,建轮的时候已经写进去了(begin_turn)。
 	号是内存里数的,写失败会留下空号 —— 允许,这一版明确不重编号。
+
+	**返回值必须原样交出去。** 它就是那一行的行号,而循环拿它当号拼在结果
+	正文的尾巴上(tools/recall.py 按这个号查回原文)。吞掉它的话号发不出来
+	—— 表现是模型看不见任何号、compress 和 recall 一起变成哑的,而且不报错。
 	"""
 	counter = count(2)
-	def record(kind: str, role: str, content) -> None:
-		STORE.append_turn_message(turn_id, next(counter), kind, role, content)
+	def record(kind: str, role: str, content) -> int | None:
+		return STORE.append_turn_message(turn_id, next(counter), kind, role, content)
 	return record
 
 
@@ -543,12 +548,13 @@ class Handler(BaseHTTPRequestHandler):
 		# 整份账本读一遍(read_session),不是每轮读一遍:结果一样,后者把
 		# 同一个文件读 N 遍,而 N 随会话长度涨。
 		#
-		# 发的是**渲染好的那一行**,跟终端打的是同一个 turn_line。金额和命中率
-		# 的规矩(None 和 0 不同、币种跟着记录走、命中率的分母是输入总量)写
-		# 两遍就会漂,而漂了不报错 —— 只是页面上的数和屏幕上的数不一样。
+		# 发的是**渲染好的那一行**(usage.turn_line),不是几个裸数字让页面自己
+		# 拼。金额和命中率的规矩(None 和 0 不同、币种跟着记录走、命中率的分母
+		# 是输入总量)写两遍就会漂,而漂了不报错 —— 只是页面上的数和报表上的数
+		# 不一样。
 		ledger = usage.read_session(sid)
 		for turn in payload["turns"]:
-			turn["usage"] = usage.turn_line(ledger.get(turn["id"], []), prefix="")
+			turn["usage"] = usage.turn_line(ledger.get(turn["id"], []))
 
 		# 挂起中的问题要一起给。它是**唯一**没法从库里重建的东西:ask 不是
 		# 一条消息,库里没有它,而页面拿到的 cursor 已经越过它那条事件了 ——
@@ -856,23 +862,30 @@ class Handler(BaseHTTPRequestHandler):
 			# 归属:这一轮里所有的 API 调用都带上 session / turn。压缩器和 vision
 			# 都在这一层里面,所以它们自动跟着 —— 传参是传不到工具 handler 里的
 			# (agent_loop 只给 handler 传 **block.input)。
+			#
+			# recall 那个工具同理:它得查"本会话"的库,还要按预览那套渲染,两样
+			# 都是 handler 够不着的东西 —— 所以绑一层环境递进去。压缩器先拿出来,
+			# 是因为取回器要用它渲染(大块原文落盘 + 头尾预览),跟外面这个
+			# 是同一个实例。
+			compactor = make_compactor(silent)
 			with usage.span(session=sid, turn=turn["id"]):
-				outcome = agent_loop(history,
-				                     active_request=query,
-				                     system=build_system(*memories),
-				                     tools=build_tools(
-					                         todo_for(sid),
-					                         # 提问器绑在这一轮这条流上,所以每轮现造。
-					                         # 跟 ask= 那份不同:那个的答案是是/否
-					                         # (权限),这个是一段文字(模型提问)。
-					                         make_ask_text(emit, sid, turn["id"])),
-				                     model=MODEL,
-				                     max_rounds=MAX_ROUNDS,
-				                     compactor=make_compactor(silent),
-				                     ask=make_ask(emit, sid, turn["id"], record),
-				                     emit=silent,
-				                     record=record,
-				                     checkpoint=lambda messages: self._checkpoint(sid, messages, emit))
+				with bind_recall(make_recall(STORE, sid, compactor)):
+					outcome = agent_loop(history,
+					                     active_request=query,
+					                     system=build_system(*memories),
+					                     tools=build_tools(
+						                         todo_for(sid),
+						                         # 提问器绑在这一轮这条流上,所以每轮现造。
+						                         # 跟 ask= 那份不同:那个的答案是是/否
+						                         # (权限),这个是一段文字(模型提问)。
+						                         make_ask_text(emit, sid, turn["id"])),
+					                     model=MODEL,
+					                     max_rounds=MAX_ROUNDS,
+					                     compactor=compactor,
+					                     ask=make_ask(emit, sid, turn["id"], record),
+					                     emit=silent,
+					                     record=record,
+					                     checkpoint=lambda messages: self._checkpoint(sid, messages, emit))
 		except Exception as e:
 			# 兜底:异常不该把 history 一起带走,也不该让流断在半截
 			# 而没有下文 —— 前端会一直转圈。这一轮记 failed。
@@ -924,7 +937,7 @@ class Handler(BaseHTTPRequestHandler):
 		                    "model_status": outcome.status,
 		                    "saved": saved, "save_error": save_error,
 		                    "usage": usage.turn_line(
-			                    usage.read_turn(sid, turn["id"]), prefix="")})
+			                    usage.read_turn(sid, turn["id"]))})
 
 	def _checkpoint(self, sid: str, messages: list, emit) -> None:
 		"""压缩器压过之后存一个上下文检查点。
@@ -942,8 +955,8 @@ class Handler(BaseHTTPRequestHandler):
 			                            f"{type(e).__name__}: {e}"})
 
 	def log_message(self, fmt, *args):
-		# 默认实现往 stderr 打一行每个请求。前端本来就是终端,不需要它
-		# 再复述一遍。
+		# 默认实现往 stderr 打一行每个请求。这个服务是本机自用的,前端
+		# 就在同一个终端里跑,不需要它再复述一遍。
 		pass
 
 

@@ -29,19 +29,21 @@ from pathlib import Path
 from config import USAGE_PATH
 
 # 账本的**定义和算法**都从写的那一头借过来,不在这儿再抄一份:
-#   COUNTERS   哪些计数器
-#   summarize  怎么加总
-#   hit_rate   命中率的分母是什么
-#   money      金额怎么渲染(含币种)
+#   COUNTERS       哪些计数器
+#   summarize      怎么加总
+#   hit_rate       命中率的分母是什么
+#   money          金额怎么渲染(含币种)
+#   is_main_loop   哪些记录算主循环 —— 命中率曲线和页面那栏"上下文"用的是
+#                  同一条规矩,原来写在这儿,现在跟其它几条住一起
 #
 # 抄一份的代价:某天加了计数器、或者改了某个口径,usage.py 改了、这儿没改 ——
 # 报表少算一栏、数字偏低。**而这不会报错**,只是数字变小了。同一个定义写两遍、
 # 漂了不报错,是这个仓库反复在防的事。
 #
-# 终端那边(usage.turn_line)用的是同一批函数,所以屏幕上那句小结和这份报表
+# 页面上那行小结(usage.turn_line)用的是同一批函数,所以它和这份报表
 # 必然一致 —— 不一致的可能性从"会不会漂"变成了"不可能"。
 from pricing import tier_at
-from usage import COUNTERS, hit_rate, money, summarize
+from usage import COUNTERS, hit_rate, is_main_loop, money, summarize
 
 
 def load(path: Path) -> tuple[list[dict], int]:
@@ -59,28 +61,6 @@ def load(path: Path) -> tuple[list[dict], int]:
 		except ValueError:
 			broken += 1
 	return records, broken
-
-
-def is_main_loop(record: dict) -> bool:
-	"""这一条算不算**主 agent 的主循环**那次调用。曲线只认这个。
-
-	两个条件缺一不可,而且第二个是踩过的坑:
-
-	  purpose == "main"
-	      压缩那次是 "compaction",本来就分开。它拿的是完整上下文、另一个
-	      system,混进曲线毫无意义。
-
-	  agent == "main"
-	      **子 agent 的 purpose 也是 "main"** —— 它复用 agent_loop,拿的是
-	      默认值。但它有另一个上下文窗口、另一个 system,它的命中率跟主循环
-	      的缓存行为没有任何关系。混进来会把主循环的数字往上拉,而这条曲线
-	      的全部意义就是看主循环那个数字。
-
-	漏掉第二个条件的表现:t3 那行显示 33.6%,而主循环自己那一次是 5.7%
-	—— 差的正好是子 agent 的 4,000 个命中。不报错,只是这条曲线从此答不了
-	它唯一要回答的问题。
-	"""
-	return record.get("purpose") == "main" and record.get("agent") == "main"
 
 
 def _table(headers: tuple, rows: list[tuple]) -> str:
@@ -110,7 +90,7 @@ def main() -> None:
 	path = Path(sys.argv[1]) if len(sys.argv) > 1 else USAGE_PATH
 	if not path.exists():
 		print(f"没有账本:{path}")
-		print("跑一轮就有了 —— 终端 python main.py,或者浏览器 python server.py。")
+		print("跑一轮就有了 —— 跑一次 python server.py,在页面上聊几句。")
 		return
 
 	records, broken = load(path)

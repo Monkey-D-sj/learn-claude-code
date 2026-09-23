@@ -145,9 +145,6 @@ def _count_tokens(text: str) -> int:
 # 端点直接 400)。结果那条没这问题:结果本来就是它那条消息的末块。
 
 _MARKER_RE = re.compile(r"\n*<message-id token=(\d+)>(m\d{5,})</message-id>\s*$")
-# 压过的号段长这样。它记的是一段,不是一次调用,所以它自己不带号。
-# 两个捕获组是发号要用的:压过的段那些号**不能再发一遍**,见 tag_ids。
-_SUMMARY_RE = re.compile(r"^\[m(\d{5,})-m(\d{5,})\] 摘要[:：]")
 _TAG_NUMBER_RE = re.compile(r"^m(\d{5,})$")
 
 
@@ -160,6 +157,34 @@ def _split_marker(text: str) -> tuple[str, str]:
 	if not match:
 		return text, ""
 	return text[:match.start()].rstrip(), text[match.start():]
+
+
+def tag_number(value) -> int | None:
+	"""号里的数字;不是一个号就给 None。
+
+	给"这个字符串能不能当号用"用。compress 和 recall 两处都要这一条判断 ——
+	写在两边的话,某天号的写法变了(位数、前缀),只有一处跟着改。
+	"""
+	match = _TAG_NUMBER_RE.match(value or "")
+	return int(match.group(1)) if match else None
+
+
+def stamp_tag(content: str, tag: str) -> str:
+	"""把号拼到这条结果的尾巴上,返回新的正文。
+
+	**为什么拼在正文里**(而不是挂个字段):它得活过存库、读回、被压缩改写三件事。
+	挂在外面的字段过一遍 json.dumps 就没了 —— 而号一旦丢失或错位,模型点的那段
+	跟它以为的那段就不是同一段,还不报错。
+
+	token= 是这条正文的估算,给模型"值不值得压"参考,不是账。算在这儿、只算一次:
+	每轮重算就会改内容、改前缀,prompt cache 每轮冲一次。
+
+	**号由调用方给**,不是这儿数的。现在是 sessions.db 里那一行的行号(见
+	tools/recall.py),于是"有号"就等于"这一段查得回来" —— 写不进去的结果没有
+	行号,也就没有号,模型看不见它自然点不动。
+	"""
+	return (content + f"\n\n<message-id token={_count_tokens(content)}>"
+	                  f"{tag}</message-id>")
 
 
 def result_tag(block) -> str | None:
@@ -185,46 +210,6 @@ def message_tags(message) -> list[str]:
 		return []
 	return [tag for tag in (result_tag(block) for block in content) if tag]
 
-
-def tag_ids(messages: list) -> int:
-	"""给还没有号的结果发号,返回这次发了几个。**每轮发之前都得先跑它。**
-
-	幂等是命根子。号是给模型记的:它上一轮说"压 m00003-m00010"。重发一遍号,
-	那些号就落到别的结果身上了 —— 模型压掉的是它没打算压的那段,而且不报错。
-
-	**接着最大号发,而且"到过的最大号"也算数。** 只看现在还剩哪些号的话,一段被
-	压掉之后水位就退回去,下一条新结果会拿到刚被压掉那个号:摘要那行写着
-	[m00002-m00005],而新结果也叫 m00002,模型再点它指到的就是别的东西了。
-	(真跑一轮撞上过。)
-
-	**token= 是这个结果正文的估算,只算一次,之后不动。** 每轮重算就会改内容、
-	改前缀,prompt cache 每轮冲一次 —— 而这个数是给模型"值不值得压"参考的,
-	不是账。
-	"""
-	next_no = 0
-	for message in messages:
-		for tag in message_tags(message):
-			next_no = max(next_no, int(tag[1:]))
-		match = _SUMMARY_RE.match(_first_text(message) or "")
-		if match:
-			next_no = max(next_no, int(match.group(2)[1:]))
-
-	count = 0
-	for message in messages:
-		content = message.get("content")
-		if not isinstance(content, list):
-			continue
-		for block in content:
-			if not isinstance(block, dict) or _block_type(block) != "tool_result":
-				continue
-			body = block.get("content")
-			if not isinstance(body, str) or result_tag(block) is not None:
-				continue
-			next_no += 1
-			block["content"] = (body + f"\n\n<message-id token={_count_tokens(body)}>"
-			                           f"m{next_no:05d}</message-id>")
-			count += 1
-	return count
 
 # "当前这份 messages"。给 compress 那个工具用的 —— handler 只拿得到
 # **block.input(agent.py 那行是有意写死的:handler 够不着前端、够不着会话),
@@ -256,16 +241,6 @@ class bind_messages:
 def current_messages() -> list | None:
 	"""当前这份 messages。不在 agent 循环里跑的时候是 None。"""
 	return _CURRENT_MESSAGES.get()
-
-
-def _first_text(message) -> str | None:
-	"""这条消息开头的文字。给"是不是一条摘要"那种判断用。"""
-	content = message.get("content")
-	if isinstance(content, str):
-		return content
-	if isinstance(content, list) and content and _block_type(content[0]) == "text":
-		return _block_field(content[0], "text") or ""
-	return None
 
 
 def _pairing_problem(span: list) -> str | None:
@@ -333,7 +308,7 @@ def compress_range(messages: list, start: str, end: str, summary: str) -> str:
 	一天写坏了,这里是最后一道 —— 真发出去就是 400,而 400 在 agent_loop 里被
 	收成"这一轮失败",模型连这句话都看不到。
 	"""
-	if _TAG_NUMBER_RE.match(start or "") is None or _TAG_NUMBER_RE.match(end or "") is None:
+	if tag_number(start) is None or tag_number(end) is None:
 		return "切得不对:号得写成 m00007 这样(字母 m + 五位数字)。"
 	if not summary.strip():
 		return "切得不对:摘要不能是空的 —— 将来只剩这句话,它得能顶替那一段。"
@@ -517,7 +492,7 @@ class ContextCompactor:
 		# emit 也在这儿,不在 prepare() 的参数里:压缩的日志散在 snip /
 		# micro / fit / budget / compact 五个方法深处,一路当参数传下去
 		# 太吵。代价是它跟着对象走 —— 一个压缩器只能对着一块屏幕说话。
-		# 单会话够用(main.py 和 server.py 各建自己那个)。
+		# 一个压缩器只能对着一块屏幕说话,所以按前端/按 agent 各建一份。
 		self.client = llm_client
 		self.model = model
 		self.transcript_dir = transcript_dir
@@ -998,7 +973,7 @@ class ContextCompactor:
 		走 call_api 而不是直接 self.client.messages.create:直接调就绕过了
 		重试,而这是整个循环里最经不起失败的一次调用 —— 它在 prepare 里、
 		在 try 之外,一次 429 会把这一整轮的工作全掀掉,异常一路穿到
-		main.py 的兜底 except。重试策略只由 call_api 一处掌握。
+		server.py 的兜底 except。重试策略只由 call_api 一处掌握。
 		"""
 		response = call_api(
 			self.client,
@@ -1028,7 +1003,7 @@ class ContextCompactor:
 	def summary_message(label: str, request: str, summary: str, transcript: Path) -> dict:
 		"""把摘要打包成一条 user 消息 —— 压缩后整个对话就只剩这一条。
 
-		标签名(Current user request / Conversation summary)跟 main.py 的
+		标签名(Current user request / Conversation summary)跟 app.py 的
 		SYSTEM 里写的必须一致,改一处就得改两处。SYSTEM 就是靠这两个标签
 		告诉模型"哪个是要执行的任务、哪个只是资料"的。
 

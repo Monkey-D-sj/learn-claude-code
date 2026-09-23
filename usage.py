@@ -110,7 +110,7 @@ def total_input(counts: dict) -> int | None:
 
 
 def summarize(records: list[dict]) -> dict:
-	"""把一批记录加成一行。报表的每一段和终端那句小结都走这儿。
+	"""把一批记录加成一行。报表的每一段和轮次小结都走这儿。
 
 	**同一个口径只能写一遍。** 两处各写一遍的话会漂,而漂了不报错 —— 只是
 	报表上那个数和屏幕上那个数不一样,你还得先决定信哪个。
@@ -199,7 +199,7 @@ def _read_records() -> list[dict]:
 
 
 def read_turn(session: str, turn) -> list[dict]:
-	"""把某一轮已经落盘的记录捞回来。给终端做一行小结用。
+	"""把某一轮已经落盘的记录捞回来。给某一轮做那一行小结用。
 
 	**从文件读,不在内存里另攒一份。** 账本是唯一真源;攒一份的话"屏幕上显示的"
 	和"账上记的"就成了两份,而它们漂了不报错 —— 屏幕上少一行,账上一条不少。
@@ -229,24 +229,78 @@ def read_session(session: str) -> dict:
 	return grouped
 
 
-def turn_line(records: list[dict], prefix: str = "[本轮] ") -> str | None:
+def is_main_loop(record: dict) -> bool:
+	"""这一条算不算**主 agent 的主循环**那次调用。
+
+	两个条件缺一不可,而且第二个是踩过的坑:
+
+	  purpose == "main"
+	      压缩那次是 "compaction",本来就分开。它拿的是完整上下文、另一个
+	      system,混进来毫无意义。
+
+	  agent == "main"
+	      **子 agent 的 purpose 也是 "main"** —— 它复用 agent_loop,拿的是
+	      默认值。但它有另一个上下文窗口、另一个 system,跟主循环的缓存行为
+	      没有任何关系。混进来会把主循环的数字往上拉,而这条曲线(和
+	      context_size 那个数)要的全是主循环自己的数字。
+
+	原来住在 report.py(命中率曲线只认它)。搬过来是因为 turn_line 现在也要
+	用同一条规矩 —— 抄第二份的代价是某天改了一处、另一处没改,表现为"页面上
+	那个数和报表上那个数不一样",不报错。report.py 照旧 import 这个名字。
+	"""
+	return record.get("purpose") == "main" and record.get("agent") == "main"
+
+
+def context_size(records: list[dict]) -> int | None:
+	"""这一轮跑完时**上下文有多大** —— 末次主循环调用的输入总量。
+
+	**跟 turn_line 里那个"输入"不是一个东西,这个函数存在的理由就是这个。**
+	那个是这一轮所有调用的**求和**:每次调用都要把整段历史重发一遍,于是
+	35 次调用的那一轮报 591,639,而那一刻上下文其实只有 27,693。求和回答的
+	是"这一轮按全价买了多少输入",不是"上下文多大"。
+
+	取**末次**而不是最大:压缩会让上下文变小,最大值是"这一轮曾经多大",而
+	看这一栏的人想知道的是"现在多大、下一轮还要发出去多少"。
+
+	只认主循环那次调用(见 is_main_loop):摘要和 vision 都是另开的一份小上下
+	文(实测那次 vision 只有 637),子 agent 同理 —— 拿它们当"当前上下文"会
+	报出一个跟主循环毫无关系的数,而且不报错,只是这一栏从此不可信。
+
+	一条主循环记录都没有时返回 None:此刻谈不上"上下文多大",不是兜底。
+	"""
+	for record in reversed(records):
+		if is_main_loop(record):
+			return record.get("total_input_tokens")
+	return None
+
+
+def turn_line(records: list[dict]) -> str | None:
 	"""每跑完一轮打的那一行。没有记录时返回 None(什么都不打)。
 
 	**钱只在算得出来的时候显示。** 价目表没填时打一个 "$0" 是最坏的选择 ——
 	那句话的意思是"这一轮没花钱"。不显示比显示错的强。
 
-	prefix 给浏览器留的:页面里那一行在轮次框内部,"[本轮]" 是终端才需要的
-	指代。格式化本身只写一遍 —— money/hit_rate 那几条规矩(None 和 0 不同、
-	币种跟着记录走、命中率的分母是输入总量)不可能在 JS 里再写对一次。
+	格式化本身只写一遍 —— money/hit_rate 那几条规矩(None 和 0 不同、币种跟着
+	记录走、命中率的分母是输入总量)不可能在 JS 里再写对一次。原来还有个
+	`prefix` 参数:终端要 "[本轮] " 这个指代、页面在轮次框内部不要。终端那个
+	前端删掉之后就只剩一个调用方,参数跟着去了。
+
+	**"输入"和"上下文"是两栏,不能并成一栏。** 前者是这一轮所有调用的求和,
+	后者是跑完时上下文的大小(见 context_size)。并起来的话,一个 35 次调用的
+	轮次看起来就像"上一轮没被加进来",而它其实被重发了 35 遍。
 	"""
 	row = summarize(records)
 	if not row["calls"]:
 		return None
-	line = (f"{prefix}{row['calls']} 次调用 · "
+	line = (f"{row['calls']} 次调用 · "
 	        f"输入 {row['total_input']:,}"
-	        f"(命中 {row['cache_read_input_tokens']:,} / {hit_rate(row)}) · "
-	        f"输出 {row['output_tokens']:,} · "
-	        f"{row['elapsed_ms'] / 1000:.1f}s")
+	        f"(命中 {row['cache_read_input_tokens']:,} / {hit_rate(row)}) · ")
+	# 拿不到就整栏不显示,不填 0:0 的意思是"上下文是空的",那是另一回事。
+	context = context_size(records)
+	if context is not None:
+		line += f"上下文 {context:,} · "
+	line += (f"输出 {row['output_tokens']:,} · "
+	         f"{row['elapsed_ms'] / 1000:.1f}s")
 	if row["cost"] is not None:
 		line += f" · {money(row['cost'], row['currency'])}"
 	return line

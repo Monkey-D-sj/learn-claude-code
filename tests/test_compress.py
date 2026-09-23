@@ -1,11 +1,15 @@
-"""模型自己压:号怎么发、号段怎么切、切错了怎么办。
+"""模型自己压:号怎么拼、号段怎么切、切错了怎么办。
 
 两条路分开测:
-  发号      context.tag_ids —— 幂等是命根子(见它自己的说明)
+  拼号      context.stamp_tag —— 拼在正文尾巴上,存库读回还认得
   切号段    context.compress_range —— 切错了**什么都不动**并回一句话
 
 工具那一层(tools/compress.py)只做"把当前的 messages 找出来、把结果转成一句话",
 所以真正要钉住的判断都在这儿。
+
+**号从哪儿来不归这儿管。** 现在是库里那一行的行号(agent.py 拿 record 的返回
+值拼上去,见 tests/test_recall.py);这里的 `stamp` 只是个凑号的替身,给号段
+那些用例当 setup 用。
 
 **号 = 一次工具调用,拼在它那条结果的末尾。** assistant 那边不挂号:那种消息
 经常一个字正文都没有,而且带 tool_use 时必须以 tool_use 收尾,号拼不上去
@@ -43,67 +47,61 @@ def result_of(message) -> dict:
 
 # ---------------------------------------------------------------- 发号
 
-def test_tag_ids_are_sequential_and_idempotent():
-	"""跑两遍号不变 —— 这条是命根子。
-
-	号是给模型记的:它上一轮说"压 m00003-m00010"。这一轮要是重新发一遍号,那些
-	号就落到别的结果身上了 —— 模型压掉的是它没打算压的那段,而且不报错。
-	"""
-	msgs = [msg("user", "问题")] + tool_round(1) + tool_round(2)
-	context.tag_ids(msgs)
-	assert tags(msgs) == [[], [], ["m00001"], [], ["m00002"]]
-
-	context.tag_ids(msgs)
-	assert tags(msgs) == [[], [], ["m00001"], [], ["m00002"]], "第二遍不该动任何一个号"
-
-	msgs += tool_round(3)
-	context.tag_ids(msgs)
-	assert tags(msgs)[-1] == ["m00003"], "新来的接着往后发"
-
-
-def test_tag_ids_ride_on_the_result_text_to_survive_serialization():
+def test_stamp_tag_拼在正文尾巴上_存库读回还认得():
 	"""号拼在结果正文的尾巴上,不是挂在消息外头。
 
 	它得活过三件事:存进 turn_messages 的 content_json、读回来、被压缩改写。
 	只有正文活得过这三样 —— 挂在外面的字段过一遍 json.dumps 就没了。
+
+	(号本身从哪儿来不归它管:现在是库里那一行的行号,见 sessions.find_message。
+	这个函数只管"把事情办成正文尾巴上那一段"。)
 	"""
-	msgs = [msg("user", "问题"), *tool_round(1, result="hi")]
-	context.tag_ids(msgs)
-	content = result_of(msgs[2])["content"]
+	content = context.stamp_tag("hi", "m00027")
 	assert content.startswith("hi"), "工具输出还是开头,一个字节没动"
-	assert "<message-id token=" in content and content.endswith(">m00001</message-id>")
+	assert "<message-id token=" in content and content.endswith(">m00027</message-id>")
 
-	reloaded = json.loads(json.dumps(msgs))
-	assert context.result_tag(result_of(reloaded[2])) == "m00001", "存库读回还认得"
+	reloaded = json.loads(json.dumps(
+		[{"role": "user", "content": [
+			{"type": "tool_result", "tool_use_id": "t1", "content": content}]}]))
+	assert context.result_tag(reloaded[0]["content"][0]) == "m00027", "存库读回还认得"
 
 
-def test_the_marker_carries_the_size_of_that_result():
+def test_stamp_tag_带上这条结果多大():
 	"""号上带着这条结果多大 —— 模型拿它判断"值不值得压"。
 
-	token= 只是它那个工具调用的结果正文,不是整条消息、也不是整段上下文。
+	token= 只是它那次工具调用的结果正文,不是整条消息、也不是整段上下文。
 	"""
-	small, big = tool_round(1, result="x" * 40), tool_round(2, result="x" * 4000)
-	msgs = [msg("user", "问题"), *small, *big]
-	context.tag_ids(msgs)
-	small_n = int(context._MARKER_RE.search(result_of(msgs[2])["content"]).group(1))
-	big_n = int(context._MARKER_RE.search(result_of(msgs[4])["content"]).group(1))
+	small = context.stamp_tag("x" * 40, "m00001")
+	big = context.stamp_tag("x" * 4000, "m00002")
+	small_n = int(context._MARKER_RE.search(small).group(1))
+	big_n = int(context._MARKER_RE.search(big).group(1))
 	assert big_n > small_n * 10, f"4 千字符该比 40 字符大一个量级:{big_n} vs {small_n}"
 
 
-def test_the_counter_never_goes_backwards_after_a_compression():
-	"""压完之后号不许回退。
+def stamp(msgs: list) -> None:
+	"""给还没号的结果补一个号 —— 测试里代替 agent 循环那一步。
 
-	一段被压掉,那些号就从上下文里消失了 —— 只看"现在还剩哪些号"的话,下一条
-	新结果会拿到刚被压掉那个号:摘要那行写着 [m00001-m00002],而新结果也叫
-	m00001,模型再点它指到的就是别的东西,不报错。真跑一轮撞上了。
+	**真号是库里那一行的行号**:agent.py 拿 record 的返回值拼上去,见
+	tests/test_recall.py 和 sessions.find_message。号段这一侧的测试不关心
+	号从哪儿来,只关心"正文尾巴上有个不重样的号、两端的吸附按它算",所以
+	这儿拿序号凑一个就够。
+
+	**不复刻"水位只增不减"。** 那套逻辑原来住在 context.tag_ids 里,是为了
+	在没有库 id 的时候模拟"号不许回退"—— 现在由 turn_messages.id 负责,
+	测试落在 test_sessions.py(行号只增不减)和 test_recall.py(每个结果各得
+	一个号)。这儿从 1 数到底,只在这份测试数据里成立。
 	"""
-	msgs = [msg("user", "问题")] + tool_round(1) + tool_round(2)
-	context.tag_ids(msgs)
-	context.compress_range(msgs, "m00001", "m00002", "前两步查完了")
-	msgs += tool_round(3)
-
-	context.tag_ids(msgs)
-	assert tags(msgs)[-1] == ["m00003"], f"该接着 m00002 往后发:{tags(msgs)}"
+	n = 0
+	for message in msgs:
+		content = message.get("content")
+		if not isinstance(content, list):
+			continue
+		for block in content:
+			if isinstance(block, dict) and block.get("type") == "tool_result" \
+			        and context.result_tag(block) is None:
+				n += 1
+				block["content"] = context.stamp_tag(
+					str(block.get("content", "")), f"m{n:05d}")
 
 
 # ---------------------------------------------------------------- 切号段
@@ -113,7 +111,7 @@ def test_compress_range_swaps_the_whole_round_for_one_summary():
 	msgs = [msg("user", "问题")]
 	for i in range(1, 4):
 		msgs += tool_round(i)
-	context.tag_ids(msgs)
+	stamp(msgs)
 	# 1 条 user + 3 轮 × 2 条 = 7 条
 	assert len(msgs) == 7
 
@@ -135,7 +133,7 @@ def test_a_range_that_starts_mid_round_drags_its_call_in():
 	模型连这句话都看不到。
 	"""
 	msgs = [msg("user", "问题")] + tool_round(1) + tool_round(2)
-	context.tag_ids(msgs)
+	stamp(msgs)
 
 	out = context.compress_range(msgs, "m00001", "m00002", "两轮都压掉")
 	assert "已压缩" in out
@@ -160,7 +158,7 @@ def test_a_round_with_two_calls_is_taken_as_a_whole():
 			{"type": "tool_result", "tool_use_id": "b", "content": "第二条"}]},
 	]
 	msgs = [msg("user", "问题"), *both]
-	context.tag_ids(msgs)
+	stamp(msgs)
 	assert tags(msgs) == [[], [], ["m00001", "m00002"]]
 
 	out = context.compress_range(msgs, "m00001", "m00001", "只压第一条")
@@ -172,7 +170,7 @@ def test_a_round_with_two_calls_is_taken_as_a_whole():
 def test_compress_range_refuses_ids_that_are_not_there():
 	"""号不在上下文里(压过了、或者压根没发过):回话,不动。"""
 	msgs = [msg("user", "问题")] + tool_round(1)
-	context.tag_ids(msgs)
+	stamp(msgs)
 
 	out = context.compress_range(msgs, "m00040", "m00042", "不存在的号")
 	assert "切得不对" in out
@@ -186,7 +184,7 @@ def test_compress_range_refuses_backwards_and_malformed_ranges():
 	是它需要听一句人话。每一次都该什么都不动。
 	"""
 	msgs = [msg("user", "问题")] + tool_round(1) + tool_round(2)
-	context.tag_ids(msgs)
+	stamp(msgs)
 	before = len(msgs)
 
 	for start, end, why in (("m00002", "m00001", "反的"),
@@ -216,7 +214,7 @@ def test_pairing_check_understands_sdk_blocks_not_just_dicts():
 		{"role": "user", "content": [
 			{"type": "tool_result", "tool_use_id": "t1", "content": "输出"}]},
 	]
-	context.tag_ids(msgs)
+	stamp(msgs)
 	out = context.compress_range(msgs, "m00001", "m00001", "查了一下环境")
 	assert "已压缩" in out, f"两副形状的配对该认出来,实际:{out!r}"
 	assert len(msgs) == 2

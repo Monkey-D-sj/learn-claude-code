@@ -1,24 +1,22 @@
-"""ask 工具的特征化测试:工具逻辑、三个前端的接线、以及那条挂起/回答的通道。
+"""ask 工具的特征化测试:工具逻辑、接线、以及那条挂起/回答的通道。
 
-盯六件事:
+盯五件事:
 
-  一、回答**原样**交回模型 —— 不管它是点按钮来的、敲进去的、还是终端里
-     用序号点的。序号只活在本地,过不去这道线
-  二、`None` 和 `""` 是两件事:`None` 是"没人答上"(超时 / 页面关了 / 终端
-     EOF),`""` 是一句(空的)回答。抹平了的话,模型分不出"人不在"和
+  一、回答**原样**交回模型 —— 不管它是点按钮来的还是敲进去的。
+  二、`None` 和 `""` 是两件事:`None` 是"没人答上"(超时 / 页面关了),
+     `""` 是一句(空的)回答。抹平了的话,模型分不出"人不在"和
      "人没说话",而它该做的下一步完全不同
   三、选项的闸:压成一行、去空、封顶 6 个
   四、**每轮现造**:ask 的 handler 绑着"这一轮的问题往哪条流上问",两次
      build 拿到同一个 ToolDesc 的话,第二个会话的问题会推到第一个会话的
      页面上去 —— 而两边都不报错
-  五、子 agent 拿不到(它的 SYSTEM 头一句就是"nobody can answer questions")
-  六、服务端那条通道:事件带 mode/options、回答写回槽、断流当场算没人答上
+  五、子 agent 拿不到(它的 SYSTEM 头一句就是"nobody can answer questions"),
+     以及服务端那条通道:事件带 mode/options、回答写回槽、断流当场算没人答上
      (不是干等满 300 秒)
 
 跑法: uv run pytest
 """
 
-import builtins
 import importlib
 import inspect
 import threading
@@ -64,7 +62,7 @@ def test_问题两端空白削掉(asked):
 
 
 def test_选中的选项原文交回_不是下标(asked):
-	"""按钮和终端序号都得在**到这儿之前**换成原文。
+	"""页面按钮上的字得在**到这儿之前**换成原文,不能递下标过来。
 
 	下标是两边各存一半的约定:模型收到的若是 "2",它得知道那是哪个列表的
 	第 2 项 —— 而那个列表在它的 tool_use 里、在页面的事件里、在这个函数的
@@ -78,9 +76,8 @@ def test_选中的选项原文交回_不是下标(asked):
 def test_空回答不是没人答上(asked):
 	""""" 是一句回答,None 是没人在。两者都得能到这儿的出口。
 
-	(现在两个前端都不会给出 "" —— 服务端在 /answer 就拒了,终端把空行当
-	没人答上。留着这条是因为**这道区分是契约**:哪天有人给某个前端加上
-	"空就是没答",得先看见这儿写着不该那么做。)
+	(现在的页面给不出 "" —— 服务端在 /answer 就拒了。留着这条是因为**这道
+	区分是契约**:哪天有人给前端加上"空就是没答",得先看见这儿写着不该那么做。)
 	"""
 	make, _ = asked
 	assert A.run_ask(make(""), "问") == ""
@@ -213,62 +210,6 @@ def test_子agent的提问器签名是对的():
 	assert subagent._nobody_to_ask("问", ["甲"]) is None
 	assert list(inspect.signature(subagent._nobody_to_ask).parameters) == \
 		["question", "options"]
-
-
-# ---------- 五、终端前端 ----------
-
-@pytest.fixture
-def typed(monkeypatch):
-	"""把终端那个 input() 换成脚本化的。返回一个"下一次type什么"的队列。"""
-	from emit import terminal_ask_text
-
-	script = []
-
-	def fake_input(prompt=""):
-		if not script:
-			raise EOFError
-		item = script.pop(0)
-		if isinstance(item, Exception):
-			raise item
-		return item
-
-	monkeypatch.setattr(builtins, "input", fake_input)
-	return script, terminal_ask_text
-
-
-def test_终端_序号换成选项原文(typed):
-	script, terminal_ask_text = typed
-	script.append("2")
-	assert terminal_ask_text("用哪种?", ["SQLite", "JSON 文件"]) == "JSON 文件"
-
-
-def test_终端_直接输入就用输入的(typed):
-	script, terminal_ask_text = typed
-	script.append("  第三种,用 redis  ")
-	assert terminal_ask_text("用哪种?", ["SQLite"]) == "第三种,用 redis"
-
-
-def test_终端_没有选项时数字不算序号(typed):
-	"""options 空的时候 "1" 就是用户想说的那个字,不是一个下标。"""
-	script, terminal_ask_text = typed
-	script.append("1")
-	assert terminal_ask_text("说个数字", []) == "1"
-
-
-def test_终端_序号越界就当普通文字(typed):
-	script, terminal_ask_text = typed
-	script.append("9")
-	assert terminal_ask_text("用哪种?", ["甲", "乙"]) == "9"
-
-
-def test_终端_EOF和空行都算没人答上(typed):
-	"""EOF 必须算没人答上,不能算空回答:管道里跑或 stdin 关掉时 input()
-	直接 EOF,那条路径上给一个空字符串,模型的 tool_result 里就是一段空白,
-	而它分不出"人说了句空的"和"根本没人在"。"""
-	script, terminal_ask_text = typed
-	assert terminal_ask_text("问", []) is None            # 脚本空了 = EOF
-	script.append("   ")
-	assert terminal_ask_text("问", []) is None
 
 
 # ---------- 六、服务端那条通道 ----------

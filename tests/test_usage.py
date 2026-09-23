@@ -1,6 +1,6 @@
 """账本。全部离线 —— 一次 API 都不打。
 
-守的是四种"会静默出错"的东西,每一种在这个项目里都有先例:
+守的是五种"会静默出错"的东西,每一种在这个项目里都有先例:
 
 1. **`input_tokens` 是未命中,不是总输入。** 实测冷 8057/user 0、热 249/7808,
    两次相加都是 8057。当总量读,账少算一个数量级,不报错。
@@ -10,9 +10,13 @@
 3. **重试那一次的钱。** 第一次请求哪怕中途炸掉,input 也已经计费了,而
    message_start 里就带着 usage。
 4. **记账失败不能掀翻 agent 循环**,但也不能静默。
+5. **一轮的"输入"是求和,不是上下文大小。** 每次调用都要把整段历史重发一遍,
+   于是 35 次调用的那一轮报 591,639,而那一刻上下文只有 27,693 —— 当上下文
+   读,会以为"上一轮没被加进来"。
 
 前三条断言的是"数字对不对",第四条断言的是"坏了之后怎么样" —— 后者才是
-这个仓库一贯在意的东西。
+这个仓库一贯在意的东西。第五条是给新加的那一栏守着的,它跟第一条是同一类:
+**把一个数当成了另一个数**。
 """
 
 import json
@@ -498,7 +502,7 @@ def test_nonstream_is_labelled(ledger, monkeypatch):
 
 # ---------------------------------------------------------------- 加总 / 命中率 / 金额
 
-# 这三个的口径都在 usage.py 这一头,所以测试也在这儿。报表和终端那句小结都是
+# 这三个的口径都在 usage.py 这一头,所以测试也在这儿。报表和每轮那句小结都是
 # 从这儿 import 的消费方 —— 只有一份定义,漂不了。
 
 
@@ -598,8 +602,8 @@ def test_money_does_not_trail_zeros():
 def test_read_turn_picks_only_that_turn(ledger):
 	"""读回来的必须正好是 (session, turn) 那一组。
 
-	终端那句小结靠它。多捞一条不报错,只是屏幕上那个数字悄悄变大 —— 而
-	main.py 的 SESSION 带时间戳就是为了让这个匹配成立。
+	每轮那句小结靠它。多捞一条不报错,只是屏幕上那个数字悄悄变大 —— 而
+	会话名带时间戳就是为了让这个匹配成立。
 	"""
 	for session, turn in (("s1", 1), ("s1", 2), ("s2", 1)):
 		with usage.span(session=session, turn=turn):
@@ -685,24 +689,6 @@ def test_read_session_is_empty_without_a_ledger(tmp_path, monkeypatch):
 	assert usage.read_session("s1") == {}
 
 
-def test_turn_line_prefix_is_dropped_for_the_page(ledger):
-	"""页面上那一行在轮次框内部,"[本轮]" 是终端才需要的指代。
-
-	只换前缀,不换格式 —— 金额和命中率的规矩在这儿重写一遍就会漂,而漂了
-	不报错,只是页面上的数和屏幕上的数不一样。
-	"""
-	with usage.span(session="s1", turn=1):
-		usage.meter(purpose="main", model="m",
-		            usage_obj=make_usage(input_tokens=100,
-		                                 cache_read_input_tokens=900),
-		            attempt=1, ok=True, elapsed_ms=5, kind="stream")
-	records = usage.read_turn("s1", 1)
-	default = usage.turn_line(records)
-	assert default.startswith("[本轮] ")
-	assert usage.turn_line(records, prefix="") == default[len("[本轮] "):]
-	assert usage.turn_line([], prefix="") is None
-
-
 def test_turn_line_shows_tokens_and_hides_unknown_money(ledger):
 	"""价目表没填时**不显示金额**。
 
@@ -745,29 +731,61 @@ def test_turn_line_shows_money_when_priced(ledger, monkeypatch):
 
 
 def test_turn_line_is_none_without_records():
-	"""一条记录都没有时不打空行 —— 记账关掉/全失败的时候不该在终端留个残句。"""
+	"""一条记录都没有时不打空行 —— 记账关掉/全失败的时候不该在页面上留个残句。"""
 	assert usage.turn_line([]) is None
 
 
-# ---------------------------------------------------------------- 会话名
+def test_turn_line_context_is_the_last_main_call_not_the_sum(ledger):
+	"""**这一栏跟"输入"是两个东西。**
 
-def test_terminal_session_name_is_per_run_not_a_constant():
-	"""**踩过的坑。** main.py 的 SESSION 不能写死成那个常量 "terminal"。
-
-	轮次序号每个进程都从 1 开始,而终端进程一个进程就是一个会话 —— 名字写死的
-	话,**两次运行的第 1 轮会撞进同一组**。报表把它们当同一轮加总,数字凭空
-	变大,不报错。
-
-	实测见过:turn 1 显示 3 次调用,其实是两次运行各一次 + 另一次。逐轮数字
-	从此就不可信了,而它看起来完全正常。
-
-	所以这儿断言的是"这个名字是每次运行现造的",不是某个固定值。
+	输入是这一轮所有调用的求和(每次调用都要把整段历史重发一遍),上下文是
+	末次主循环那一次的大小。实测第 2 轮 35 次调用报 591,639,而那一刻上下文
+	只有 27,693 —— 只看那个求和,会以为"上一轮没被加进来"。
 	"""
-	import main
+	with usage.span(session="s1", turn=1):
+		for tokens in (100, 200, 300):
+			usage.meter(purpose="main", model="m",
+			            usage_obj=make_usage(input_tokens=tokens),
+			            attempt=1, ok=True, elapsed_ms=5, kind="stream")
+	line = usage.turn_line(usage.read_turn("s1", 1))
+	assert "输入 600" in line          # 求和
+	assert "上下文 300" in line        # 末次那一次的大小,不是 600
 
-	assert main.SESSION != "terminal"
-	assert main.SESSION.startswith("terminal-")
-	# 带时间戳:两个进程拿到的值不同。纯随机串也能满足唯一性,但读不出是哪次 ——
-	# 报表的"按会话"那一栏就没法看。解析一遍顺便把格式也钉住。
-	name = main.SESSION[len("terminal-"):]
-	time.strptime(name, "%Y%m%d-%H%M%S")
+
+def test_context_size_ignores_calls_that_are_not_the_main_loop(ledger):
+	"""摘要、vision、子 agent 都是另开的一份小上下文。
+
+	末次那条要是它们之一,这一栏会报出一个跟主循环毫无关系的数(实测那次
+	vision 只有 637),而且不报错,只是从此不可信。
+	"""
+	with usage.span(session="s1", turn=1):
+		usage.meter(purpose="main", model="m",
+		            usage_obj=make_usage(input_tokens=9_000),
+		            attempt=1, ok=True, elapsed_ms=5, kind="stream")
+		usage.meter(purpose="vision", model="m",
+		            usage_obj=make_usage(input_tokens=637),
+		            attempt=1, ok=True, elapsed_ms=5, kind="nonstream")
+		usage.meter(purpose="compaction", model="m",
+		            usage_obj=make_usage(input_tokens=88_000),
+		            attempt=1, ok=True, elapsed_ms=5, kind="nonstream")
+	with usage.span(session="s1", turn=1, agent="subagent"):
+		usage.meter(purpose="main", model="m",
+		            usage_obj=make_usage(input_tokens=1_234),
+		            attempt=1, ok=True, elapsed_ms=5, kind="stream")
+
+	records = usage.read_turn("s1", 1)
+	assert usage.context_size(records) == 9_000
+	assert "上下文 9,000" in usage.turn_line(records)
+
+
+def test_turn_line_omits_context_when_there_is_no_main_call(ledger):
+	"""一条主循环记录都没有时整栏不显示。
+
+	不填 0:0 的意思是"上下文是空的",那是另一回事。
+	"""
+	with usage.span(session="s1", turn=1):
+		usage.meter(purpose="vision", model="m",
+		            usage_obj=make_usage(input_tokens=637),
+		            attempt=1, ok=True, elapsed_ms=5, kind="nonstream")
+	assert usage.context_size(usage.read_turn("s1", 1)) is None
+	assert "上下文" not in usage.turn_line(usage.read_turn("s1", 1))

@@ -598,23 +598,55 @@ class SessionStore:
 	# ---- 热路径:从不起异常 ----
 
 	def append_turn_message(self, turn_id: str, message_no: int, kind: str,
-	                        role: str, content) -> None:
-		"""记一条原始消息。调用方是 record 回调,而它是 agent 循环调的 ——
-		那里没有 try,一条消息写不进去不该掀翻一整轮。
+	                        role: str, content) -> int | None:
+		"""记一条原始消息,返回它的行号(写不进去给 None)。
 
 		message_no 由调用方发(它是内存里数的),所以失败会留下一个空号。
 		允许空号:UNIQUE 只管不重复,而且这一版明确不重编号 —— 补号意味着
 		去改已经落库的邻居,那是另一回事。
+
+		**行号就是发给模型的那个"号"**(见 tools/recall.py)。用它而不是自己
+		数一个计数器,买的是三件事:
+
+		  1. 只增不减由 SQLite 保证 —— 不用再维护"接着最大号发、被压掉的号
+		     也算数"那套水位逻辑(那是为了在没有这个 id 的时候模拟它);
+		  2. **有号 = 查得回来。** 写不进去就没有行号,上层就不发号,模型
+		     看不到号也就点不动它 —— 不会出现"点了一个查不回来的号";
+		  3. 查回来是主键命中,不用拿 LIKE 去扫 content_json 那种大字段。
+
+		失败返回 None 而不是 0:0 是个合法行号吗?不是(INTEGER PRIMARY KEY
+		 ︎从 1 起),但 None 的意思更明确 —— "没有这一行"。
 		"""
 		try:
 			text = json.dumps(content, ensure_ascii=False, default=_block_json)
 			with self._lock:
-				self._conn.execute(
+				cursor = self._conn.execute(
 					"INSERT INTO turn_messages (turn_id, message_no, kind, role,"
 					" content_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
 					(turn_id, message_no, kind, role, text, time.time()))
+				return cursor.lastrowid
 		except Exception as e:
 			print(f"[sessions] 轮次消息没落库: {type(e).__name__}: {e}")
+			return None
+
+	def find_message(self, sid: str, message_id: int) -> object | None:
+		"""按号(行号)捞回那条消息的正文;不在这个会话里就给 None。
+
+		号就是 `turn_messages.id`,而那张表是**全库一张** —— 所以必须用
+		`turns.session_id` 把它圈回这个会话。少了那一句,A 会话拿自己上下文里
+		的一个号就能读到 B 会话的原文;而"两个会话互相看不见对方"是这张表
+		唯一还立着的边界,破了不报错。
+
+		读路径**要抛**(跟 load_context 同一条规矩:拿一份错的原文接着跑,
+		比停下来糟得多)。查不到不算异常 —— 那是"这个号不在",给 None。
+		"""
+		with self._lock:
+			row = self._conn.execute(
+				"SELECT m.content_json FROM turn_messages AS m"
+				" JOIN turns AS t ON t.id = m.turn_id"
+				" WHERE m.id = ? AND t.session_id = ?",
+				(message_id, sid)).fetchone()
+		return json.loads(row[0]) if row else None
 
 	def append_event(self, sid: str, event: dict) -> int | None:
 		"""落库一条事件,返回它的游标。写不进去返回 None,**不抛**。

@@ -44,7 +44,7 @@ def run_ask(ask_user, question: str, options=None) -> str:
 	"""问一个问题,把回答原样交回模型。
 
 	ask_user 的签名是 ask_user(question, options) -> str | None,None 表示
-	**没人答上**(超时、页面关了、终端 EOF)。那三种情况对模型是同一件事:
+	**没人答上**(超时、页面关了、回答通道断了)。那几种情况对模型是同一件事:
 	手里没答案,得自己拿主意 —— 所以合成一条报错,不细分。
 
 	返回的**永远**是字符串:工具 handler 只有这一个出口,失败的形状也必须是
