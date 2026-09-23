@@ -53,6 +53,8 @@ Turn 终态放同一个事务。数据库事务一律不包住模型请求和工
 """
 
 import json
+import os
+import sys
 import threading
 import uuid
 from itertools import count
@@ -60,21 +62,48 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+import dblock
 from agent import TurnOutcome, agent_loop
 from app import MODEL, build_system, make_compactor
 from config import MAX_ROUNDS, MEMORY_PATH, USER_MEMORY_PATH
 from context import ContextCompactor
 from hooks import trigger_hooks
-from sessions import SessionStore
+from sessions import DB_PATH, SessionStore, TurnStateConflict
 from tools import build_tools
 from tools.memory import load_memory
 from tools.todo import TodoManager
 import usage
 
-PORT = 8765
+# 端口可以用环境变量顶掉(AGENT_PORT),理由同 sessions.DB_PATH:进程级测试
+# 要起真的服务,不能占着你的 8765。默认值没变 —— ui/index.html 里还有一份
+# 写死的 8765(改要一起改),dev.py 也认 8765。
+PORT = int(os.environ.get("AGENT_PORT") or "8765")
 PAGE = Path(__file__).parent / "ui" / "index.html"
 
-STORE = SessionStore()
+# **这个库的排他锁和 STORE 都不是 import 时装上的**,理由见 open_store()。
+#
+# STORE 先摆一个 None:测试里 monkeypatch 换掉它(见 tests/test_ask.py 的
+# soon fixture),真跑起来由 main() 装。
+STORE: "SessionStore | None" = None
+DB_LOCK: "dblock.DbLock | None" = None
+
+
+def open_store():
+	"""拿到这个库的排他锁,然后才建会话库(含迁移)。返回那把锁。
+
+	**顺序是这一步的全部意义**:SessionStore.__init__ 会跑迁移,而迁移是往
+	库里**写**(至少 PRAGMA journal_mode,真要升级时还有 DDL)。第二个实例
+	如果先 import 建了 STORE、再发现自己拿不到锁,库已经被动过了 —— 而"没
+	拿到锁的实例一个字都不许写"正是启动独占要保证的事。
+
+	所以模块级不再是 `STORE = SessionStore()`:import 这个模块(测试、一次性
+	检查脚本、REPL)不该有能力打开、更不该有能力迁移你的会话库。同一个理由
+	把 reap_running 从 __init__ 挪到了 __main__(见它的注释),这是第二半。
+	"""
+	global STORE, DB_LOCK
+	DB_LOCK = dblock.acquire(DB_PATH)
+	STORE = SessionStore()
+	return DB_LOCK
 
 # 每个会话一把锁。**只增不删**:删掉的瞬间,等在它上面的线程手里还攥着
 # 旧那把,而下一个请求拿到的是新的 —— 两把锁护同一份状态,等于没护。
@@ -285,6 +314,15 @@ ASK_TIMEOUT = 300.0
 # 那边不报错,只会留下一个永远清不掉的槽。
 PENDING: dict[str, dict] = {}
 
+# **这一轮的结果没存进库**的记录。key 是 sid,value 是补写所需的那份参数
+# (turn_id / 终态 / 最终上下文)。
+#
+# 为什么留在进程里而不是库里:库正是写不进去的那一方。它只活到"这个会话的下
+# 一次请求"为止 —— 那一刻先把这份补写进去(**不重跑模型、不重跑工具**,手上
+# 就有最终上下文),补进去了才允许开新的一轮;补不进去就回 503。少了这道闸,
+# 下一轮会拿那份**旧上下文**继续跑,而模型完全看不出上一轮发生过什么。
+UNSAVED: dict[str, dict] = {}
+
 
 def _ask_and_wait(emit, sid: str, turn_id: str, mode: str,
                   **fields) -> tuple[dict | None, str]:
@@ -361,6 +399,17 @@ def make_ask_text(emit, sid: str, turn_id: str):
 		                        question=question, options=options)
 		return None if slot is None else slot.get("answer")
 	return ask_text
+
+
+def _save_failure_text(conflict: bool, detail: str) -> str:
+	"""保存失败那句人话。两种情况分开说 —— 它们要用户做的事不一样。"""
+	if conflict:
+		return (f"这一轮在库里已经是终态(状态冲突),这次算出来的工作上下文"
+		        f"**没有**写进去:下一轮会从库里已有的那份接着跑,可能少了这一轮的"
+		        f"记录。这不是库坏了:{detail}")
+	return (f"这一轮跑完了,但结果没存进库(刷新会退回上一轮):{detail}。"
+	        f"库里这一轮还停在 running;下一次问这个会话会先试着把它补上,"
+	        f"补不上就不会开新的一轮。")
 
 
 def trim_dangling_tool_use(history: list) -> int:
@@ -474,6 +523,21 @@ class Handler(BaseHTTPRequestHandler):
 			return
 		payload = STORE.list_turns(sid)
 		payload["running"] = is_running(sid)
+
+		# 每一轮花了多少。账本里的归属键就是上面那个 turn.id —— 写的时候是
+		# usage.span(session=sid, turn=turn["id"]),读的时候同一个字符串,不用
+		# 再对一次。
+		#
+		# 整份账本读一遍(read_session),不是每轮读一遍:结果一样,后者把
+		# 同一个文件读 N 遍,而 N 随会话长度涨。
+		#
+		# 发的是**渲染好的那一行**,跟终端打的是同一个 turn_line。金额和命中率
+		# 的规矩(None 和 0 不同、币种跟着记录走、命中率的分母是输入总量)写
+		# 两遍就会漂,而漂了不报错 —— 只是页面上的数和屏幕上的数不一样。
+		ledger = usage.read_session(sid)
+		for turn in payload["turns"]:
+			turn["usage"] = usage.turn_line(ledger.get(turn["id"], []), prefix="")
+
 		# 挂起中的问题要一起给。它是**唯一**没法从库里重建的东西:ask 不是
 		# 一条消息,库里没有它,而页面拿到的 cursor 已经越过它那条事件了 ——
 		# 不补这一下,刷新之后页面上就没有那个按钮或那个输入框,而 agent
@@ -492,6 +556,20 @@ class Handler(BaseHTTPRequestHandler):
 				 "turn_id": slot["turn_id"]}
 				for rid, slot in list(PENDING.items()) if slot["session"] == sid
 			]
+
+		# "这一轮的结果没存进库"那份记录也要一起给,理由跟上面一样:它在库里
+		# 读不出来 —— 保存失败的话那一轮**还停在 running**(终态那一次写就没
+		# 成功),刷新之后页面只会显示"运行中",而真相是它已经跑完了、只是
+		# 没存上。少了这一句,用户会以为它还在干活,或者以为自己的活白干了。
+		#
+		# 只在**这一轮**还在库里挂着的时候报:补写成功之后库里就是终态了,
+		# 那份记录也没了(见 _flush_unsaved),两条路不会同时说话。
+		unsaved = UNSAVED.get(sid)
+		if unsaved:
+			for turn in payload["turns"]:
+				if turn["id"] == unsaved["turn_id"]:
+					turn["unsaved"] = {"model_status": unsaved["status"],
+					                   "error": unsaved["error"]}
 		self._send_json(payload)
 
 	def _get_events(self, sid: str, query: dict):
@@ -578,12 +656,32 @@ class Handler(BaseHTTPRequestHandler):
 		self._send_json({"id": row["id"], "title": row["title"]})
 
 	def _post_delete(self, sid: str):
-		# 正在跑的会话不许删:那一轮还攥着锁、还要写回 messages,删了它下次
-		# 写回就是外键错误,而用户看到的是"聊到一半的东西没了"。
-		if is_running(sid):
+		"""删会话。**跟执行抢同一把会话锁** —— 这是 R4 修的那件事。
+
+		以前是先问 is_running()、再删,而问和删之间没有互斥区间:
+		"删除线程看到空闲 → 执行线程取得锁并开轮 → 删除线程把会话删掉",
+		于是那一轮开始写回时命中的是一个不存在的会话(外键错误),而用户
+		看到的是"聊到一半的东西没了"。
+
+		现在两条路都必须先攥住同一个 sid 的那把锁:删除拿不到就返回冲突
+		(确实有一轮在跑),拿到了就等于"从这一刻起不会有新的轮开起来"。
+		检查和操作在同一个互斥区间里,中间没有缝。
+
+		顺序也反过来了:先拿锁,再查存在性。先查的话,查完到拿锁之间会话
+		可能已经被别的删除请求删掉了 —— 而那种"删一个已经不在的东西"报
+		200 挺好(幂等),报 404 也行,但绝不能是"查到了、删的时候没有"。
+		"""
+		lock = session_lock(sid)
+		if not lock.acquire(blocking=False):
 			self.send_error(409, "this session has a turn running")
 			return
-		STORE.delete_session(sid)
+		try:
+			if not STORE.session_exists(sid):
+				self.send_error(404, "no such session")
+				return
+			STORE.delete_session(sid)
+		finally:
+			lock.release()
 		# 进程里那两份(LOCKS/TODOS)不跟着收:它们只增不删,理由见上面。
 		# 剩下几个没人用的 dict,在本机工具里不值得为它引入删除的竞态。
 		self._send_json({"ok": True})
@@ -628,6 +726,29 @@ class Handler(BaseHTTPRequestHandler):
 		self.end_headers()
 		self.wfile.write(out)
 
+	def _flush_unsaved(self, sid: str) -> bool:
+		"""把上一轮没存进库的那份补写进去。补上了(或者本来就没有)返回 True。
+
+		**它不重跑模型、也不重跑工具** —— 手上就有最终上下文和终态,补的是写。
+		"恢复保存时工具执行次数不增加"那条验收说的就是这件事。
+
+		补写在开新的一轮**之前**,而且在同一把会话锁里:补不上就不开新轮
+		(调用方回 503),因为开了的话模型会拿着一份少了上一轮的上下文往下跑,
+		而它看不出少了什么。
+		"""
+		pending = UNSAVED.get(sid)
+		if pending is None:
+			return True
+		try:
+			STORE.finish_turn(sid, pending["turn_id"], pending["status"],
+			                  pending["error"], pending["messages"])
+		except Exception:
+			# 还是写不进去。记录留着,下一次请求再试 —— 补写这件事本身是幂等
+			# 的(同一个事务里的 upsert + 条件更新)。
+			return False
+		UNSAVED.pop(sid, None)
+		return True
+
 	def _post_ask(self):
 		body = self._json_body('{"session": "...", "query": "..."}')
 		if body is None:
@@ -648,6 +769,21 @@ class Handler(BaseHTTPRequestHandler):
 			self.send_error(409, "this session already has a turn running")
 			return
 		try:
+			# 拿到锁之后再查一次存在性 —— 上面那次(pre-lock)是给明显不合法
+			# 的 id 一个快一点的 404;这一次才是权威的:删除要拿同一把锁,
+			# 所以"锁在我手里"就等于"此刻没人能把它删掉"。少了这一下,
+			# 删除先拿到锁那条路径上,这一轮会走到 begin_turn 才撞外键,
+			# 用户拿到的是一句 500 "cannot start turn" —— 而事实是会话
+			# 已经没了。
+			if not STORE.session_exists(sid):
+				self.send_error(404, "no such session")
+				return
+			# 上一轮的结果没存进库的话,先把那份补上再开新的一轮。补不进去就
+			# 不开 —— 503 而不是 200:这不是"这个会话忙",是"后端现在不能
+			# 接着往下跑"。用户重发一次就再试一遍。
+			if not self._flush_unsaved(sid):
+				self.send_error(503, "previous turn result is not saved yet")
+				return
 			self._run_turn(sid, query)
 		finally:
 			lock.release()
@@ -692,6 +828,10 @@ class Handler(BaseHTTPRequestHandler):
 		# 以预料之外的方式跳出去,收尾时手里也有个说得通的终态,而不是
 		# NameError —— 那会让这一轮永远停在 running。
 		outcome = TurnOutcome("failed", "", "这一轮没有跑完")
+		# "模型跑出什么"和"存没存上"分开记:后者在下面的 finally 里被改写。
+		# 放在 try 外面,是因为 finally 要写它们,而 finally 在任何一条路径上
+		# 都会跑到 —— 只写在 except 里的话,正常跑完那条路上它们是未定义的。
+		saved, save_error = True, ""
 		try:
 			trigger_hooks("UserPromptSubmit", query)
 			# 用户那条 begin_turn 已经写进 turn_messages 了(它是开轮那个
@@ -737,17 +877,42 @@ class Handler(BaseHTTPRequestHandler):
 				STORE.finish_turn(sid, turn["id"], outcome.status, outcome.error,
 				                  history)
 			except Exception as e:
-				# 这一轮没存上,用户必须知道(刷新会退回上一轮)。流可能已经
-				# 断了,所以走 emit_quietly —— 库里那条 note 照样落得下。
+				# **模型跑出什么,和这一轮存没存上,是两件事。** 这里只改后
+				# 一件:保存失败不能跟着 outcome.status 一起发出去 —— 页面会
+				# 把它画成普通的"完成",而库里那一轮还是 running、工作上下文
+				# 还是旧的,用户接着问就静默地少了一整轮。
+				saved, save_error = False, f"{type(e).__name__}: {e}"
+				# 状态冲突单独说:那不是"库坏了",是这一轮在库里已经是终态
+				# (被 reap 收过)。它重试也没用(finish_turn 会一直抛),所以
+				# 不进 UNSAVED 那道闸 —— 进了的话这个会话就永远问不下去了。
+				conflict = isinstance(e, TurnStateConflict)
+				if not conflict:
+					UNSAVED[sid] = {"turn_id": turn["id"],
+					                "status": outcome.status,
+					                "error": outcome.error,
+					                "messages": history}
 				emit_quietly(emit, {"kind": "note", "source": "store",
-				                    "text": f"这一轮的上下文没存上(刷新会退回上一轮): "
-				                            f"{type(e).__name__}: {e}"})
+				                    "text": _save_failure_text(conflict, save_error)})
 
 		# reply 排在收尾**之后**发。反过来的话,页面收到 reply 时库里的
 		# status 还是 running,而它的游标已经越过这条事件 —— 刷新也补不
 		# 回来,那一轮会一直显示"运行中"。
+		#
+		# 花费跟着一起发,理由同上一句:这一轮的所有调用都发生在上面,
+		# 到这儿账已经记完了。放在这里面,页面不用为一个数字再跑一趟 ——
+		# 而且那一趟还得解决"什么时候去要"的问题,而"这一轮刚结束"正好
+		# 就是这里。
+		#
+		# **status 发的是"这个页面该显示成什么",不是模型的心气。** 保存失败
+		# 时发 unsaved:发 completed 就等于告诉页面"存好了,可以接着聊",而
+		# 库里那一轮还是 running、上下文还是旧的。model_status 那份照旧发出去,
+		# 因为"执行完了"和"存上了"是两件事,用户两个都要知道。
 		emit_quietly(emit, {"kind": "reply", "text": outcome.text,
-		                    "status": outcome.status})
+		                    "status": outcome.status if saved else "unsaved",
+		                    "model_status": outcome.status,
+		                    "saved": saved, "save_error": save_error,
+		                    "usage": usage.turn_line(
+			                    usage.read_turn(sid, turn["id"]), prefix="")})
 
 	def _checkpoint(self, sid: str, messages: list, emit) -> None:
 		"""压缩器压过之后存一个上下文检查点。
@@ -771,5 +936,32 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+	# 顺序是:排他锁 → 迁移 → 清理 → 收请求。
+	#
+	# 第一件就是拿锁:拿不到直接退出,**在这之前一个字节都不写库**。这是
+	# "第二个实例不能改第一个实例正在跑的任务"的唯一保证 —— 端口不算保证,
+	# 换个端口、或者 Windows 上 SO_REUSEADDR 那种语义,都能两个进程绑同一个库。
+	try:
+		open_store()
+	except dblock.AlreadyRunning as e:
+		print(str(e))
+		print("一个库只能有一个 server —— 两个一起跑会互相改状态:")
+		print("后来的那个一启动就会把所有 running 的轮收成失败,而它分不出"
+		      "那是别人正在跑的。")
+		print("先把那个关掉(dev.py 里叫它别起新的那个情况也一样),再起这个。")
+		sys.exit(1)
+
+	# 收拾上一次没跑完的轮:进程被杀时那一轮就没有最后那次状态写,库里会
+	# 留着一条永远 running 的行,页面上的轮次框也就一直显示"运行中"。放在
+	# 这儿而不是 SessionStore.__init__ 里,理由见 reap_running 的注释。
+	# 现在有排他锁兜着,"留下的"确实只可能是死进程留下的。
+	reaped = STORE.reap_running()
+	if reaped:
+		print(f"上次没跑完的 {reaped} 轮已标记为失败")
 	print(f"http://localhost:{PORT}/")
-	ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+	try:
+		ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+	finally:
+		# 正常退出也交还那把锁(进程死掉时内核也会放,这一步只是"早一点" +
+		# 让 Ctrl+C 之后能立刻再起一个)。
+		DB_LOCK.release()

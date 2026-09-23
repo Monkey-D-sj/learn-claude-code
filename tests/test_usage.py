@@ -629,6 +629,80 @@ def test_read_turn_skips_broken_lines(ledger):
 	assert len(usage.read_turn("s1", 1)) == 2
 
 
+def test_read_session_groups_by_turn_in_one_pass(ledger, monkeypatch):
+	"""一次读回整个会话,按轮分好组 —— 轮次接口要的是**所有**轮的小结。
+
+	按轮各调一次 read_turn 结果一样,但把同一个文件读 N 遍。所以除了分组,
+	还要钉住"只读一遍":多读几遍不报错,只是会话越长越慢。
+	"""
+	for session, turn in (("s1", 1), ("s1", 1), ("s1", 2), ("s2", 1)):
+		with usage.span(session=session, turn=turn):
+			usage.meter(purpose="main", model="m", usage_obj=make_usage(),
+			            attempt=1, ok=True, elapsed_ms=5, kind="stream")
+
+	content = ledger.read_text(encoding="utf-8")
+	reads = []
+
+	class CountingLedger:
+		"""只数读了几遍。多读一遍不报错,所以只能这么钉。"""
+		def exists(self):
+			return True
+
+		def read_text(self, **_):
+			reads.append(1)
+			return content
+
+	monkeypatch.setattr(usage, "USAGE_PATH", CountingLedger())
+	grouped = usage.read_session("s1")
+
+	assert sorted(grouped) == [1, 2]
+	assert len(grouped[1]) == 2          # 同一轮里的两次调用归到一组
+	assert len(grouped[2]) == 1
+	assert len(reads) == 1               # 整份账本只读一遍
+
+
+def test_read_session_keeps_records_without_a_turn(ledger):
+	"""有会话、没轮次的账也要收进来,挂在 None 这个键上。
+
+	丢掉的话那笔钱永远不出现在任何地方 —— 而"少一笔"和"没花"在页面上
+	长得一模一样。
+	"""
+	with usage.span(session="s1"):                      # 只开了会话,没开轮
+		usage.meter(purpose="main", model="m", usage_obj=make_usage(),
+		            attempt=1, ok=True, elapsed_ms=5, kind="stream")
+	with usage.span(session="s1", turn=1):
+		usage.meter(purpose="main", model="m", usage_obj=make_usage(),
+		            attempt=1, ok=True, elapsed_ms=5, kind="stream")
+
+	grouped = usage.read_session("s1")
+	assert set(grouped) == {None, 1}
+	assert len(grouped[None]) == 1
+	assert len(grouped[1]) == 1
+
+
+def test_read_session_is_empty_without_a_ledger(tmp_path, monkeypatch):
+	monkeypatch.setattr(usage, "USAGE_PATH", tmp_path / "nope.jsonl")
+	assert usage.read_session("s1") == {}
+
+
+def test_turn_line_prefix_is_dropped_for_the_page(ledger):
+	"""页面上那一行在轮次框内部,"[本轮]" 是终端才需要的指代。
+
+	只换前缀,不换格式 —— 金额和命中率的规矩在这儿重写一遍就会漂,而漂了
+	不报错,只是页面上的数和屏幕上的数不一样。
+	"""
+	with usage.span(session="s1", turn=1):
+		usage.meter(purpose="main", model="m",
+		            usage_obj=make_usage(input_tokens=100,
+		                                 cache_read_input_tokens=900),
+		            attempt=1, ok=True, elapsed_ms=5, kind="stream")
+	records = usage.read_turn("s1", 1)
+	default = usage.turn_line(records)
+	assert default.startswith("[本轮] ")
+	assert usage.turn_line(records, prefix="") == default[len("[本轮] "):]
+	assert usage.turn_line([], prefix="") is None
+
+
 def test_turn_line_shows_tokens_and_hides_unknown_money(ledger):
 	"""价目表没填时**不显示金额**。
 

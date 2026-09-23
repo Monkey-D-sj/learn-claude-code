@@ -12,6 +12,8 @@
 跟"要发多大一坨"是两回事。顺手一起改掉的话,那个判断会静默地变味。
 """
 
+import pytest
+
 import context
 
 Compactor = context.ContextCompactor
@@ -121,6 +123,78 @@ def test_a_whole_task_is_not_archived(tmp_path):
 	assert len(msgs) == 118
 	c = make_compactor(tmp_path)
 	assert c.snip_compact(msgs) is msgs, "原样返回 = 没动"
+
+
+# ------------------------------------------- 第 2 档的总闸门:按 token,不按条数
+
+def test_the_gate_sits_inside_the_budget():
+	"""闸门必须落在预算**以内**。
+
+	等于 1.0 的话,等它响的时候这一轮已经按满价发出去了 —— 而提前一档
+	动手正是它存在的理由。
+	"""
+	assert 0 < Compactor.SNIP_TRIGGER_RATIO < 1
+	assert Compactor.SNIP_TRIGGER_TOKENS == int(
+		Compactor.CONTEXT_TOKEN_BUDGET * Compactor.SNIP_TRIGGER_RATIO)
+
+
+def test_snip_stays_out_when_only_the_count_is_high(tmp_path):
+	"""**这条是这道闸门的全部理由。** 条数早就过线、token 没到 —— 不许切。
+
+	150 条小结果可能只有几万 token,离预算差一个数量级,却照样把中段切掉;
+	而切中段就是改前缀,改了前缀这一轮全部按未命中重算(实测冷 ¥0.005546
+	对热 ¥0.000528)。拿一个跟成本无关的量决定动不动缓存,注定错。
+	"""
+	msgs = conversation(100, result="x" * 2000)      # 202 条,远过 150
+	c = make_compactor(tmp_path)
+	assert len(msgs) > c.SNIP_MAX_MESSAGES, "前提:条数这道闸门早就过了"
+	assert c.estimate_tokens(msgs) < c.SNIP_TRIGGER_TOKENS, "前提:token 没到"
+
+	out = c.prepare(msgs, "任务")
+
+	assert out is msgs, "原样返回 = 一档都没走"
+	assert len(out) == 202, "一条都不许切"
+
+
+@pytest.mark.skip(reason=(
+	"第 2 档当前是关着的(见 context.prepare 里那一行「先关掉(2026-09-22,临时的)」),"
+	"而这条断言的是它开着时的行为 —— 它和上面那条 "
+	"test_snip_stays_out_when_only_the_count_is_high 是一对,合起来编码的才是"
+	"「闸门按 token 说话」这个意思。等 compress 那条路的用法定下来、四档按那时"
+	"的注释补好 _split_marker 接回去,就该把这个 skip 去掉。"))
+def test_snip_runs_once_the_context_is_heavy_enough(tmp_path):
+	"""同一个条数,token 上去了就该切 —— 闸门量的是 token。
+
+	刻意停在这条带里:过了 75%、还没到 100%。再往上第 3、4 档要接手,
+	而第 4 档调模型 —— 这儿的压缩器 client 是 None,走上去就炸。
+	"""
+	msgs = conversation(100, result="x" * 8500)      # 239,614 token
+	c = make_compactor(tmp_path)
+	tokens = c.estimate_tokens(msgs)
+	assert c.SNIP_TRIGGER_TOKENS < tokens <= c.CONTEXT_TOKEN_BUDGET, (
+		f"{tokens:,} 该落在 ({c.SNIP_TRIGGER_TOKENS:,}, "
+		f"{c.CONTEXT_TOKEN_BUDGET:,}] 里 —— 常量改了就把这个夹具跟着改")
+
+	out = c.prepare(msgs, "任务")
+
+	assert out is not msgs, "构造了新列表 = snip 动过了"
+	assert len(out) < len(msgs)
+	assert any(c.is_archive_marker(m) for m in out), "该留下一条归档标记"
+
+
+def test_the_first_layer_can_never_fire_below_the_gate():
+	"""第 1 层的门槛是**整份预算**,闸门是预算的 75% —— 它响的时候闸门必然
+	早就开了。
+
+	所以"第 1 层不并进闸门"是个空操作,不是漏掉:一批要 30 万 token 才算
+	大,而那意味着整段上下文至少也是 30 万,早过了 22.5 万。两层各自独立,
+	写在一起只是因为它们本来就是这个关系。
+
+	钉住它:哪天有人把 TOOL_RESULT_BATCH_TOKEN_BUDGET 调到闸门以下,第 1
+	层就会开始出现在短上下文里 —— 那是新行为,该有人知道。
+	"""
+	assert (Compactor.TOOL_RESULT_BATCH_TOKEN_BUDGET
+	        >= Compactor.SNIP_TRIGGER_TOKENS)
 
 
 def test_recent_results_survive_micro_compact(tmp_path):

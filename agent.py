@@ -7,6 +7,7 @@ from anthropic import Anthropic
 from dotenv import load_dotenv
 
 import usage
+from config import ROUND_WARN
 from hooks import trigger_hooks
 
 load_dotenv()
@@ -241,6 +242,28 @@ def clip_for_event(output: str) -> str:
 	return (f"{output[:EVENT_RESULT_CHARS]}\n"
 	        f"... [display truncated: {len(output)} chars total]")
 
+def round_warn(rounds: int, max_rounds: int) -> str:
+	"""轮数快用完时塞给模型的那一句。
+
+	报的是**这一次调用是第几次**、以及**它后面还允许几次** —— 不报"还剩几次"
+	这种含糊说法:循环顶部先自增再算,`max_rounds - rounds` 是"这一次之后
+	剩的",而模型读"还剩 3 次"时多半把当前这次也算进去,两边差一。差一在这
+	里不是小事:最后一次调用收到的提醒要是写着"还剩 1 次",它会以为还能再调
+	一个工具,而那一次之后循环直接停 —— 前面几十轮的工作一个字都交付不出去。
+
+	三件事缺一不可:第几次、后面还有几次、**没做完的要说出来**。
+
+	最后那句不是客套。子 agent 拿不到别的信号 —— tools/subagent.py 只把
+	outcome 摊平成一段文本交回主 agent,主 agent 看不到它的中间过程。提醒
+	如果只说"赶紧收尾",模型的自然反应是编一句"已完成",而那两个结论长得
+	一模一样,主 agent 会拿半成品当结果往下做。
+	"""
+	after = max_rounds - rounds
+	return (f"<reminder>Round budget: this is API call {rounds} of {max_rounds}, "
+	        f"with {after} more allowed after this one. Stop starting new work. "
+	        "Finish or answer now; if the task is not done, say plainly what is "
+	        "done and what is missing - do not claim completion.</reminder>")
+
 def agent_loop(messages: list, active_request: str, system: str, tools: list,
                model: str, max_rounds: int, compactor, emit, ask,
                record=_drop, checkpoint=None, stream: bool = True) -> TurnOutcome:
@@ -342,12 +365,44 @@ def agent_loop(messages: list, active_request: str, system: str, tools: list,
 		# 切片赋值改的是原对象的内容,prepare 返回同一个还是新的都对。
 		messages[:] = compactor.prepare(messages, active_request, checkpoint)
 
+		# 轮数快用完了,提前说一声。判据是"这一次之后还剩几次"(rounds 已自增
+		# 过):0 就是最后一次,那一次的提醒最要紧 —— 它必须让模型给出答复,
+		# 而不是再开一个工具调用,否则这一轮什么都不会交付。
+		#
+		# 只进这一次请求的 payload,不进 messages。跟 todo 那个提醒不同:
+		# 那条留在 history 里是无害的唠叨,这条留到下一轮就成了主动使坏 ——
+		# 用户换个问题再问,模型一上来就看见"预算要没了",于是草草答一句。
+		# 它会一直赖在那儿,直到被压缩归档。
+		#
+		# 也不能写成"先 append 进 messages、调用完再 pop":中间隔着上面那句
+		# prepare(),它会 messages[:] = 重建整个列表(snip_compact 归档中段、
+		# compact_history 整段换摘要)。等回来再按位置删,删掉的很可能已经
+		# 是另一条消息,而且不报错 —— 正是"改错了静默毁历史"那一类。
+		#
+		# 位置在 prepare 之后:提醒是这一次请求的临时装饰,不是历史,不该被
+		# 压缩器看见。此刻 messages 停在完整回合上,尾巴是那条带 tool_result
+		# 的 user 消息,并进它而不是另起一条,形状跟 todo 提醒一致。
+		payload = messages
+		if 0 <= max_rounds - rounds < ROUND_WARN:
+			warn = {"type": "text", "text": round_warn(rounds, max_rounds)}
+			tail = messages[-1]
+			if isinstance(tail.get("content"), list):
+				payload = [*messages[:-1],
+				           {**tail, "content": [*tail["content"], warn]}]
+			else:
+				# Stop hook 塞进来的那条控制消息是纯字符串,顺序展开会炸成
+				# 一个个字符。退成另起一条 user —— 连续两条 user 是合法的。
+				payload = [*messages, {"role": "user", "content": [warn]}]
+			# 记进库里那条是"模型当时看到了什么"。不进 history 是另一回事:
+			# context 那份存的是可继续的对话,这条只属于这一次请求。
+			record("control", "user", [warn])
+
 		try:
 			response = call_api(
 				client,
 				emit,
 				model=model,
-				messages=messages,
+				messages=payload,
 				system=system,
 				tools=wire,
 				max_tokens=8000,

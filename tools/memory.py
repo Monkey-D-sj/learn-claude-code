@@ -39,6 +39,7 @@ from config import (
 	WORKDIR,
 )
 from tools.base import ToolDesc
+from tools.filelock import path_lock
 
 # 给模型看的路径。写成相对 WORKDIR 的形式:它手里的 read_file / bash 都是
 # 从 WORKDIR 出发的,给绝对路径只会多一串它用不上的前缀,还得自己截。
@@ -243,12 +244,20 @@ def run_memory(path: Path, action: str, content: str = "",
 	分支都抄一遍"参数是不是空的"。
 	"""
 	action = (action or "").strip().lower()
-	if action == "add":
-		return _add(path, content)
-	if action == "remove":
-		return _remove(path, match)
-	if action == "update":
-		return _update(path, match, content)
+	# **读—校验—写整段上锁**(见 tools/filelock.py)。两个会话同时往同一份记忆里
+	# 写,不加锁的话后写的那次用的是它读到的旧内容 —— 两条只活下来一条,而两边
+	# 都收到 "Added."。容量检查也必须在这把锁里:不然两个 add 各自看到"还没满"
+	# (29/30),一起写进去就是 31 条,上限形同虚设。
+	#
+	# 锁放在这一层而不是 _add / _remove / _update 里各写一遍:这是它们唯一的
+	# 入口,放这儿就不会有哪个分支漏掉;将来加一个动作也自动在锁里。
+	with path_lock(path):
+		if action == "add":
+			return _add(path, content)
+		if action == "remove":
+			return _remove(path, match)
+		if action == "update":
+			return _update(path, match, content)
 	return (f"Error: unknown action {action!r}. "
 	        f"Use one of: add, remove, update.")
 
