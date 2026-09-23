@@ -185,6 +185,7 @@
   .thead .no { color: var(--dim); }
   .turn[data-status="running"] .thead .state { color: var(--tool); }
   .turn[data-status="failed"]  .thead .state { color: var(--err); }
+  .turn[data-status="unsaved"] .thead .state { color: var(--err); }
 
   /* 一轮的花费小结。排在正文**下面**,不跟着抬头 —— 它是读完这一轮之后
      才想知道的数,不是开始读之前。抬头留轮号和状态,这儿留钱,不打架。
@@ -422,6 +423,10 @@
     margin: 3px 0 3px 2px;
   }
   .error { color: var(--err); font: 12.5px/1.6 var(--mono); margin: 6px 0; }
+  .copy { padding: 2px 8px; margin-top: 4px; background: var(--raised);
+    color: var(--fg); border: 1px solid var(--line); border-radius: 6px;
+    font: 12px var(--mono); cursor: pointer; }
+  .copy:hover { background: #1d2430; border-color: #2f3a4d; }
 
   /* ---- 权限确认 ----
      不在 #bar 里,所以 setComposer 禁输入框的时候它照样可点 —— agent 那头
@@ -606,7 +611,8 @@ function add(node, target) {
 // 只有第三个是从库里重建的,前两个是过程。两者靠事件游标 cursor 划清界限,
 // 见 loadTurns。
 
-const STATE_TEXT = { running: "运行中", completed: "完成", failed: "失败" };
+const STATE_TEXT = { running: "运行中", completed: "完成", failed: "失败",
+                     unsaved: "未入库" };
 
 function turnBox(id, no) {
   let box = TURNS.get(id);
@@ -741,6 +747,14 @@ function renderTurn(t) {
 
   if (t.status === "failed" && t.error_message) {
     box.appendChild(el("div", "error", t.error_message));
+  }
+  // 保存失败的那一轮,库里还停在 running(终态那次写没成功)——光看库里的
+  // 状态,刷新之后页面只会显示"运行中",而真相是它已经跑完、只是没存上。
+  // 那一轮到底跑成什么样、为什么没存上,只有服务端内存里那份记录知道。
+  if (t.unsaved) {
+    setState(t.id, "unsaved", t.error_message);
+    box.appendChild(saveFailureBox({ model_status: t.unsaved.model_status,
+                                     save_error: t.unsaved.error }));
   }
   setUsage(t.id, t.usage);
   follow();
@@ -1432,6 +1446,41 @@ function settleLive(turnId, target, fresh) {
   return true;
 }
 
+// 复制一段文字。页面是 127.0.0.1(http),算 secure context,clipboard 能用;
+// 失败也得有人说话 —— 按钮自己变成"复制失败",而文字就在旁边,手动选也行。
+function copyBtn(text, label) {
+  const name = label || "复制";
+  const b = el("button", "copy", name);
+  b.type = "button";
+  b.onclick = async () => {
+    try {
+      await navigator.clipboard.writeText(text);
+      b.textContent = "已复制";
+    } catch (err) {
+      b.textContent = "复制失败(手动选中)";
+    }
+    setTimeout(() => { b.textContent = name; }, 1500);
+  };
+  return b;
+}
+
+// "执行结束了,但结果没存进库"。
+//
+// 为什么要单独一块红字,而不是照旧发一条"完成":库里那一轮**还停在 running**
+// (终态那一次写就没成功),工作上下文也还是旧的 —— 下一轮会从旧的那份接着
+// 跑。把它画成普通完成,用户就会以为可以放心接着聊。
+function saveFailureBox(ev) {
+  const box = el("div", "error");
+  const what = STATE_TEXT[ev.model_status] || ev.model_status || "结束";
+  box.appendChild(el("div", null,
+    "执行已结束(" + what + "),但这一轮的结果没存进库:刷新会退回上一轮。" +
+    (ev.save_error ? " " + ev.save_error : "")));
+  // 这段文字可能没进库(记消息那条热路径和收尾那次写是两条,可能一起坏),
+  // 页面上这份就是唯一一份 —— 所以给一个复制按钮。
+  if (ev.text) box.appendChild(copyBtn(ev.text));
+  return box;
+}
+
 function render(ev) {
   // 先归位,再画。带 turn_id 的按 id 找容器 —— 轮询可能从半截接上,那时
   // 屏幕上连这一轮的盒子都还没有,得现建;没有 turn_id 的是旧版记录,
@@ -1491,6 +1540,10 @@ function render(ev) {
     // 花费跟终态一起来,理由相同 —— 而且到这一刻这一轮的账才记完。
     // 刷新那一路由 renderTurn 补,两条路画的是同一行字符串。
     if (ev.turn_id && ev.usage) setUsage(ev.turn_id, ev.usage);
+    // 保存失败:状态词已经由上面那句 setState 画成"未入库"了,这里补那句
+    // 人话和复制按钮。判断用 ev.saved,不用 ev.status —— 后者是给页面看的
+    // 显示值,前者才是"存没存上"这件事本身。
+    if (ev.saved === false) add(saveFailureBox(ev));
 
   } else {
     // 认不出来的也显示,别默默吞掉 —— 将来加了新 kind,页面上至少

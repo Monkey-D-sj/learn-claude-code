@@ -314,6 +314,15 @@ ASK_TIMEOUT = 300.0
 # 那边不报错,只会留下一个永远清不掉的槽。
 PENDING: dict[str, dict] = {}
 
+# **这一轮的结果没存进库**的记录。key 是 sid,value 是补写所需的那份参数
+# (turn_id / 终态 / 最终上下文)。
+#
+# 为什么留在进程里而不是库里:库正是写不进去的那一方。它只活到"这个会话的下
+# 一次请求"为止 —— 那一刻先把这份补写进去(**不重跑模型、不重跑工具**,手上
+# 就有最终上下文),补进去了才允许开新的一轮;补不进去就回 503。少了这道闸,
+# 下一轮会拿那份**旧上下文**继续跑,而模型完全看不出上一轮发生过什么。
+UNSAVED: dict[str, dict] = {}
+
 
 def _ask_and_wait(emit, sid: str, turn_id: str, mode: str,
                   **fields) -> tuple[dict | None, str]:
@@ -390,6 +399,17 @@ def make_ask_text(emit, sid: str, turn_id: str):
 		                        question=question, options=options)
 		return None if slot is None else slot.get("answer")
 	return ask_text
+
+
+def _save_failure_text(conflict: bool, detail: str) -> str:
+	"""保存失败那句人话。两种情况分开说 —— 它们要用户做的事不一样。"""
+	if conflict:
+		return (f"这一轮在库里已经是终态(状态冲突),这次算出来的工作上下文"
+		        f"**没有**写进去:下一轮会从库里已有的那份接着跑,可能少了这一轮的"
+		        f"记录。这不是库坏了:{detail}")
+	return (f"这一轮跑完了,但结果没存进库(刷新会退回上一轮):{detail}。"
+	        f"库里这一轮还停在 running;下一次问这个会话会先试着把它补上,"
+	        f"补不上就不会开新的一轮。")
 
 
 def trim_dangling_tool_use(history: list) -> int:
@@ -536,6 +556,20 @@ class Handler(BaseHTTPRequestHandler):
 				 "turn_id": slot["turn_id"]}
 				for rid, slot in list(PENDING.items()) if slot["session"] == sid
 			]
+
+		# "这一轮的结果没存进库"那份记录也要一起给,理由跟上面一样:它在库里
+		# 读不出来 —— 保存失败的话那一轮**还停在 running**(终态那一次写就没
+		# 成功),刷新之后页面只会显示"运行中",而真相是它已经跑完了、只是
+		# 没存上。少了这一句,用户会以为它还在干活,或者以为自己的活白干了。
+		#
+		# 只在**这一轮**还在库里挂着的时候报:补写成功之后库里就是终态了,
+		# 那份记录也没了(见 _flush_unsaved),两条路不会同时说话。
+		unsaved = UNSAVED.get(sid)
+		if unsaved:
+			for turn in payload["turns"]:
+				if turn["id"] == unsaved["turn_id"]:
+					turn["unsaved"] = {"model_status": unsaved["status"],
+					                   "error": unsaved["error"]}
 		self._send_json(payload)
 
 	def _get_events(self, sid: str, query: dict):
@@ -672,6 +706,29 @@ class Handler(BaseHTTPRequestHandler):
 		self.end_headers()
 		self.wfile.write(out)
 
+	def _flush_unsaved(self, sid: str) -> bool:
+		"""把上一轮没存进库的那份补写进去。补上了(或者本来就没有)返回 True。
+
+		**它不重跑模型、也不重跑工具** —— 手上就有最终上下文和终态,补的是写。
+		"恢复保存时工具执行次数不增加"那条验收说的就是这件事。
+
+		补写在开新的一轮**之前**,而且在同一把会话锁里:补不上就不开新轮
+		(调用方回 503),因为开了的话模型会拿着一份少了上一轮的上下文往下跑,
+		而它看不出少了什么。
+		"""
+		pending = UNSAVED.get(sid)
+		if pending is None:
+			return True
+		try:
+			STORE.finish_turn(sid, pending["turn_id"], pending["status"],
+			                  pending["error"], pending["messages"])
+		except Exception:
+			# 还是写不进去。记录留着,下一次请求再试 —— 补写这件事本身是幂等
+			# 的(同一个事务里的 upsert + 条件更新)。
+			return False
+		UNSAVED.pop(sid, None)
+		return True
+
 	def _post_ask(self):
 		body = self._json_body('{"session": "...", "query": "..."}')
 		if body is None:
@@ -692,6 +749,9 @@ class Handler(BaseHTTPRequestHandler):
 			self.send_error(409, "this session already has a turn running")
 			return
 		try:
+			if not self._flush_unsaved(sid):
+				self.send_error(503, "previous turn result is not saved yet")
+				return
 			self._run_turn(sid, query)
 		finally:
 			lock.release()
@@ -736,6 +796,10 @@ class Handler(BaseHTTPRequestHandler):
 		# 以预料之外的方式跳出去,收尾时手里也有个说得通的终态,而不是
 		# NameError —— 那会让这一轮永远停在 running。
 		outcome = TurnOutcome("failed", "", "这一轮没有跑完")
+		# "模型跑出什么"和"存没存上"分开记:后者在下面的 finally 里被改写。
+		# 放在 try 外面,是因为 finally 要写它们,而 finally 在任何一条路径上
+		# 都会跑到 —— 只写在 except 里的话,正常跑完那条路上它们是未定义的。
+		saved, save_error = True, ""
 		try:
 			trigger_hooks("UserPromptSubmit", query)
 			# 用户那条 begin_turn 已经写进 turn_messages 了(它是开轮那个
@@ -781,11 +845,22 @@ class Handler(BaseHTTPRequestHandler):
 				STORE.finish_turn(sid, turn["id"], outcome.status, outcome.error,
 				                  history)
 			except Exception as e:
-				# 这一轮没存上,用户必须知道(刷新会退回上一轮)。流可能已经
-				# 断了,所以走 emit_quietly —— 库里那条 note 照样落得下。
+				# **模型跑出什么,和这一轮存没存上,是两件事。** 这里只改后
+				# 一件:保存失败不能跟着 outcome.status 一起发出去 —— 页面会
+				# 把它画成普通的"完成",而库里那一轮还是 running、工作上下文
+				# 还是旧的,用户接着问就静默地少了一整轮。
+				saved, save_error = False, f"{type(e).__name__}: {e}"
+				# 状态冲突单独说:那不是"库坏了",是这一轮在库里已经是终态
+				# (被 reap 收过)。它重试也没用(finish_turn 会一直抛),所以
+				# 不进 UNSAVED 那道闸 —— 进了的话这个会话就永远问不下去了。
+				conflict = isinstance(e, TurnStateConflict)
+				if not conflict:
+					UNSAVED[sid] = {"turn_id": turn["id"],
+					                "status": outcome.status,
+					                "error": outcome.error,
+					                "messages": history}
 				emit_quietly(emit, {"kind": "note", "source": "store",
-				                    "text": f"这一轮的上下文没存上(刷新会退回上一轮): "
-				                            f"{type(e).__name__}: {e}"})
+				                    "text": _save_failure_text(conflict, save_error)})
 
 		# reply 排在收尾**之后**发。反过来的话,页面收到 reply 时库里的
 		# status 还是 running,而它的游标已经越过这条事件 —— 刷新也补不
@@ -795,8 +870,15 @@ class Handler(BaseHTTPRequestHandler):
 		# 到这儿账已经记完了。放在这里面,页面不用为一个数字再跑一趟 ——
 		# 而且那一趟还得解决"什么时候去要"的问题,而"这一轮刚结束"正好
 		# 就是这里。
+		#
+		# **status 发的是"这个页面该显示成什么",不是模型的心气。** 保存失败
+		# 时发 unsaved:发 completed 就等于告诉页面"存好了,可以接着聊",而
+		# 库里那一轮还是 running、上下文还是旧的。model_status 那份照旧发出去,
+		# 因为"执行完了"和"存上了"是两件事,用户两个都要知道。
 		emit_quietly(emit, {"kind": "reply", "text": outcome.text,
-		                    "status": outcome.status,
+		                    "status": outcome.status if saved else "unsaved",
+		                    "model_status": outcome.status,
+		                    "saved": saved, "save_error": save_error,
 		                    "usage": usage.turn_line(
 			                    usage.read_turn(sid, turn["id"]), prefix="")})
 
