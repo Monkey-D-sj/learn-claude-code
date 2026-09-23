@@ -79,6 +79,7 @@ import usage
 # 写死的 8765(改要一起改),dev.py 也认 8765。
 PORT = int(os.environ.get("AGENT_PORT") or "8765")
 PAGE = Path(__file__).parent / "ui" / "index.html"
+PET_IMAGE = Path(__file__).parent / "ui" / "assets" / "whale-girl.png"
 
 # **这个库的排他锁和 STORE 都不是 import 时装上的**,理由见 open_store()。
 #
@@ -476,6 +477,8 @@ class Handler(BaseHTTPRequestHandler):
 		parts, query = route(self.path)
 		if not parts:
 			self._page()
+		elif parts == ["assets", "whale-girl.png"]:
+			self._pet_image()
 		elif parts == ["sessions"]:
 			self._get_sessions()
 		elif len(parts) == 3 and parts[0] == "session" and parts[2] == "events":
@@ -492,6 +495,15 @@ class Handler(BaseHTTPRequestHandler):
 		self.send_header("Content-Type", "text/html; charset=utf-8")
 		self.send_header("Content-Length", str(len(body)))
 		self.send_header("Cache-Control", "no-store")
+		self.end_headers()
+		self.wfile.write(body)
+
+	def _pet_image(self):
+		body = PET_IMAGE.read_bytes()
+		self.send_response(200)
+		self.send_header("Content-Type", "image/png")
+		self.send_header("Content-Length", str(len(body)))
+		self.send_header("Cache-Control", "public, max-age=86400")
 		self.end_headers()
 		self.wfile.write(body)
 
