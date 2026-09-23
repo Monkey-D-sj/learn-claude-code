@@ -22,10 +22,17 @@ python main.py
 
 # 3B. 浏览器
 python server.py     # 然后打开 http://localhost:8765/
+
+# 3B'. 浏览器(开发时用这个:改 .py 自动重启,不用手动停/起)
+uv run dev.py
 ```
 
 两个前端共用同一套提示词、工具集和压缩逻辑(接线都在 `app.py`),区别只在
 "怎么收输入、往哪块屏幕画"。
+
+`dev.py` 只在**没有轮在跑**的时候重启,所以"让 agent 改自己的服务端代码"是安全的:
+那一轮用旧代码跑完,下一轮才是新代码。改 `ui/index.html` 不用重启 —— 页面是每次
+请求现读的,刷一下浏览器就生效。
 
 终端里输入 `q`、`exit` 或直接回车退出。
 
@@ -62,7 +69,7 @@ python server.py     # 然后打开 http://localhost:8765/
 |---|---|
 | `agent.py` | `call_api()`(唯一网络出口,3 次指数退避)和 `agent_loop()` 主循环 |
 | `context.py` | `ContextCompactor` —— 四层上下文压缩 |
-| `config.py` | `WORKDIR`、`MAX_ROUNDS=50`、落盘目录 |
+| `config.py` | `WORKDIR`、`MAX_ROUNDS=50`、`ROUND_WARN=3`、落盘目录 |
 | `emit.py` | 终端渲染器。叶子模块,不 import 项目内任何东西(防循环依赖) |
 | `app.py` | 两个前端共用的 SYSTEM 提示词 / MODEL / 压缩器工厂 |
 | `main.py` | 终端前端(REPL) |
@@ -277,6 +284,26 @@ partial 进去,而 `build_tools` 那个 `ask_user` **故意不给默认值** —
 **压缩只能在循环顶部做。** 此处 `messages` 必定停在完整回合上。切在 `tool_use`
 和它的 `tool_result` 之间,下次请求直接 400。同理,`max_rounds` 也在循环顶部查,
 不在工具执行完之后返回。
+
+**轮数提醒只进当次请求,不进 history。** 剩 `ROUND_WARN`(3)轮的时候,往这一次
+的 payload 里塞一句"这是第几次调用、后面还允许几次、别再开新活、没做完的要明说"。
+判据是"这一次之后还剩几次"(`rounds` 已经自增过),0 就是最后一次 —— 报"还剩几次"
+这种含糊说法会差一,而差一在这里正咬人:最后一次调用收到的提醒要是写着"还剩 1 次",
+模型会再调一个工具,那一次之后循环直接停,前面几十轮的工作一个字都交付不出去。
+
+它跟 todo 那条提醒形状一样,待遇不同。todo 那条是写进 `messages` 的,留到下一轮
+只是句无害的唠叨;`你只剩 1 轮` 留到下一轮就是主动使坏 —— 用户换个问题再问,模型
+一上来就看见"预算要没了",于是草草答一句,而且会一直赖在那儿直到被压缩归档。
+所以它只活在这一次的 payload 里。
+
+也不能写成"先 append 进 `messages`、调用完再 pop":中间隔着 `compactor.prepare()`,
+它会 `messages[:] =` 重建整个列表(`snip_compact` 归档中段、`compact_history` 整段
+换摘要),等回来再按位置删,删掉的很可能已经是另一条消息,而且不报错。
+
+末句"没做完的要明说"不是客套。子 agent 拿不到别的信号 —— `tools/subagent.py` 只把
+`outcome` 摊平成一段文本交回主 agent,主 agent 看不到它的中间过程。提醒如果只说
+"赶紧收尾",模型的自然反应是编一句"已完成",而那两个结论长得一模一样,主 agent
+会拿半成品当结果往下做。
 
 **`call_api` 是全项目唯一的重试出口。** 谁要直连 `client.messages.create`,
 就绕过了所有退避策略(包括压缩器那次摘要调用)。SDK 自己的重试关掉了

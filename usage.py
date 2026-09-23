@@ -179,15 +179,11 @@ def money(value: float | None, currency: str = CURRENCY) -> str:
 	return f"{head}{text}" if text != "0" else f"{head}{value:.2e}"
 
 
-def read_turn(session: str, turn) -> list[dict]:
-	"""把某一轮已经落盘的记录捞回来。给前端做一行小结用。
+def _read_records() -> list[dict]:
+	"""把整份账本读回来。坏行跳过,不吭声。
 
-	**从文件读,不在内存里另攒一份。** 账本是唯一真源;攒一份的话"屏幕上显示的"
-	和"账上记的"就成了两份,而它们漂了不报错 —— 屏幕上少一行,账上一条不少。
-	顺带,读回来也算验了一下写有没有落下去。
-
-	代价是每轮 O(账本行数)。一行几百字节,几万次调用也才几 MB,毫秒级 ——
-	换掉"两份可能不一致"这个问题,值。
+	跳过是对的:一行写坏(进程正好在 append 中途被杀)不该让整个报表读不
+	出来。数量由 report.py 那边统计,所以也不是丢了没人知道。
 	"""
 	if not USAGE_PATH.exists():
 		return []
@@ -196,24 +192,57 @@ def read_turn(session: str, turn) -> list[dict]:
 		if not line.strip():
 			continue
 		try:
-			record = json.loads(line)
+			out.append(json.loads(line))
 		except ValueError:
-			continue                      # 坏行跳过;数量由报表那边报
-		if record.get("session") == session and record.get("turn") == turn:
-			out.append(record)
+			continue
 	return out
 
 
-def turn_line(records: list[dict]) -> str | None:
-	"""终端每跑完一轮打的那一行。没有记录时返回 None(什么都不打)。
+def read_turn(session: str, turn) -> list[dict]:
+	"""把某一轮已经落盘的记录捞回来。给终端做一行小结用。
+
+	**从文件读,不在内存里另攒一份。** 账本是唯一真源;攒一份的话"屏幕上显示的"
+	和"账上记的"就成了两份,而它们漂了不报错 —— 屏幕上少一行,账上一条不少。
+	顺带,读回来也算验了一下写有没有落下去。
+
+	代价是每轮 O(账本行数)。一行几百字节,几万次调用也才几 MB,毫秒级 ——
+	换掉"两份可能不一致"这个问题,值。
+	"""
+	return [record for record in _read_records()
+	        if record.get("session") == session and record.get("turn") == turn]
+
+
+def read_session(session: str) -> dict:
+	"""一个会话里每一轮的记录,按 turn 分好组。整份账本只读一遍。
+
+	给轮次接口用 —— 那儿一次要的是**所有**轮的小结,按轮各调一次
+	read_turn 等于把同一个文件读 N 遍:N 随会话长度涨,而读到的内容
+	一模一样。
+
+	没有归属的账(turn 是 None:spans 之外的调用)也会收进来,挂在
+	None 这个键上。丢掉的话,那笔钱就永远不出现在任何地方。
+	"""
+	grouped: dict = {}
+	for record in _read_records():
+		if record.get("session") == session:
+			grouped.setdefault(record.get("turn"), []).append(record)
+	return grouped
+
+
+def turn_line(records: list[dict], prefix: str = "[本轮] ") -> str | None:
+	"""每跑完一轮打的那一行。没有记录时返回 None(什么都不打)。
 
 	**钱只在算得出来的时候显示。** 价目表没填时打一个 "$0" 是最坏的选择 ——
 	那句话的意思是"这一轮没花钱"。不显示比显示错的强。
+
+	prefix 给浏览器留的:页面里那一行在轮次框内部,"[本轮]" 是终端才需要的
+	指代。格式化本身只写一遍 —— money/hit_rate 那几条规矩(None 和 0 不同、
+	币种跟着记录走、命中率的分母是输入总量)不可能在 JS 里再写对一次。
 	"""
 	row = summarize(records)
 	if not row["calls"]:
 		return None
-	line = (f"[本轮] {row['calls']} 次调用 · "
+	line = (f"{prefix}{row['calls']} 次调用 · "
 	        f"输入 {row['total_input']:,}"
 	        f"(命中 {row['cache_read_input_tokens']:,} / {hit_rate(row)}) · "
 	        f"输出 {row['output_tokens']:,} · "
