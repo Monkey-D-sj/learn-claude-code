@@ -112,13 +112,15 @@ python server.py     # 然后打开 http://localhost:8765/
 问题该往哪条流上问),就写成工厂,由 `build_tools` 现造 —— `todo_write` 和
 `ask` 就是这两个,`BASE_TOOLS` 里没有它们。
 
-`compress` 也属于"要绑东西"的一类,但它绑的那份 `messages` **每轮都换**(甚至
-在同一轮里被压缩改过),没有"造工具的那一刻"可以挂上去 —— 所以它走
-`contextvar`(`context.bind_messages`),由 `agent_loop` 在跑 handler 之前 bind。
+`compress` / `recall` 这一对也属于"要绑东西"的一类,但它俩绑的东西都没有
+"造工具的那一刻"可以挂上去 —— 所以两个都走 `contextvar`,各绑各的
+(`tools/compress.py`,一个模块管号的两头):
 
-`recall` 同理,只是它绑的是**这个会话的取回器**(会话库 + 会话 id + 压缩器)——
-`server.py` 跑一轮之前 bind(`tools.recall.bind_recall`)。没绑上时代码不会崩,
-工具会如实回一句"现在没接会话库"。
+- `compress` 绑**当前那份 `messages`** —— 它每轮都换(甚至在同一轮里被压缩
+  改过),由 `agent_loop` 在跑 handler 之前 bind(`context.bind_messages`)
+- `recall` 绑**这个会话的取回器**(会话库 + 会话 id + 压缩器)—— 由 `server.py`
+  跑一轮之前 bind(`tools.compress.bind_recall`)。没绑上时代码不会崩,工具会
+  如实回一句"现在没接会话库"
 
 ## Hooks
 

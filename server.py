@@ -71,7 +71,7 @@ from hooks import trigger_hooks
 from sessions import DB_PATH, SessionStore, TurnStateConflict
 from tools import build_tools
 from tools.memory import load_memory
-from tools.recall import bind_recall, make_recall
+from tools.compress import bind_recall, make_recall
 from tools.todo import TodoManager
 import usage
 
@@ -266,7 +266,7 @@ def make_recorder(turn_id: str):
 	号是内存里数的,写失败会留下空号 —— 允许,这一版明确不重编号。
 
 	**返回值必须原样交出去。** 它就是那一行的行号,而循环拿它当号拼在结果
-	正文的尾巴上(tools/recall.py 按这个号查回原文)。吞掉它的话号发不出来
+	正文的尾巴上(tools/compress.py 的 recall 按这个号查回原文)。吞掉它的话号发不出来
 	—— 表现是模型看不见任何号、compress 和 recall 一起变成哑的,而且不报错。
 	"""
 	counter = count(2)

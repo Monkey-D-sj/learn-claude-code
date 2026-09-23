@@ -1,13 +1,12 @@
 from tools.ask import make_ask_tool
 from tools.base import ToolDesc
 from tools.bash import bash
-from tools.compress import compress
+from tools.compress import compress, recall
 from tools.edit import edit_file
 from tools.glob import glob
 from tools.grep import grep
 from tools.memory import memory_tool, user_memory_tool
 from tools.read import read_file
-from tools.recall import recall
 from tools.skill import skill
 from tools.subagent import task
 from tools.todo import TodoManager, make_todo_write
@@ -22,12 +21,10 @@ from tools.write import write_file
 #
 # 所以它俩现造,由 build_tools 挂在后面。
 #
-# compress 也是"要绑一个东西"的,但绑的那份 messages 是**每轮**都换的(甚至
-# 在同一轮里被压缩改过),没有"造工具的那一刻"可以挂上去 —— 所以它走
-# contextvar,由 agent_loop 在跑 handler 之前 bind,见 tools/compress.py。
-#
-# recall 同理,但它绑的是**这个会话的取回器**(库 + 会话 id + 压缩器),由
-# server.py 跑一轮之前 bind —— 见 tools/recall.py。
+# compress 和 recall 这对也是"要绑一个东西"的,但绑的东西没有"造工具的那一刻"
+# 可以挂上去 —— 所以它俩都走 contextvar,见 tools/compress.py:
+#   compress 绑当前那份 messages,由 agent_loop 每轮 bind
+#   recall   绑这个会话的取回器(库 + 会话 id + 压缩器),由 server.py 每轮 bind
 BASE_TOOLS = [
 	bash, read_file, write_file, edit_file, glob, grep, skill, vision,
 	memory_tool, user_memory_tool, task, compress, recall,

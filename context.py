@@ -180,8 +180,8 @@ def stamp_tag(content: str, tag: str) -> str:
 	每轮重算就会改内容、改前缀,prompt cache 每轮冲一次。
 
 	**号由调用方给**,不是这儿数的。现在是 sessions.db 里那一行的行号(见
-	tools/recall.py),于是"有号"就等于"这一段查得回来" —— 写不进去的结果没有
-	行号,也就没有号,模型看不见它自然点不动。
+	tools/compress.py 的 make_recall),于是"有号"就等于"这一段查得回来" ——
+	写不进去的结果没有行号,也就没有号,模型看不见它自然点不动。
 	"""
 	return (content + f"\n\n<message-id token={_count_tokens(content)}>"
 	                  f"{tag}</message-id>")
