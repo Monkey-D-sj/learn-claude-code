@@ -148,6 +148,10 @@
   }
   #head.busy .dot { background: var(--tool); animation: pulse 1.1s ease-in-out infinite; }
   #head.waiting .dot { background: var(--you); animation: none; }
+  /* 够不着后端。写在 .busy/.waiting 之后是有意的:够不着的时候那两个类名都是
+     上一次问到的旧值(刷新会话列表那一步也失败了,它是静默留着的),让红的赢 ——
+     "连不上"才是此刻唯一确定的事。 */
+  #head.down .dot { background: var(--err); animation: none; }
   @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .25 } }
   #head .name { color: var(--fg); font-weight: 600; letter-spacing: .2px; }
   #head .spacer { flex: 1; }
@@ -551,13 +555,25 @@
 </main>
 
 <script>
-// 后端在哪儿。页面由后端自己发出来的时候(8765)走相对路径就行;从别处打开
+// 后端在哪儿。页面由后端自己发出来的时候走相对路径就行;从别处打开
 // —— 比如 IDE 的内置预览服务(63342)—— 相对路径会打到那个服务上,那边
 // 没有 /ask,于是 404。所以按端口判断一下,不是后端发的就显式指过来。
 //
 // 改后端端口的话,server.py 的 PORT 和这行要一起改。
-const BACKEND = "http://127.0.0.1:8765";
-const API = location.port === "8765" ? "" : BACKEND;
+//
+// ?backend= 是给那堆一次性检查脚本用的:它们要在自己的端口上起一个临时库的
+// 实例,而绝不能去抢 8765 —— 那是你正开着的那个服务(它们以前会 taskkill
+// 掉它,页面于是死在"流断了: TypeError: network error")。
+//
+// 只认本机地址:这个参数会让页面把事件流、把 /ask、把"允许"指到一个任意
+// 后端上,给它一道门跟 server.py 里 is_local_origin 是同一路的谨慎。少了
+// 那个正则,一条链接就能把这一页交出去。
+const DEFAULT_BACKEND = "http://127.0.0.1:8765";
+const BACKEND = (() => {
+  const v = new URLSearchParams(location.search).get("backend");
+  return v && /^http:\/\/(127\.0\.0\.1|localhost):\d+$/.test(v) ? v : DEFAULT_BACKEND;
+})();
+const API = location.port === String(new URL(BACKEND).port) ? "" : BACKEND;
 
 const stream = document.getElementById("stream");
 const log = document.getElementById("log");
@@ -577,6 +593,7 @@ let current = null;      // 屏幕上是哪个会话
 let lastSeq = 0;         // 这个会话已经画到哪条事件 —— 库给的游标,只增
 let ownsStream = false;  // 本页是不是那一轮直播流的持有者
 let poller = null;       // 轮询定时器
+let screenBuilt = false; // 这个会话的屏幕建起来了吗(轮次框都在、lastSeq 是服务端给的)
 let composerOn = null;   // 输入框上一刻的状态,用来只在"重新可用"时抢焦点
 let TURNS = new Map();   // turn_id -> 那一轮的 <section>,已经画在屏幕上的
 let SINK = null;         // 新容器挂哪:null = stream;重放旧版记录时是那块区域
@@ -697,13 +714,16 @@ async function loadLegacy(sid) {
 
 // 切会话/刷新时重建轮次。画的是 turn_messages(原始消息),不是事件重放 ——
 // 两边都画就得写一套"这条事件对应哪条消息"的去重规则,而那种规则迟早会漏。
+//
+// 返回"建起来了没有":pollTick 要靠它判断"要不要整个重建"。这里失败是静默
+// return 的(后端不在而已),所以只能由返回值说出去,不能靠调用方猜。
 async function loadTurns(sid) {
   let data;
   try {
     const r = await fetch(API + "/session/" + sid + "/turns");
-    if (!r.ok) return;
+    if (!r.ok) return false;
     data = await r.json();
-  } catch { return; }
+  } catch { return false; }
 
   for (const t of data.turns) renderTurn(t);
 
@@ -718,6 +738,7 @@ async function loadTurns(sid) {
     if (ask.turn_id) turn = turnBox(ask.turn_id, null);
     add(renderAsk(ask));
   }
+  return true;
 }
 
 function blocksOf(content) {
@@ -900,26 +921,128 @@ function feed(sid, ev) {
   if (sid === current) renderIfNew(ev);
 }
 
+// 问一次后端:这个会话在跑吗?
+//
+// **三种结果,别把后两种混成一个**:
+//   true   在跑
+//   false  没在跑 —— 后端说了话,而它说没有
+//   null   **没问到** —— 传输失败、5xx、回的 JSON 坏了
+//
+// "没问到"和"没在跑"要的反应正好相反:前者必须继续盯着(后端一回来就接上),
+// 后者才是收工。把它当 false,后端一重启页面就以为轮次结束了;当成 true,又
+// 永远转圈。所以这个函数**绝不抛**:抛出去的话调用方(轮询、收尾)会各自在
+// 不同的地方断掉,而它们都需要拿到这个三态。
+//
+// 404 算 false:那是"这个会话被删了"(removeSession 那条路,别的标签页也能删),
+// 不是连不上。当 null 的话,后端明明活得好好的,页面却会一直转圈并说够不着。
 async function catchUp() {
   if (!current) return false;
-  const r = await fetch(API + "/session/" + current + "/events?since=" + lastSeq);
-  if (!r.ok) return false;
-  const data = await r.json();
+  let r;
+  try {
+    r = await fetch(API + "/session/" + current + "/events?since=" + lastSeq);
+  } catch {
+    return null;
+  }
+  if (r.status === 404) return false;
+  if (!r.ok) return null;
+  let data;
+  try {
+    data = await r.json();
+  } catch {
+    return null;
+  }
   for (const ev of data.events) renderIfNew(ev);
   setComposer(!data.running);
-  if (data.running && !ownsStream) startPolling();
-  else stopPolling();
   return data.running;
 }
 
-// 只在"当前会话在跑,而这条流不归本页"时才转。覆盖两种情形:页面刷过
-// (那条 POST 流没了),以及轮是别的标签页起的。
+// 轮询的一拍,也是"收尾那一拍"。**两条路必须走同一个函数** —— 这是这次修的东西:
+// 以前轮询只在 catchUp 的成功路径里被启动,而收尾那一下不经过它,于是"后端重启"
+// 时收尾抛出、轮询没起、输入框永远停在"运行中…",只能手动刷新。
+async function pollTick() {
+  if (!current) { stopPolling(); return; }
+  // 屏幕还没建起来(切会话时后端正好不在,loadTurns 静默失败了),而后端现在
+  // 回来了:得整个重建,不能补增量 —— lastSeq 还停在 0,补增量会把这一会话的
+  // 全部事件当散牌重画一遍(同一批东西画两遍,一遍在轮次框里、一遍散在流上)。
+  if (!screenBuilt && !ownsStream) {
+    const back = await pingBackend();
+    setLink(back);
+    if (back) { await switchTo(current); return; }
+    startPolling();
+    return;
+  }
+  const state = await catchUp();
+  setLink(state !== null);
+  if (state === false) {
+    stopPolling();
+    if (!ownsStream) settleDeadTurn();
+  } else {
+    startPolling();           // true 和 null 都盯着:null 要等它回来
+  }
+  refreshSessionsSoon();
+}
+
+// 后端还在吗?只看这一件事,不碰任何渲染状态。
+async function pingBackend() {
+  try {
+    return (await fetch(API + "/sessions")).ok;
+  } catch {
+    return false;
+  }
+}
+
+// 够不着后端的**那一刻/那一段**在页面上留痕。
+//
+// 为什么要一个独立的变量而不是从 catchUp 的返回值反推:这次事故的第一次翻转
+// 是 true→null(直播流断在半路),照"false→null 才提示"的字面写法正好漏掉。
+//
+// 每次翻转各打一条,不是每拍一条 —— 一次重启该看见两条,不是两条乘上它持续了
+// 多少秒。提示落在 stream 上(显式指定):不指定的话它会掉进当前那个轮次框里。
+//
+// 顶栏那个点是这里管的。`#hint` 平时是 setComposer 的地盘,唯一该由这里写的
+// 就是"刚够不着"那一刻:从那以后 setComposer 不再被调到(它只在问到的路上),
+// 而 hint 上会一直留着一句"运行中…" —— 够不着的时候那句话是假的。
+let linkUp = true;
+function setLink(up) {
+  head.classList.toggle("down", !up);
+  if (!up) hint.textContent = "连不上后端…";
+  if (up === linkUp) return;
+  linkUp = up;
+  add(el("div", "note", up
+    ? "[连接] 后端回来了,接着往下走"
+    : "[连接] 够不着后端了(重启?)。这边不停,它回来会自动接上"), stream);
+}
+
+// 一个还在"运行中"的轮次框,而服务端已经明确说这个会话没在跑了 —— 那就是
+// 进程被杀时留下的那一轮。它那句 reply 根本没发出来(reply 是这一轮最后才发的,
+// 见 server.py 的 _run_turn),所以光靠补事件补不上这个状态。
+//
+// 启动时的 reap 只管得住**刷新之后**的页面;活着的页面是从轮次接口读 status 的,
+// 不刷新就一直是"运行中"。而不刷新才是常态 —— 页面本来就不该逼人刷新。
+//
+// 靠 box.dataset.status 自己就是不重复的:settle 过的那一轮已经不是 running 了,
+// 下一拍再扫到它会跳过。所以这个函数可以在轮询里每拍调。
+const DEAD_TURN = "进程重启,这一轮没有跑完";
+
+function settleDeadTurn() {
+  for (const [id, box] of TURNS) {
+    if (box.dataset.status !== "running") continue;
+    setState(id, "failed", DEAD_TURN);
+    add(el("div", "error", DEAD_TURN), box);
+  }
+}
+
+// 只在"当前会话在跑、或者够不着后端"时才转。
+//
+// 注释里的"在跑"要理解成 pollTick 的三态:false 才停,null(够不着)也得接着转
+// —— 后端回来是**下一次问它**才知道的,没人问就永远不知道。
+//
+// 藏着不转(document.hidden):切回来看的那一眼最多晚 1.5 秒,不值得为它多写一套。
 function startPolling() {
   if (poller) return;
   poller = setInterval(async () => {
     if (document.hidden) return;
-    if (!(await catchUp())) { stopPolling(); }
-    refreshSessionsSoon();
+    await pollTick();
   }, 1500);
 }
 
@@ -934,6 +1057,7 @@ function blankScreen() {
   lastSeq = 0;
   TURNS = new Map();            // 屏幕清空了,那些盒子的引用也跟着作废
   SINK = null;
+  screenBuilt = false;
 }
 
 async function switchTo(sid) {
@@ -945,8 +1069,13 @@ async function switchTo(sid) {
   // 顺序要的:旧版记录先画,轮次后画 —— 它们本来就是"旧的在上、新的
   // 在下",而 DOM 里谁先挂进去谁在上面。
   await loadLegacy(sid);
-  await loadTurns(sid);
-  await catchUp();
+  if (sid !== current) return;  // 这几下都是网络往返,人可能已经点去别的会话了
+  // loadTurns 的返回值就是"屏幕建起来了没有":它成功时 lastSeq 已经被推到服务端
+  // 给的游标,轮次框也都挂上了。后端不在时它静默返回 false,这时屏幕是空的而
+  // lastSeq 还是 0 —— 后面 pollTick 会认这个标志,等后端回来整个重建。
+  screenBuilt = await loadTurns(sid);
+  if (sid !== current) return;
+  await pollTick();             // 收尾这一拍:问不着也得把轮询接上,见 pollTick
   refreshSessions();
 }
 
@@ -969,16 +1098,28 @@ async function newSession() {
   localStorage.setItem("agent.session", id);
   stopPolling();
   blankScreen();
+  // 新建的会话本来就什么都没有,空屏就是它正确的样子 —— 所以这才是"屏幕建好了"。
+  // 不认这个的话,下面那一轮收尾时 pollTick 会以为屏幕没建起来,反手重建一次:
+  // 内容一样(都是从库里画的),但是白跑一趟,而且屏幕会闪一下。
+  screenBuilt = true;
   paintSessions();
   setComposer(true);
 }
 
 async function removeSession(sid) {
-  const r = await fetch(API + "/session/" + sid + "/delete", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: "{}",
-  });
+  let r;
+  try {
+    r = await fetch(API + "/session/" + sid + "/delete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+  } catch {
+    // 后端不在。这次点击就是什么都没发生 —— 说一声,别让人对着没反应的按钮猜。
+    // (删除是点一次发生一次的事,不会刷屏,所以不必像轮询那样只在翻转时说话。)
+    add(el("div", "note", "[连接] 后端不在了,这次删除没送到。等它回来再删一次"), stream);
+    return;
+  }
   if (!r.ok) {
     add(el("div", "error", "没删掉: 后端 " + r.status +
         (r.status === 409 ? "(这一轮还在跑)" : "")));
@@ -1652,14 +1793,26 @@ form.addEventListener("submit", async (e) => {
     }
     if (buf.trim()) feed(sid, JSON.parse(buf));
   } catch (err) {
-    if (sid === current) add(el("div", "error", "流断了: " + err));
+    // 不是错误,是"这一轮被从外面打断了" —— 最典型的就是后端重启(dev.py 改完
+    // 代码重启、或者你手动停了服务)。所以是灰色旁注而不是红字。带上 err:这个
+    // catch 也接着 JSON.parse 的 SyntaxError,把文本丢了就查不出是哪种。
+    if (sid === current) {
+      add(el("div", "note",
+        "[连接] 这一轮读到一半连接断了(" + err + ")。正在等后端回来,回来了会自己接上"),
+        stream);
+    }
   }
   ownsStream = false;
 
-  // 收尾:这一轮的事件可能没画全(中途切走过),catchUp 补齐,顺带把
-  // running 带回来。服务端是先放锁再关连接,所以读到 EOF 时问它,一般
-  // 已经是 false —— 不会白转一个 1.5 秒的轮询。
-  await catchUp();
+  // 收尾:这一轮的事件可能没画全(中途切走过),补一下,顺带把 running 带回来。
+  // 服务端是先放锁再关连接,所以读到 EOF 时问它,一般已经是 false —— 不会白转
+  // 一个 1.5 秒的轮询。
+  //
+  // **走 pollTick 而不是直接 catchUp,就是这次修的东西**:后端刚重启时这一下
+  // 也会问不着,而"问不着"不等于"这一轮结束了" —— 那一拍必须顺手把轮询接上,
+  // 否则输入框永远停在"运行中…",只能手动刷新。加了 dev.py 之后这是最常见的
+  // 触发点,不是边角:一轮干净跑完、收尾这一拍正好撞上重启。
+  await pollTick();
   refreshSessions();
 });
 
@@ -1684,7 +1837,8 @@ newBtn.addEventListener("click", newSession);
 function backendHint(err) {
   return "连不上后端 " + (API || location.origin) + "。\n" +
     "  后端起了吗?在仓库目录跑:  .venv\\Scripts\\python.exe server.py\n" +
-    "  起了的话,直接开 http://localhost:8765/ —— 同源,不用跨域\n" +
+    "  起了的话,直接开 http://localhost:" + new URL(BACKEND).port +
+    "/ —— 同源,不用跨域\n" +
     "  (" + err + ")";
 }
 
@@ -1695,6 +1849,10 @@ async function boot() {
     sessions = (await (await fetch(API + "/sessions")).json()).sessions;
   } catch (err) {
     add(el("div", "error", backendHint(err)));
+    // 顶栏那个点也照实说。这里只点灯不发那条"[连接] …会自动接上"的旁注:这一步
+    // 之后没有任何轮询在跑,真没人会去接 —— 那是句空话,而上面那段提示才是能照做
+    // 的(把后端起起来,然后刷新)。
+    head.classList.add("down");
     return;
   }
   SESSIONS = sessions;
