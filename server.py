@@ -149,11 +149,10 @@ def is_running(sid: str) -> bool:
 
 
 def turn_tools(sid: str, turn_id: str) -> list:
-	"""这一轮多的那些工具:`agent`,以及 task 开启时的五个 task 工具。
+	"""`agent` 始终可用，task 开启时另加五个 task 工具。
 
-	**每轮现造**,跟以前造 todo 那个工具是同一个理由,只是范围大了:
-	它们全都绑着"哪个库、哪一轮",而这两样每轮才存在。顺带把会话开关
-	读进来 —— 关闭的会话里那五个工具**根本不进工具集**,不是进了再拒绝:
+	task 工具要绑定库与当前 turn,所以每轮现造；`agent` 本身不绑定 task。
+	会话开关也在这一轮开始时读入 —— 关闭的会话里那五个工具**根本不进工具集**,不是进了再拒绝:
 	列在那儿的话,模型会去用,然后拿到一句错误,而它会以为自己的调用方式
 	不对,换着法儿重试。
 
@@ -162,7 +161,7 @@ def turn_tools(sid: str, turn_id: str) -> list:
 	对不上,那一轮就再也恢复不了。
 	"""
 	enabled = STORE.task_enabled(sid)
-	tools = [make_agent_tool(STORE, turn_id, enabled)]
+	tools = [make_agent_tool()]
 	if enabled:
 		tools.extend(make_task_tools(STORE, turn_id))
 	return tools
@@ -511,14 +510,14 @@ def signature_tools(sid: str) -> list:
 	"正在跑的那一轮"或者一个真库。
 
 	**按 task 开关算两套,这是必须的。** 开关不同的会话,工具集真的不一样
-	(五个 task 工具在不在、agent 的 task_id 参数在不在),而恢复签名回答的
+	(五个 task 工具在不在),而恢复签名回答的
 	正是"模型当时看到的还是这一套吗"。用同一套签名糊过去的话,一个关着
 	task 的会话能恢复一轮当时开着 task 的检查点 —— 模型会拿着一条它现在
 	根本没有的工具调用往下跑。
 	"""
-	extra = [make_agent_tool(None, "", False)]
+	extra = [make_agent_tool()]
 	if STORE is not None and STORE.task_enabled(sid):
-		extra = [make_agent_tool(None, "", True), *make_task_tools(None, "")]
+		extra.extend(make_task_tools(None, ""))
 	return build_tools(lambda question, options: None, extra)
 
 

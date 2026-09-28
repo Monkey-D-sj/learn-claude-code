@@ -7,15 +7,13 @@
      反过来做(任务跟着会话走)在演示里看不出来,只会在"换个会话就找不到
      自己的活了"那天暴露
   二、认领必须原子:两个会话同时抢一条 ready 任务,恰好一个成功 —— 先读
-     后写的话两个都会成功,而后果是同一个任务被两个子 agent 同时改同一批
-     文件
+     后写的话两个都会成功,任务归属就不再确定
   三、依赖是图不是树:多前置全完成才 ready,环、自依赖、重复边都要拒
-  四、运行中的任务不可改:子 agent 正按着当时那份 description 干活,改掉
-     之后它交回来的东西是按一套要求做的、按另一套评判的
+  四、运行中的任务不可改:执行期间改变要求会让完成判据漂移
   五、任何情况下都不自动重试:失败、中断、进程重启之后任务停在
      in_progress,等人核对过再显式 retry
   六、关着 task 的会话**根本看不到**那些工具,而不是看得见调不动
-  七、任务写入和依赖边同事务,而且**事务不跨越模型调用和子 agent 执行**
+  七、任务写入和依赖边同事务,而且**事务不跨越模型调用和 agent 执行**
 
 跑法: uv run pytest
 """
@@ -172,12 +170,8 @@ def test_两个会话同时认领_恰好一个成功(env):
 	assert raw(db, "SELECT COUNT(*) FROM tasks WHERE status = 'in_progress'") == [(1,)]
 
 
-def test_认领失败时一句模型调用都不发生(env, monkeypatch):
-	"""**失败方在启动子 agent 之前**得到结果(设计 §8 第 2 条)。
-
-	认领没成就派活的话,这一轮会白花一次子 agent 的钱,而且两个子 agent
-	同时改同一批文件 —— 这条钉住的是"认领在前、派活在 w后"这个顺序。
-	"""
+def test_认领失败不启动独立agent(env, monkeypatch):
+	"""task_status 的认领结果不应自动派出子 agent。"""
 	db, store, sid = env
 	enable(store, sid)
 	started = []
@@ -193,11 +187,13 @@ def test_认领失败时一句模型调用都不发生(env, monkeypatch):
 	ok(tools_for(sid), "task_dependency", task_id=second["id"],
 	   depends_on_id=blocked["id"], action="add")
 
-	got = call(tools_for(sid), "agent", task_id=second["id"])
+	got = call(tools_for(sid), "task_status", task_id=second["id"],
+	           action="start")
 	assert got["error"] == "blocked", got
-	assert started == [], "认领没成还是把子 agent 派出去了"
-	# 而 ready 的那条派得出去
-	assert tools_for(sid)["agent"].handler(task_id=blocked["id"]) != ""
+	assert started == []
+	# ready 任务的状态可以独立认领,子 agent 只接受 prompt。
+	ok(tools_for(sid), "task_status", task_id=blocked["id"], action="start")
+	assert tools_for(sid)["agent"].handler(prompt="查一件事") == "干完了"
 	assert len(started) == 1
 
 
@@ -317,7 +313,7 @@ def test_已完成是终态_不能改也不能取消(env):
 		== "invalid_state"
 
 
-def test_子agent返回不等于任务完成(env, monkeypatch):
+def test_独立agent返回不改变任务状态(env, monkeypatch):
 	db, store, sid = env
 	enable(store, sid)
 	said = {}
@@ -329,31 +325,26 @@ def test_子agent返回不等于任务完成(env, monkeypatch):
 	monkeypatch.setattr(subagent, "agent_loop", fake_loop)
 	tools = tools_for(sid)
 	a = ok(tools, "task_create", name="查一件事", description="要求:查清楚")["task"]
+	ok(tools, "task_status", task_id=a["id"], action="start")
 
-	text = tools["agent"].handler(task_id=a["id"])
-	# 子 agent 拿到的指令来自库里的 name + description,调用方插不进别的话 ——
-	# 要看的是**它收到什么**,不是它回什么
+	text = tools["agent"].handler(prompt="独立调查")
 	sent = said["messages"][0]["content"]
-	assert "查一件事" in sent and "要求:查清楚" in sent, sent
-	# 交回来的话必须说清"任务还没完成",否则主 agent 会把一段结论当结果
-	assert "still in_progress" in text, text
+	assert sent == "独立调查"
+	assert text == "查完了"
 	assert ok(tools, "task_read", task_id=a["id"])["task"]["status"] == "in_progress"
-	# 主 agent 显式提交才算完
 	ok(tools, "task_status", task_id=a["id"], action="complete")
 	assert ok(tools, "task_read", task_id=a["id"])["task"]["status"] == "completed"
 
 
-def test_agent的prompt不能被task_id以外的东西覆盖(env):
-	"""调用方给一段自由文本盖掉任务要求,等于同一份要求在不同会话里不是
-	同一件事 —— 所以 task_id 模式下 prompt 是二选一,不是叠加。"""
+def test_agent只接受prompt(env):
 	db, store, sid = env
 	enable(store, sid)
-	tools = tools_for(sid)
-	a = ok(tools, "task_create", name="原要求")["task"]
-	result = tools["agent"].handler(prompt="改成别的", task_id=a["id"])
-	assert result.startswith("Error:"), result
-	# 两个都不给也拒
-	assert tools["agent"].handler().startswith("Error:")
+	agent = tools_for(sid)["agent"]
+	assert set(agent.input_schema["properties"]) == {"prompt"}
+	assert agent.input_schema["required"] == ["prompt"]
+	assert agent.handler(prompt=" ").startswith("Error:")
+	with pytest.raises(TypeError):
+		agent.handler(task_id="不再支持")
 
 
 # ------------------------------------------------------ 五、绝不自动重试
@@ -407,15 +398,15 @@ def test_进程重启后不自动重试(env):
 	ok(tools_for(sid), "task_status", task_id=a["id"], action="retry")
 
 
-def test_子agent失败也停在in_progress(env, monkeypatch):
+def test_独立agent失败不改变任务状态(env, monkeypatch):
 	db, store, sid = env
 	enable(store, sid)
 	monkeypatch.setattr(subagent, "agent_loop",
 	                    lambda messages, **kw: TurnOutcome("failed", "", "炸了"))
 	tools = tools_for(sid)
 	a = ok(tools, "task_create", name="a")["task"]
-	tools["agent"].handler(task_id=a["id"])
-	# 失败不自动回到 pending:得有人看过之后决定
+	ok(tools, "task_status", task_id=a["id"], action="start")
+	assert "subagent failed" in tools["agent"].handler(prompt="调查")
 	assert ok(tools, "task_read", task_id=a["id"])["task"]["status"] == "in_progress"
 
 
@@ -427,25 +418,21 @@ def test_关着的时候模型看不到任务工具_但agent还在(env, monkeypa
 	                    lambda messages, **kw: TurnOutcome("completed", "结论"))
 	names = [t.name for t in server.turn_tools(sid, "t1")]
 	assert names == ["agent"], names
-	# **不是"列出来但调不动"**:task_id 那个参数根本不在 schema 里 ——
-	# 列在那儿的话模型会去用,然后拿到一句错误,于是换着法儿重试。
 	agent_tool = server.turn_tools(sid, "t1")[0]
 	assert set(agent_tool.input_schema["properties"]) == {"prompt"}
-	# 临时委派照常能用
 	assert agent_tool.handler(prompt="查个东西") == "结论"
-	# 就算硬塞 task_id 也不认
-	assert agent_tool.handler(task_id="随便").startswith("Error:")
+	with pytest.raises(TypeError):
+		agent_tool.handler(task_id="随便")
 
 
-def test_开着的时候五个工具都在_子agent只多一个task_read(env, monkeypatch):
+def test_开着的时候task工具不改变agent接口(env, monkeypatch):
 	db, store, sid = env
 	enable(store, sid)
 	names = [t.name for t in server.turn_tools(sid, "t1")]
 	assert set(names) == {"agent", "task_read", "task_create", "task_edit",
 	                      "task_dependency", "task_status"}, names
-	# task_id 进了 agent 的 schema
 	agent_tool = [t for t in server.turn_tools(sid, "t1") if t.name == "agent"][0]
-	assert set(agent_tool.input_schema["properties"]) == {"prompt", "task_id"}
+	assert set(agent_tool.input_schema["properties"]) == {"prompt"}
 
 	seen = {}
 	monkeypatch.setattr(subagent, "agent_loop",
@@ -453,10 +440,8 @@ def test_开着的时候五个工具都在_子agent只多一个task_read(env, mo
 	                    TurnOutcome("completed", "结论"))
 	agent_tool.handler(prompt="查个东西")
 	sub_names = {t.name for t in seen["tools"]}
-	# 子 agent 读得到全局任务图,一个字都改不了
-	assert "task_read" in sub_names
-	assert not (sub_names & {"task_create", "task_edit", "task_dependency",
-	                         "task_status", "agent"}), sub_names
+	assert not (sub_names & {"task_read", "task_create", "task_edit",
+	                         "task_dependency", "task_status", "agent"}), sub_names
 
 
 def test_开关进恢复签名(env):
@@ -505,8 +490,7 @@ def test_模型和子agent执行期间不持SQLite事务(env, monkeypatch):
 
 	monkeypatch.setattr(subagent, "agent_loop", fake_loop)
 	tools = tools_for(sid)
-	a = ok(tools, "task_create", name="a")["task"]
-	tools["agent"].handler(task_id=a["id"])
+	tools["agent"].handler(prompt="独立调查")
 	assert inside["subagent"] is False
 	assert store._conn.in_transaction is False
 	# 认领那条也一样:认领完了不该留着事务

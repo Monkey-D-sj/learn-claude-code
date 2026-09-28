@@ -109,9 +109,7 @@ def _fails(fn):
 
 
 def _read_handler(store) -> Callable[..., dict]:
-	"""task_read 的实现。单独拎出来,是因为子 agent 也拿得到这一个 ——
-	它读得、改不得(见 tools/subagent.py),而它那份工具集里没有另外四个。
-	"""
+	"""task_read 的实现。"""
 	def do_read(task_id: str = "", owner: str = "", status: str = "") -> dict:
 		"""有 task_id 给详情,否则给列表。
 
@@ -134,17 +132,8 @@ def _read_handler(store) -> Callable[..., dict]:
 	return do_read
 
 
-def make_task_read(store, read_only: bool = False) -> ToolDesc:
-	"""只读那一个。**主子 agent 共用,但话不一样。**
-
-	给子 agent 的那份(read_only=True)要多说一句"你改不了,把想建的任务
-	写进报告" —— 它手里确实只有这一个 task 工具,而模型看不见自己的工具
-	列表里**少了**什么。不说的话它会调 task_create,拿到一句"unknown tool",
-	然后把结论咽回去。
-
-	反过来,主 agent 那份带这句是错的:它建得了,而"报给调用方"这句话会
-	让它以为上面还有个人。
-	"""
+def make_task_read(store) -> ToolDesc:
+	"""只读的 task 工具，仅供启用 task 的主 agent 使用。"""
 	description = (
 		"Read the shared task list. With task_id: that task's full "
 		"detail, including what it waits on and what waits on it. "
@@ -155,12 +144,6 @@ def make_task_read(store, read_only: bool = False) -> ToolDesc:
 		"ready (can be started) or blocked (a prerequisite is not "
 		"done yet); 'blocking' names the prerequisites responsible."
 	)
-	if read_only:
-		description += (
-			" This is the only task tool you have - you cannot create or "
-			"change tasks. Report anything you think should be created or "
-			"re-linked, and let the caller do it."
-		)
 	return ToolDesc(
 		name="task_read",
 		description=description,
@@ -299,8 +282,7 @@ def make_task_tools(store, turn_id: str) -> list[ToolDesc]:
 				"cancel: drop a pending task without doing it. retry: put a "
 				"task that is stuck in in_progress back to pending, only "
 				"once its previous run has stopped. Completing a task is "
-				"always your call - a subagent returning does not mean the "
-				"task is done."
+				"always your call; an agent(prompt) result never changes task status."
 			),
 			input_schema={
 				"type": "object",
@@ -329,8 +311,8 @@ def _transition(store, turn_id: str, task_id: str, action: str) -> dict:
 	  start    没人攥着才行。库里那条条件 UPDATE 是真闸门,这儿先查一遍
 	           只是为了一句更准的话 —— 库里只会说"它已经是 in_progress",
 	           而模型更该知道的是"另一个会话正在跑它"。
-	  complete 自己和别人**都不**拦:子 agent 返回时已经松了手,而
-	           进程重启后 ACTIVE 是空的 —— 那两种情况下的任务都停在
+	  complete 自己和别人**都不**拦:主 agent 可以在本轮提交,而
+	           进程重启后 ACTIVE 是空的 —— 这些情况下任务都停在
 	           in_progress,等着主 agent 核对完显式提交。只拦别人。
 	           提交成功之后**当场松手**:任务已经是终态,再攥着它谁也动不了,
 	           而"攥着"这件事只该用来挡住"另一个会话正在跑它"。

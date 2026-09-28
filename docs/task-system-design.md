@@ -1,14 +1,13 @@
 # Task 与 Agent 工具设计
 
-文档状态：**已实施（2026-09-28）**。正文是当时的设计规格，逐条落地情况见文末
-「9. 实施记录」。适用范围是当前单进程、本机使用的 Agent 服务。本文中的 task 是跨会话的工作项；turn 是一次聊天请求的执行记录，两者不是同一个对象。
+文档状态：**已实施，后续将 `agent` 与 task 解耦（2026-09-28）**。适用范围是当前单进程、本机使用的 Agent 服务。本文中的 task 是跨会话的工作项；turn 是一次聊天请求的执行记录，两者不是同一个对象。
 
 ## 1. 目标与边界
 
 - 用持久化的 task 和依赖图替换现有的 `todo_write` 清单。
 - task 属于当前服务使用的数据库，不绑定创建它的会话。新会话开启 task 功能后，可以读取并继续已有任务。
 - task 功能按会话开启或关闭，新会话默认关闭。关闭只隐藏 task 能力，不删除任务。
-- 保留委派能力：现有的 `task(prompt)` 工具改名为 `agent`。临时调查可以不关联 task；执行已有 task 时使用其 ID。
+- 保留独立委派能力：`agent` 只接收 `prompt`，不认领或修改 task。任务由 `task_*` 工具单独管理。
 - 第一版不做自动调度、并行子 agent、任务硬删除、执行历史表或多用户权限控制。
 
 ## 2. 数据模型
@@ -77,18 +76,18 @@ WHERE id = ? AND status = 'pending'
 | `task_create` | `name`；可选 `description`、`owner`、`depends_on_ids` | 生成 ID；任务和初始依赖在同一事务提交，默认 owner 为 `main` |
 | `task_edit` | `task_id`；`name`、`description`、`owner` 至少一个 | 只改传入字段；任务必须处于 `pending` |
 | `task_dependency` | `task_id`、`depends_on_id`、`action: add/remove` | 在事务中校验并修改依赖；目标任务必须处于 `pending` |
-| `task_status` | `task_id`、`action: start/complete/cancel/retry` | 按状态规则迁移；`start` 调用与 `agent` 共用的原子认领函数 |
-| `agent` | `task_id` 或 `prompt`，二选一 | `task_id` 模式读取任务、认领成功后才启动子 agent；`prompt` 模式做临时委派 |
+| `task_status` | `task_id`、`action: start/complete/cancel/retry` | 按状态规则迁移；`start` 原子认领 ready 任务 |
+| `agent` | 必填 `prompt` | 独立委派子 agent，不读写 task 表 |
 
 `task_read` 列表默认返回未完成任务，并允许显式查询已完成或已取消任务。`status` 过滤可使用数据库状态以及计算出的 `ready`、`blocked`。所有工具结果返回机器可读的任务 ID、实际状态和错误原因，不能只打印人类可读的清单。对不存在的任务、非法状态迁移和依赖成环，返回明确错误，不静默修正。
 
-`agent(task_id)` 使用数据库中的 `name` 和 `description` 形成子 agent 指令；调用方不能用另一段自由文本覆盖任务要求。子 agent 完成一轮对话只表示执行返回，不表示 task 已完成。主 agent 检查结果后调用 `task_status(complete)`；未达到要求且原执行已结束时，可调用 `task_status(retry)`。执行失败或进程中断时保留可检查的 `in_progress` 状态，不自动重跑。
+`agent` 只执行传入的自包含 `prompt`。若主 agent 同时在处理一条 task，应先用 `task_status(start)` 认领，再根据任务内容独立组织工作；子 agent 的返回不会修改任务状态。主 agent 检查结果后显式调用 `task_status(complete)`，未达到要求且原执行已结束时可显式 `retry`。执行失败或进程中断时保留可检查的 `in_progress` 状态，不自动重跑。
 
-`task_status(start)` 用于主 agent 自己执行任务；`agent(task_id)` 在内部完成同样的认领，调用方不能先 `start` 再把同一任务交给 `agent`。task 已开启时，子 agent 第一版只获得 `task_read`，不能修改全局任务图，也不能再调用 `agent`。它提出的新任务和依赖通过最终报告交给主 agent 创建。
+`task_status(start)` 是唯一的任务认领入口。子 agent 不获得 task 工具，也不能再调用 `agent`；它的报告只交回主 agent，由主 agent 决定是否更新任务表。
 
 ## 5. 运行中任务与重试
 
-同一数据库仍由一个服务进程使用。服务端在内存中记录当前正在执行的 task ID 及其所属 turn：子 agent 调用期间保持占用；主 agent 用 `task_status(start)` 开始任务时，保持到当前 turn 结束。同一 turn 可以在工作完成后提交 `complete`，其他会话不能在执行期间替它完成或重试。该记录不是持久化的任务身份，也不放进 task 表。
+同一数据库仍由一个服务进程使用。服务端在内存中记录 `task_status(start)` 认领的 task ID 及其所属 turn，占用保持到任务提交完成或当前 turn 结束。其他会话不能在执行期间替它完成或重试。该记录不是持久化的任务身份，也不放进 task 表。
 
 `retry` 是显式操作，服务端发现原执行仍在进行时必须拒绝。进程意外退出后，原进程的执行已经停止，但 task 仍可能留下部分文件修改或其他副作用；恢复时展示为待核对，不自动把它改回 `pending`。核对后再显式重试。不能因为一个定时器到期就自动重跑。
 
@@ -97,8 +96,8 @@ WHERE id = ? AND status = 'pending'
 ## 6. 会话开关与页面
 
 - 新会话的 `task_enabled` 默认为关闭，页面提供开关并展示当前值。
-- 关闭时不向模型提供任何 `task_*` 工具，也不注入任务清单或任务提醒；`agent(prompt)` 仍可使用，`agent(task_id)` 不可使用。
-- 开启时提供五个 task 工具及 `agent` 的两种调用方式；任务由数据库读取，跨会话可见。
+- 关闭时不向模型提供任何 `task_*` 工具，也不注入任务清单或任务提醒；`agent(prompt)` 仍可使用。
+- 开启时提供五个 task 工具；`agent` 的接口不随开关改变。任务由数据库读取，跨会话可见。
 - 开关更新由服务端保存到 `sessions.task_enabled`。活动 turn 或尚未解决的中断 turn 存在时拒绝切换；完成或处理后再切换，从下一轮生效。这样一轮执行期间的工具集和恢复签名保持不变。
 - 关闭不会删除或取消任务；再次开启后继续读取同一张全局表。
 
@@ -113,16 +112,16 @@ WHERE id = ? AND status = 'pending'
 ## 8. 验收要点
 
 1. 两个会话开启 task 后能看到同一任务；任一会话关闭 task 不影响另一会话或任务数据。
-2. 两个会话同时认领同一 ready 任务，恰好一个成功；失败的一方在启动子 agent 前得到结果。
+2. 两个会话同时用 `task_status(start)` 认领同一 ready 任务，恰好一个成功；`agent` 调用不参与认领。
 3. 多前置任务全部完成后任务才 ready；自依赖、重复边和环均被拒绝。
-4. 任务运行中不能修改要求或依赖；子 agent 返回后不会自动把任务标为 completed。
+4. 任务运行中不能修改要求或依赖；`agent(prompt)` 返回后不会自动改变任务状态。
 5. 运行中、失败、中断及服务重启后均不自动重试；显式 retry 只能在原执行停止后进行。
 6. task 关闭时模型看不到 task 工具和任务内容，`agent(prompt)` 仍可用；旧会话历史可读。
-7. 任务表写入和依赖边写入保持原子性；模型请求及子 agent 执行期间不持有 SQLite 事务。
+7. 任务表写入和依赖边写入保持原子性；模型请求及 `agent(prompt)` 执行期间不持有 SQLite 事务。
 
 ## 9. 实施记录
 
-七条验收要点逐条落在 `tests/test_task.py`（26 条用例）。落地时有两处正文没定死、
+七条验收要点由 `tests/test_task.py` 覆盖。落地时有两处正文没定死、
 由实施时决定的地方，记在这儿：
 
 - **模型怎么看见任务：只靠 `task_read`，不做任何自动注入。** 第 6 节那句
@@ -134,12 +133,7 @@ WHERE id = ? AND status = 'pending'
   可以，两个都做了。列表是只读的：建任务、改状态都由模型调工具做，页面上
   再放一套按钮等于给同一件事开第二个入口，而那两套规则迟早会漂。
 
-落地时发现并修掉的两个问题（都是写下来之后才看清的，不是新增范围）：
-
-- `agent(prompt)` 一开始没把库和开关传给子 agent，于是开着 task 的会话里，
-  经这条路派出去的子 agent 看不到任务表 —— 它会把自己会话已有的活重做一遍。
-- `task_status(complete)` 一开始不松手，任务提交完还被那一轮攥着，于是紧接着
-  的 `retry` 报的是"原执行还在跑"（假话），而不是"它已经完成了"（终态）。
+后续修订将 `agent` 与 task 完全解耦：删除 `agent` 的 `task_id` 参数和内部任务认领路径，子 agent 也不再获得 `task_read`。任务状态只由五个 `task_*` 工具管理。原先 `task_status(complete)` 不及时松开占用的问题仍由任务工具自身处理。
 
 正文第 7 节提到的 `tools/todo.py` 等已随这一版删除；本节之前提到的
 "每三轮一次的 todo 提醒"、`runtime_json` 里的 `todos` 字段、"待办装回来"

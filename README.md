@@ -105,7 +105,7 @@ python server.py     # 然后打开 http://localhost:8765/
 | `user_memory` | 用户级记忆:你这个人的喜好和习惯。同上三个动作 |
 | `vision` | 看一眼图片(PNG/JPEG/GIF/WebP),答一个关于它的问题。图不进上下文 |
 | `ask` | 问用户一个问题,等他的回答。可以带一组选项,页面上画成按钮 |
-| `agent` | 派一个子 agent,独立上下文,只回结论。也可以给 `task_id` 执行一条已有任务 |
+| `agent` | 按 `prompt` 派一个独立上下文的子 agent,只回结论;不依赖 task |
 | `compress` | 把一段干完的活按号段压成一句话(见下面的上下文压缩) |
 | `recall` | 按号把压掉的那段原文取回来(号就是库里那一行的行号,见下面的上下文压缩) |
 | `task_read` / `task_create` / `task_edit` / `task_dependency` / `task_status` | 跨会话的任务表(见下面「任务」) |
@@ -116,7 +116,8 @@ python server.py     # 然后打开 http://localhost:8765/
 
 要是它得绑一个**每轮或每会话才存在**的东西(这一轮的问题该往哪条流上问、
 用哪个库、这是哪一轮),就写成工厂,由 `build_tools` 的 `per_turn` 参数现造
-—— `ask`、`agent`、`task_*` 都是这一类,`BASE_TOOLS` 里没有它们。
+—— `ask` 和 `task_*` 属于这一类。`agent` 由服务端单独挂入主 agent 的工具集,
+不传 task 状态;子 agent 自己拿不到这个委派工具。
 `build_tools` 两个参数都**不给默认值**:默认值等于把"这个会话到底能不能用
 task"这个决定藏起来。
 
@@ -133,11 +134,11 @@ task"这个决定藏起来。
   就得回头改所有受影响的后续任务,改漏了还不报错。
 - 认领(把 `pending` 改成 `in_progress`)**依赖检查和状态改写是同一条
   UPDATE**:先读后写的话,两个会话同时抢一条 ready 任务会双双成功,而后果
-  是同一个任务被两个子 agent 同时改同一批文件。
+  是同一个任务被两个会话同时执行。
 - **任务不会自动重试。** 失败、中断、进程重启之后它停在 `in_progress` 等人
   核对,只有显式 `task_status(retry)` 才回到 `pending`。
-- 子 agent 返回**不等于**任务完成:它只表示这次调用结束了,提交由主 agent
-  调 `task_status(complete)` 决定。
+- `agent(prompt)` 的返回不会修改任务状态;任务完成仍由主 agent 显式调用
+  `task_status(complete)` 提交。
 
 页面右侧那个「任务:开/关」按钮就是那个开关(活动轮次或未处理的中断轮次
 存在时会被拒),侧栏下方那块是任务列表。

@@ -22,10 +22,8 @@ from tools.write import write_file
 #   compress 绑当前那份 messages,由 agent_loop 每轮 bind
 #   recall   绑这个会话的取回器(库 + 会话 id + 压缩器),由 server.py 每轮 bind
 #
-# **这里没有 todo_write,也没有 agent。** 前者随这一版整个删掉了(任务清单
-# 搬进库里,见 tools/task.py)。后者是**每轮现造**的:它要拿到库、这一轮的
-# id、以及这个会话的 task 开关,三样都不是进程级的常量(见
-# tools/subagent.py 的 make_agent_tool)。
+# **这里没有 todo_write,也没有 agent。** 前者随任务清单迁入数据库而删除；
+# 后者由 server.py 挂到主 agent 的工具集，子 agent 不获得委派工具。
 BASE_TOOLS = [
 	bash, read_file, write_file, edit_file, glob, grep, skill, skill_manage_tool, vision,
 	memory_tool, user_memory_tool, compress, recall,
@@ -40,11 +38,10 @@ def build_tools(ask_user, per_turn: list[ToolDesc]) -> list[ToolDesc]:
 	            线程连同会话锁一起挂死;直接返回"没人答"又会让那个前端里
 	            ask 静默地永远不能用。没有一份默认值能同时避开这两种,所以
 	            忘了传就是调用处当场 TypeError。
-	  per_turn  是"这一轮多了哪些工具"。它装的是那两样**每轮才存在**的
-	            东西:agent(绑库和本轮 id),以及 task 开启时那五个 task 工具
-	            (绑库和本轮 id)。给默认值等于把"这个会话到底能不能用 task"
+	  per_turn  是"这一轮多了哪些工具":主 agent 的委派工具，以及 task
+	            开启时绑定库和本轮 id 的五个 task 工具。给默认值等于把"这个会话到底能不能用 task"
 	            这个决定藏起来 —— 而它正是这个参数存在的理由。
 
-	子 agent 传的是空列表或只有 task_read 那一份(见 tools/subagent.py)。
+	子 agent 传空列表，不获得 agent 和 task 工具(见 tools/subagent.py)。
 	"""
 	return [*BASE_TOOLS, *per_turn, make_ask_tool(ask_user)]
