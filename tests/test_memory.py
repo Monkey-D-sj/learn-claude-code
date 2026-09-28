@@ -29,7 +29,6 @@ import pytest
 
 from config import MEMORY_MAX_CHARS, MEMORY_MAX_ENTRIES
 from tools import build_tools, memory_tool, user_memory_tool
-from tools.todo import TodoManager
 
 # 用 importlib 而不是 `import tools.memory as M`:`as` 形式取的是**包上的
 # 属性**而不是 sys.modules。变量当初就叫 memory 的时候,那句 import 拿到的
@@ -274,7 +273,7 @@ def _nobody(question, options):
 def test_两个工具的名字和schema():
 	assert memory_tool.name == "memory"
 	assert user_memory_tool.name == "user_memory"
-	names = [t.name for t in build_tools(TodoManager(), _nobody)]
+	names = [t.name for t in build_tools(_nobody, [])]
 	assert "memory" in names and "user_memory" in names
 	# 同一个 dict 对象:它俩的入参本来就该一字不差,共用才漂不了
 	assert memory_tool.input_schema is user_memory_tool.input_schema
@@ -390,8 +389,8 @@ def test_子agent两个记忆工具都拿不到(monkeypatch):
 		return TurnOutcome("completed", "结论")
 
 	monkeypatch.setattr(subagent, "agent_loop", fake_loop)
-	assert subagent.run_task("去看看") == "结论"
+	assert subagent.run_agent("去看看") == "结论"
 
 	names = [t.name for t in seen["tools"]]
-	assert "task" not in names, names
+	assert "agent" not in names, names
 	assert "memory" not in names and "user_memory" not in names, names

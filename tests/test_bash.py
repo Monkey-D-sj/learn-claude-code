@@ -23,7 +23,6 @@ import pytest
 
 import config
 from tools import build_tools
-from tools.todo import TodoManager
 
 bash_mod = importlib.import_module("tools.bash")
 
@@ -136,7 +135,7 @@ def test_还是返回字符串_接口没换(workdir):
 
 
 def test_进工具集():
-	names = [t.name for t in build_tools(TodoManager(), lambda q, o: None)]
+	names = [t.name for t in build_tools(lambda q, o: None, [])]
 	assert "bash" in names, names
 
 

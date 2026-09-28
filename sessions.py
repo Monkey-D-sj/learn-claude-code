@@ -3,13 +3,15 @@
 本机自用,一个进程一个文件。这个模块只干"存取",不懂 agent —— 谁在
 什么时候调它,是 server.py 的事。
 
-现在有五个活着的对象:
+现在有七个活着的对象:
 
-	sessions          会话本身,外加会话开始那一刻的记忆快照
+	sessions          会话本身,外加会话开始那一刻的记忆快照,以及那个 task 开关
 	turns             一轮执行,状态机只有 running -> completed / failed
 	turn_messages     这一轮的原始消息,只追加、不修改
 	session_contexts  交给模型的那份工作上下文,整体重写
 	events            页面重放的流水账,只追加
+	tasks             跨会话的工作项,不绑任何会话
+	task_dependencies 任务之间的先后关系,有向无环
 
 三条贯穿全文件的规矩,每条都有理由:
 
@@ -77,7 +79,7 @@ from pathlib import Path
 DB_PATH = Path(os.environ.get("AGENT_DB_PATH")
                or (Path(__file__).resolve().parent / "sessions.db"))
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # 每条一个语句,不写成一个大字符串走 executescript。
 # 理由:executescript 在遇到已挂起的事务时会先隐式 COMMIT —— 那会把
@@ -284,9 +286,57 @@ _MIGRATION_4 = (
 	"ALTER TABLE turns_rebuild RENAME TO turns",
 )
 
+# v5 是 task 那一版:两张**全局**表(task 不绑会话),外加会话上那个开关列。
+#
+# task 表里**没有 session_id**,这是这一版的核心决定,不是漏了:task 是跨
+# 会话的工作项,会话只是"看见它"的一扇窗(见 sessions.task_enabled 那段)。
+# 加一个来源会话字段看上去方便,实际上立刻要求回答"两个会话同时改它算谁的",
+# 而第一版不打算回答那个问题。
+#
+# **不加 ON DELETE CASCADE**:第一版没有硬删除,依赖边要留着。真去删一个
+# 还有依赖边的任务,该报外键错误而不是顺着一串删掉受影响的后续任务 ——
+# 后者是静默的数据丢失。
+_MIGRATION_5 = (
+	"""
+	CREATE TABLE tasks (
+		id          TEXT PRIMARY KEY,
+		name        TEXT NOT NULL CHECK (trim(name) <> ''),
+		description TEXT NOT NULL DEFAULT '',
+		owner       TEXT NOT NULL DEFAULT 'main' CHECK (trim(owner) <> ''),
+		status      TEXT NOT NULL DEFAULT 'pending' CHECK (status IN (
+			'pending', 'in_progress', 'completed', 'cancelled')),
+		created_at  REAL NOT NULL,
+		updated_at  REAL NOT NULL
+	)
+	""",
+	# 列表默认按 (created_at, id) 排,这个索引就是那个顺序 —— created_at 相
+	# 同时靠 id 打破平局(同一毫秒里建的两条),不然两次请求可能给出不同
+	# 的顺序,页面会自己跳。
+	"CREATE INDEX tasks_created ON tasks(created_at, id)",
+	# 认领那条条件 UPDATE 每次都 JOIN 一遍依赖,按 task_id 找边是主键前缀,
+	# 白拿;这条反过来是给"谁挡着谁"用的 —— task_read 要报阻塞原因,
+	# 而删依赖边也要按 depends_on_id 查。
+	"""
+	CREATE TABLE task_dependencies (
+		task_id       TEXT NOT NULL REFERENCES tasks(id),
+		depends_on_id TEXT NOT NULL REFERENCES tasks(id),
+		PRIMARY KEY (task_id, depends_on_id),
+		CHECK (task_id <> depends_on_id)
+	)
+	""",
+	"CREATE INDEX task_dependencies_on ON task_dependencies(depends_on_id)",
+	# 开关只决定这个会话能不能用 task 工具,不决定任务归属。
+	#
+	# **默认 0(关闭),不是 1。** 新会话默认关闭是设计里写死的一条:task 会
+	# 让模型看见一张跨会话的全局表,那是要用户主动开的权限。
+	"ALTER TABLE sessions ADD COLUMN task_enabled INTEGER NOT NULL"
+	" DEFAULT 0 CHECK (task_enabled IN (0, 1))",
+)
+
 # 下标 = 目标版本 - 1。加一次改动就往后接一个,并把 SCHEMA_VERSION 加一。
 # 每一项是一串 SQL 字符串,逐条执行。
-MIGRATIONS = (_MIGRATION_1, _MIGRATION_2, _MIGRATION_3, _MIGRATION_4)
+MIGRATIONS = (_MIGRATION_1, _MIGRATION_2, _MIGRATION_3, _MIGRATION_4,
+              _MIGRATION_5)
 
 # 必须在**关掉外键的连接**里跑的那几条迁移。目前只有 v4,理由见它上面
 # 那段(turns 重建:开着外键 DROP TABLE 会顺着 CASCADE 删光原始消息)。
@@ -364,6 +414,36 @@ class CheckpointConflict(RuntimeError):
 	之后还有没纳进来的尾部记录。三个都要拒绝,而且要说得出是哪一个 ——
 	"恢复失败"这四个字对用户没有用。
 	"""
+
+
+# 落库的状态只有这四个。ready 和 blocked **不落库**,它们由依赖实时算
+# (见 _with_state)。存下来的话,一个前置任务状态一变就得回头改所有受
+# 影响的后续任务 —— 那是"同一件事有两个真相"的经典开局,而且改漏了不
+# 报错,只是列表上少标一个 blocked。
+#
+# 放模块级是为了让工具层能拿它拼状态过滤的**合法性判断**(tools/task.py),
+# 而不是让它从类里摸一个下划线开头的属性。两处各写一份的话,加第五个状态
+# 时必然漏一处,而漏的那处不报错 —— 只是过滤条件静默地少匹配一种。
+TASK_STATES = ("pending", "in_progress", "completed", "cancelled")
+
+# 未完成 = 还没到终态。task_read 不带 status 时给的就是这一档。
+TASK_OPEN_STATES = ("pending", "in_progress")
+
+
+class TaskError(RuntimeError):
+	"""一次 task 操作没做成,而**原因是调用方能改的**。
+
+	带上 reason 短码(task_error_reason 那张表),因为分得清是哪一种是有
+	后果的:not_found 说明 ID 写错了,invalid_state 说明顺序不对,cycle 说明
+	这一对边不能加 —— 三种要模型做的事完全不同。工具层把它们渲染成不同的
+	句子;只回一句"操作失败"的话,模型唯一能做的就是重试同一件事。
+
+	**它不是异常情况。** 认领一个还 blocked 的任务、改一个运行中的任务,都是
+	正常请求撞上规则,不是 bug —— 所以调用方(工具层)接住它,原样说给模型听。
+	"""
+	def __init__(self, reason: str, message: str):
+		super().__init__(message)
+		self.reason = reason
 
 
 # 中断原因是**机器读**的,所以是短码不是句子;给人看的那句在
@@ -533,13 +613,45 @@ class SessionStore:
 		rowid DESC 只用来打破 updated_at 相同时的平局(同一毫秒里建的两个
 		会话)。不加的话顺序由 SQLite 自己定,两次请求可能给出不同的顺序,
 		侧栏会自己跳。
+
+		task_enabled 跟着一起给:侧栏那个开关要画成"开"还是"关",只能从
+		这儿知道。页面不从聊天事件推它 —— 推出来的和库里那份迟早不一样,
+		而用户不会知道该信哪个。
 		"""
 		with self._lock:
 			rows = self._conn.execute(
-				"SELECT id, title, updated_at FROM sessions"
+				"SELECT id, title, updated_at, task_enabled FROM sessions"
 				" ORDER BY updated_at DESC, rowid DESC LIMIT 50").fetchall()
-		return [{"id": row[0], "title": row[1], "updated_at": row[2]}
+		return [{"id": row[0], "title": row[1], "updated_at": row[2],
+		         "task_enabled": bool(row[3])}
 		        for row in rows]
+
+	def task_enabled(self, sid: str) -> bool:
+		"""这个会话能不能用 task 工具。会话不存在时返回 False。
+
+		返回 False 而不是抛:调用方是每一轮开跑前的工具集装配,而"会话不在
+		了"那一轮本来也跑不起来(下面那句 begin_turn 会先抛)。在这儿抛只会
+		把一句能看懂的话换成一句外键错误。
+		"""
+		with self._lock:
+			row = self._conn.execute(
+				"SELECT task_enabled FROM sessions WHERE id = ?",
+				(sid,)).fetchone()
+		return bool(row[0]) if row else False
+
+	def set_task_enabled(self, sid: str, enabled: bool) -> None:
+		"""改这个会话的 task 开关。
+
+		**不动 updated_at**:它不是"这个会话动过了",会话的内容一个字都没变
+		—— 跟着动的话,点一下开关就会把会话顶到侧栏最前面,而用户会以为
+		自己刚发过消息。
+		"""
+		with self._tx() as conn:
+			cursor = conn.execute(
+				"UPDATE sessions SET task_enabled = ? WHERE id = ?",
+				(1 if enabled else 0, sid))
+			if cursor.rowcount != 1:
+				raise TaskError("not_found", f"没有这个会话:{sid}")
 
 	def load_context(self, sid: str) -> list:
 		"""这一轮的起点:交给模型的那份工作上下文。
@@ -1266,3 +1378,321 @@ class SessionStore:
 		except Exception as e:
 			print(f"[sessions] 事件没落库: {type(e).__name__}: {e}")
 			return None
+
+	# ---- task:跨会话的工作项,不属于任何会话 ----
+
+	def _read_tasks(self, conn, where: str = "", args: tuple = ()) -> list[dict]:
+		"""读任务并算好依赖派生出来的那几项。锁内调用。
+
+		依赖分两次查(任务一次、边一次)而不是在每行上挂相关子查询:边那一
+		次是 `WHERE task_id IN (...)`,一条 SQL 拿回全部,而相关子查询会
+		按行再来一遍。靠 GROUP_CONCAT 拼 id 更省,但它的拼接顺序在 SQLite
+		里没有保证 —— 而"阻塞原因"那一列要给人看,顺序每次不一样就是在
+		骗人。
+		"""
+		rows = conn.execute(
+			"SELECT id, name, description, owner, status, created_at,"
+			" updated_at FROM tasks" + where, args).fetchall()
+		tasks = {
+			row[0]: {"id": row[0], "name": row[1], "description": row[2],
+			         "owner": row[3], "status": row[4],
+			         "created_at": row[5], "updated_at": row[6],
+			         "depends_on": [], "blocking": []}
+			for row in rows
+		}
+		if tasks:
+			# marks 是**按参数个数现生成**的 '?,?,?',不是从外面来的字符串 ——
+			# 唯一能进 f-string 的就是它,别的都走参数位。
+			marks = ",".join("?" * len(tasks))
+			for dep_task, dep_id, dep_status, dep_name in conn.execute(
+					f"SELECT d.task_id, d.depends_on_id, p.status, p.name"
+					f" FROM task_dependencies d"
+					f" JOIN tasks p ON p.id = d.depends_on_id"
+					f" WHERE d.task_id IN ({marks})"
+					f" ORDER BY p.created_at, d.depends_on_id", list(tasks)):
+				entry = tasks[dep_task]
+				entry["depends_on"].append(
+					{"id": dep_id, "name": dep_name, "status": dep_status})
+				if dep_status != "completed":
+					entry["blocking"].append(
+						{"id": dep_id, "name": dep_name, "status": dep_status})
+		for entry in tasks.values():
+			self._with_state(entry)
+		return list(tasks.values())
+
+	@staticmethod
+	def _with_state(task: dict) -> None:
+		"""把 ready / blocked 算进这一条。锁内调用,就地改。
+
+		只有 pending 有这两种派生状态。in_progress 的任务即使前置后来被
+		动过也照样是 in_progress —— 它已经在跑了,把它显示成 blocked 只会
+		让人以为它停了。
+		"""
+		task["state"] = (("ready" if not task["blocking"] else "blocked")
+		                 if task["status"] == "pending" else task["status"])
+
+	def list_tasks(self, owner: str | None = None,
+	               status: str | None = None) -> list[dict]:
+		"""列任务。status 收数据库状态,也收 ready / blocked / all。
+
+		默认只给未完成的:已完成的会一直堆着,而列表是给"接下来干什么"
+		用的。要翻旧账就显式说 completed / cancelled / all。
+
+		owner 是**等值**过滤,不是权限 —— 第一版的 owner 只是工作分配标签
+		(见 migrations 那段),谁都能读全部。
+		"""
+		where, args = "", ()
+		if owner:
+			where, args = " WHERE owner = ?", (owner,)
+		with self._tx(immediate=False) as conn:
+			tasks = self._read_tasks(conn, where, args)
+		if status is None:
+			return [t for t in tasks if t["status"] in TASK_OPEN_STATES]
+		if status == "all":
+			return tasks
+		return [t for t in tasks if t["state"] == status]
+
+	def get_task(self, task_id: str) -> dict | None:
+		"""一条任务的详情,含它的依赖和被谁依赖。没有就 None。
+
+		依赖那两个方向都给:depends_on 是"我得等谁",dependents 是"谁在
+		等我"。只给前一个的话,"我把它取消了会挡住谁"这个问题没人答得上 ——
+		而取消一个别的东西正等着它完成的任务,是要有后果的。
+		"""
+		with self._tx(immediate=False) as conn:
+			tasks = self._read_tasks(conn, " WHERE id = ?", (task_id,))
+			if not tasks:
+				return None
+			task = tasks[0]
+			rows = conn.execute(
+				"SELECT t.id, t.name, t.status FROM task_dependencies d"
+				" JOIN tasks t ON t.id = d.task_id"
+				" WHERE d.depends_on_id = ? ORDER BY t.created_at, t.id",
+				(task_id,)).fetchall()
+		task["dependents"] = [{"id": r[0], "name": r[1], "status": r[2]}
+		                      for r in rows]
+		return task
+
+	def create_task(self, name: str, description: str = "", owner: str = "main",
+	                depends_on_ids: list[str] | None = None) -> dict:
+		"""建一条任务,连它的初始依赖边一起。一个事务。
+
+		边和任务必须同事务:分开写的话,中间那个窗口里任务已经存在、依赖
+		还没挂上 —— 而它正好是一个 ready 的任务,此刻另一个会话就能认领它
+		开跑,跑在一个"前置还没完成"的任务上。不报错,只是顺序错了。
+
+		新任务不可能成环(它还没有入边),但依赖 id 必须存在、不能重复、
+		不能是自己 —— 自己那条是**新建就有 id** 之后才可能的,所以也要查。
+		"""
+		name = " ".join(str(name or "").split())
+		owner = " ".join(str(owner or "").split()) or "main"
+		if not name:
+			raise TaskError("invalid_input", "name 不能是空的")
+		depends = list(dict.fromkeys(depends_on_ids or []))
+		now = time.time()
+		task_id = uuid.uuid4().hex
+		with self._tx() as conn:
+			for dep_id in depends:
+				if dep_id == task_id:
+					raise TaskError("cycle", "任务不能依赖自己")
+				if conn.execute("SELECT 1 FROM tasks WHERE id = ?",
+				                (dep_id,)).fetchone() is None:
+					raise TaskError("not_found", f"依赖的任务不存在:{dep_id}")
+			conn.execute(
+				"INSERT INTO tasks (id, name, description, owner, status,"
+				" created_at, updated_at) VALUES (?, ?, ?, ?, 'pending', ?, ?)",
+				(task_id, name, str(description or ""), owner, now, now))
+			conn.executemany(
+				"INSERT INTO task_dependencies (task_id, depends_on_id)"
+				" VALUES (?, ?)", [(task_id, dep) for dep in depends])
+		return self.get_task(task_id)
+
+	def edit_task(self, task_id: str, name: str | None = None,
+	              description: str | None = None,
+	              owner: str | None = None) -> dict:
+		"""只改传进来的字段。
+
+		**不能整行覆盖。** 两个会话同时编辑同一条任务时,各自手里那份快照
+		都缺对方刚改的字段;整行写回等于把对方的修改抹掉,而且不报错。所以
+		这里拼的是 SET 子句,只带调用方明确给的那几列。
+
+		只允许改 pending 的:运行中的任务改要求,等于让一个正在按旧要求
+		干活的子 agent 交回一个按新要求评判的结果。
+		"""
+		sets, args = [], []
+		if name is not None:
+			clean = " ".join(str(name).split())
+			if not clean:
+				raise TaskError("invalid_input", "name 不能是空的")
+			sets.append("name = ?")
+			args.append(clean)
+		if description is not None:
+			sets.append("description = ?")
+			args.append(str(description))
+		if owner is not None:
+			clean = " ".join(str(owner).split())
+			if not clean:
+				raise TaskError("invalid_input", "owner 不能是空的")
+			sets.append("owner = ?")
+			args.append(clean)
+		if not sets:
+			raise TaskError("invalid_input", "没有要改的字段")
+		args.extend([time.time(), task_id])
+		with self._tx() as conn:
+			self._require_pending(conn, task_id, "修改")
+			conn.execute(f"UPDATE tasks SET {', '.join(sets)}, updated_at = ?"
+			             f" WHERE id = ?", args)
+		return self.get_task(task_id)
+
+	def add_dependency(self, task_id: str, depends_on_id: str) -> dict:
+		"""加一条前置关系:task_id 必须等 depends_on_id 完成。"""
+		if task_id == depends_on_id:
+			raise TaskError("cycle", "任务不能依赖自己")
+		with self._tx() as conn:
+			self._require_pending(conn, task_id, "修改依赖")
+			if conn.execute("SELECT 1 FROM tasks WHERE id = ?",
+			                (depends_on_id,)).fetchone() is None:
+				raise TaskError("not_found", f"依赖的任务不存在:{depends_on_id}")
+			if conn.execute(
+					"SELECT 1 FROM task_dependencies"
+					" WHERE task_id = ? AND depends_on_id = ?",
+					(task_id, depends_on_id)).fetchone():
+				raise TaskError("duplicate_edge", "这条依赖已经存在了")
+			if self._reaches(conn, depends_on_id, task_id):
+				raise TaskError(
+					"cycle",
+					f"{depends_on_id} 已经(直接或间接)依赖 {task_id},"
+					f"再加这条会成环")
+			conn.execute(
+				"INSERT INTO task_dependencies (task_id, depends_on_id)"
+				" VALUES (?, ?)", (task_id, depends_on_id))
+		return self.get_task(task_id)
+
+	def remove_dependency(self, task_id: str, depends_on_id: str) -> dict:
+		"""摘掉一条前置关系。摘掉之后可能立刻变 ready,这是正常的。"""
+		with self._tx() as conn:
+			self._require_pending(conn, task_id, "修改依赖")
+			cursor = conn.execute(
+				"DELETE FROM task_dependencies"
+				" WHERE task_id = ? AND depends_on_id = ?",
+				(task_id, depends_on_id))
+			if cursor.rowcount != 1:
+				raise TaskError("not_found", "这条依赖不存在")
+		return self.get_task(task_id)
+
+	def claim_task(self, task_id: str) -> dict:
+		"""原子认领。成功返回任务,没抢到抛 TaskError。
+
+		**依赖检查和状态改写是同一条 UPDATE。** 先读状态、释放锁、再无条件
+		更新的话,两个会话同时认领同一条 ready 任务会双双成功 —— 而后果不是
+		"多跑一遍",是同一个任务被两个子 agent 同时改同一批文件。验收第 2 条
+		要的就是这条 SQL:影响行数为 1 才算认领到。
+
+		影响行数为 0 时**要分清楚是哪一种**,因为三种要模型做的事完全不同:
+		id 打错了、任务已经在跑或已完成、前置还没完成。
+		"""
+		now = time.time()
+		with self._tx() as conn:
+			cursor = conn.execute(
+				"UPDATE tasks SET status = 'in_progress', updated_at = ?"
+				" WHERE id = ? AND status = 'pending'"
+				"   AND NOT EXISTS ("
+				"     SELECT 1 FROM task_dependencies AS d"
+				"     JOIN tasks AS prerequisite ON prerequisite.id = d.depends_on_id"
+				"     WHERE d.task_id = tasks.id"
+				"       AND prerequisite.status <> 'completed')", (now, task_id))
+			if cursor.rowcount != 1:
+				self._explain_unclaimable(conn, task_id, "start", "pending", True)
+			return self._read_tasks(conn, " WHERE id = ?", (task_id,))[0]
+
+	def set_task_status(self, task_id: str, action: str) -> dict:
+		"""complete / cancel / retry 三条迁移,一条 SQL 一条。
+
+		**三条都是条件更新**,理由跟认领一样:先读后写中间那道缝里,别人
+		可能已经把这条任务带走了。影响行数为 0 就走 _explain_unclaimable
+		那条路,把当前状态原样报回去 —— 不猜、也不静默改成"差不多"的状态。
+
+		retry 只从 in_progress 回到 pending。"原执行还在不在跑"这一层不进
+		数据库(它不是任务的身份,是服务进程的内存状态),由工具层在调这里
+		之前挡。到了这儿只判状态:**已经停在 in_progress 的任务重试一次是
+		合法的,而 completed / cancelled 是终态,不能借 retry 复活。**
+		"""
+		target = {"complete": "completed", "cancel": "cancelled",
+		          "retry": "pending"}.get(action)
+		if target is None:
+			raise TaskError("invalid_input", f"不认识的 action:{action}")
+		source = {"complete": "in_progress", "cancel": "pending",
+		          "retry": "in_progress"}[action]
+		with self._tx() as conn:
+			cursor = conn.execute(
+				"UPDATE tasks SET status = ?, updated_at = ?"
+				" WHERE id = ? AND status = ?",
+				(target, time.time(), task_id, source))
+			if cursor.rowcount != 1:
+				self._explain_unclaimable(conn, task_id, action, source, False)
+			return self._read_tasks(conn, " WHERE id = ?", (task_id,))[0]
+
+	def _require_pending(self, conn, task_id: str, what: str) -> None:
+		"""改任务图之前的那道闸。锁内调用。
+
+		运行中的任务不能改要求、也不能改依赖:子 agent 正按着当时的
+		name / description 干活,改掉之后它交回来的东西是按一套要求做的、
+		按另一套评判的。已完成和已取消是终态,改它们等于让别人的依赖判断
+		在事后变脸。
+		"""
+		row = conn.execute("SELECT status FROM tasks WHERE id = ?",
+		                   (task_id,)).fetchone()
+		if row is None:
+			raise TaskError("not_found", f"没有这个任务:{task_id}")
+		if row[0] != "pending":
+			raise TaskError(
+				"invalid_state", f"只能{what}等待中(pending)的任务,"
+				f"而它是 {row[0]}")
+
+	@staticmethod
+	def _reaches(conn, start: str, goal: str) -> bool:
+		"""从 start 顺着"依赖"边走,走得到 goal 吗。锁内调用。
+
+		用 UNION 而不是 UNION ALL:UNION 会去重,于是即使库里已经存在一个
+		环(不该有,但那是别处的 bug),这个查询也会因为集合不再增长而停
+		下来,而不是把进程转到没内存。查环这件事本身不该成为新的故障源。
+		"""
+		row = conn.execute(
+			"WITH RECURSIVE chain(id) AS ("
+			"  SELECT depends_on_id FROM task_dependencies WHERE task_id = ?"
+			"  UNION"
+			"  SELECT d.depends_on_id FROM task_dependencies d"
+			"    JOIN chain c ON d.task_id = c.id)"
+			" SELECT 1 FROM chain WHERE id = ? LIMIT 1", (start, goal)).fetchone()
+		return row is not None
+
+	def _explain_unclaimable(self, conn, task_id: str, action: str,
+	                         source: str, deps_matter: bool) -> None:
+		"""条件更新一行都没改到时,说清楚是哪一种。锁内调用,**必定抛**。
+
+		这里不返回一个"失败"值让调用方自己编话:几种原因要模型做的事完全
+		不同(id 打错了该去 task_read 查,前置没完成该等,已经在跑该停手),
+		交给调用方就是把这段判断写第二遍。
+
+		deps_matter 分开传,而不是"状态对就一定是被前置挡住":依赖条件只
+		写在认领那条 UPDATE 里,complete / cancel / retry 的 WHERE 中没有
+		它 —— 那三条走到这儿又状态相符,是别处改坏了,得说实话,不能顺手
+		编一句"前置任务还没完成"。
+		"""
+		tasks = self._read_tasks(conn, " WHERE id = ?", (task_id,))
+		if not tasks:
+			raise TaskError("not_found", f"没有这个任务:{task_id}")
+		task = tasks[0]
+		if task["status"] != source:
+			raise TaskError(
+				"invalid_state",
+				f"{action} 要求任务处于 {source},而它是 {task['status']}"
+				f"(当前 {task['state']})")
+		if not deps_matter:
+			raise TaskError(
+				"invalid_state",
+				f"{action} 没有改到这一行,但它的状态就是 {source} —— "
+				f"这是别处的问题,不是你的调用有问题")
+		names = "、".join(f"{d['name']}({d['id']}, {d['status']})"
+		                  for d in task["blocking"])
+		raise TaskError("blocked", f"前置任务还没完成,先等它们:{names}")

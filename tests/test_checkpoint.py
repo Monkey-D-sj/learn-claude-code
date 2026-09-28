@@ -157,8 +157,7 @@ def _one_round(messages, kw, seen):
 	messages.append({"role": "user", "content": [
 		{"type": "tool_result", "tool_use_id": uid, "content": "ok"}
 		for uid in ("tu1", "tu2", "tu3")]})
-	kw["checkpoint"](messages, {"rounds": seen["rounds"],
-	                            "rounds_since_todo": 1}, False)
+	kw["checkpoint"](messages, {"rounds": seen["rounds"]}, False)
 
 
 # ---------------------------------------------------------------- 快照与水位
@@ -195,7 +194,11 @@ def test_每个完整回合存一份_水位和运行状态一起(env, monkeypatc
 	assert runtime["max_rounds"] == server.MAX_ROUNDS, runtime
 	# 签名和 model 是恢复判定的依据,必须在快照里
 	assert runtime["signature"] and runtime["model"] == server.MODEL, runtime
-	assert runtime["todos"] == [], runtime
+	# **任务清单不进快照。** 它以前跟着 runtime_json 走(每轮把内存里那份
+	# todo 序列化进来),现在它在库里,是跨会话的权威来源 —— 再存一份就是
+	# 给同一件事留两个真相。这条钉住的是"删干净了":留着的话,恢复时拿哪
+	# 一份都说得通,而两份可以不一样。
+	assert "todos" not in runtime, runtime
 
 	# 普通回合的保存**不该**碰"压过"的时间:那是压缩档的事
 	assert compacted_at is None, seen["snapshot"]
@@ -211,7 +214,7 @@ def test_压缩那次保存_会写上压过的时间(env, monkeypatch):
 	db, store, sid = env
 	loop, seen = _scripted(
 		only=lambda messages, kw, seen: kw["checkpoint"](
-			messages, {"rounds": 1, "rounds_since_todo": 0}, **{"True": True})
+			messages, {"rounds": 1}, **{"True": True})
 		if False else kw["checkpoint"](messages, {"rounds": 1}, True))
 	monkeypatch.setattr(server, "agent_loop", loop)
 
@@ -359,9 +362,8 @@ def _dead_turn(store, sid, runtime=None, messages=None, covered=1, reserve=0):
 	store.save_checkpoint(
 		sid, turn["id"], covered,
 		messages if messages is not None else [{"role": "user", "content": "干活"}],
-		runtime or {"rounds": 1, "rounds_since_todo": 0, "signature": "sig",
-		            "active_request": "干活", "max_rounds": 100,
-		            "todos": [{"content": "第一步", "status": "in_progress"}]})
+		runtime or {"rounds": 1, "signature": "sig",
+		            "active_request": "干活", "max_rounds": 100})
 	for _ in range(reserve):
 		assert store.reserve_round(turn["id"], 100) is True
 	store.reap_running()
@@ -391,9 +393,10 @@ def test_续跑_号接着发_计数接着数_待办装回来(env, monkeypatch):
 	assert any("继续" in t for t in texts), texts
 	# 计数从快照里接着数(不是从 0),额度也是接着用的
 	assert seen["rounds_start"] == 1, seen.get("rounds_start")
-	# 待办装回来了 —— 不装的话模型一睁眼看到的是"No todos"
-	from server import todo_for
-	assert [i["content"] for i in todo_for(sid).items] == ["第一步"]
+	# **待办不再装回来。** 以前这儿验的是"清单从快照装回内存",现在清单在
+	# 库里 —— 恢复这条路一个字都不该去碰它,模型要清单就调 task_read。
+	# 钉住"恢复没往库里写任务":那才是这一版换成全局表之后新的危险。
+	assert store.list_tasks() == []
 	# 而回复事件照常发出去
 	assert handler.reply()["status"] == "completed", handler.reply()
 

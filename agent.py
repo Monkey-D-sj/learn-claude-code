@@ -295,8 +295,8 @@ def round_warn(rounds: int, max_rounds: int) -> str:
 def agent_loop(messages: list, active_request: str, system: str, tools: list,
                model: str, max_rounds: int, compactor, emit, ask,
                record=_drop, checkpoint=None, stream: bool = True,
-               begin_exec=None, reserve_round=None, rounds_start: int = 0,
-               rounds_since_todo_start: int = 0) -> TurnOutcome:
+               begin_exec=None, reserve_round=None,
+               rounds_start: int = 0) -> TurnOutcome:
 	"""跑一轮完整的 agent 循环,返回这一轮的结果(TurnOutcome)。
 
 	只负责机制。提示词、工具集、模型、轮数上限、压缩器都从外面传进来 ——
@@ -355,7 +355,6 @@ def agent_loop(messages: list, active_request: str, system: str, tools: list,
 	# 按有副作用处理(跟 ToolDesc 的默认值同一个方向)。
 	side_effects = {t.name for t in tools if getattr(t, "side_effect", True)}
 	wire = [t.to_wire() for t in tools]
-	rounds_since_todo = rounds_since_todo_start
 	# 从哪儿接着数:恢复过来的那一轮不是从 0 开始的,而额度是接着用的。
 	rounds = rounds_start
 	# 压缩器只回报"这一轮真压过了",存不存由下面那一处决定 —— 保存的
@@ -420,18 +419,16 @@ def agent_loop(messages: list, active_request: str, system: str, tools: list,
 		# 收掉的东西。压没压过由 prepare 回报(见 _mark_compacted),存不存
 		# 由这里说了算。
 		if checkpoint is not None:
-			checkpoint(messages,
-			           {"rounds": rounds, "rounds_since_todo": rounds_since_todo},
-			           compacted_here[0])
+			checkpoint(messages, {"rounds": rounds}, compacted_here[0])
 
 		# 轮数快用完了,提前说一声。判据是"这一次之后还剩几次"(rounds 已自增
 		# 过):0 就是最后一次,那一次的提醒最要紧 —— 它必须让模型给出答复,
 		# 而不是再开一个工具调用,否则这一轮什么都不会交付。
 		#
-		# 只进这一次请求的 payload,不进 messages。跟 todo 那个提醒不同:
-		# 那条留在 history 里是无害的唠叨,这条留到下一轮就成了主动使坏 ——
-		# 用户换个问题再问,模型一上来就看见"预算要没了",于是草草答一句。
-		# 它会一直赖在那儿,直到被压缩归档。
+		# 只进这一次请求的 payload,不进 messages。**这一条是它跟别的东西
+		# 的分界**:留到下一轮就成了主动使坏 —— 用户换个问题再问,模型一上来
+		# 就看见"预算要没了",于是草草答一句。它会一直赖在那儿,直到被压缩
+		# 归档。
 		#
 		# 也不能写成"先 append 进 messages、调用完再 pop":中间隔着上面那句
 		# prepare(),它会 messages[:] = 重建整个列表(snip_compact 归档中段、
@@ -440,7 +437,7 @@ def agent_loop(messages: list, active_request: str, system: str, tools: list,
 		#
 		# 位置在 prepare 之后:提醒是这一次请求的临时装饰,不是历史,不该被
 		# 压缩器看见。此刻 messages 停在完整回合上,尾巴是那条带 tool_result
-		# 的 user 消息,并进它而不是另起一条,形状跟 todo 提醒一致。
+		# 的 user 消息,并进它而不是另起一条。
 		payload = messages
 		if 0 <= max_rounds - rounds < ROUND_WARN:
 			warn = {"type": "text", "text": round_warn(rounds, max_rounds)}
@@ -565,7 +562,6 @@ def agent_loop(messages: list, active_request: str, system: str, tools: list,
 			return TurnOutcome("completed", final_text(response))
 
 		results = []
-		used_todo = False
 		for block in tool_calls:
 			# 调用和结果分两次发,前端才能知道"这条结果属于哪次调用"。
 			# 被 hook 拦下来的那次也有结果(拦截理由),所以 tool_result
@@ -598,7 +594,6 @@ def agent_loop(messages: list, active_request: str, system: str, tools: list,
 				except Exception as e:
 					output = f"Error: {type(e).__name__}: {e}"
 				trigger_hooks("PostToolUse", block, output)
-				used_todo = used_todo or block.name == "todo_write"
 
 			# 两条路(被拦 / 跑完)在这儿合流,是为了让"记一条工具结果"
 			# 只写一处。写三处的话,将来加第四条路(比如超时)时漏掉一处
@@ -631,16 +626,6 @@ def agent_loop(messages: list, active_request: str, system: str, tools: list,
 			results.append(result)
 			emit({"kind": "tool_result", "name": block.name,
 			      "output": clip_for_event(output)})
-
-		rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
-		if rounds_since_todo >= 3:
-			reminder = {
-				"type": "text",
-				"text": "<reminder>Update your todos.</reminder>"
-			}
-			results.append(reminder)
-			record("control", "user", [reminder])
-			rounds_since_todo = 0
 
 		# Feed tool results back, loop continues
 		messages.append({"role": "user", "content": results})

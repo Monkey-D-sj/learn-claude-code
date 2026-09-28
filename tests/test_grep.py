@@ -24,7 +24,6 @@ import inspect
 import pytest
 
 from tools import build_tools
-from tools.todo import TodoManager
 
 grep_mod = importlib.import_module("tools.grep")
 
@@ -147,7 +146,7 @@ def _nobody(question, options):
 
 
 def test_进工具集_挨着glob():
-	tools = build_tools(TodoManager(), _nobody)
+	tools = build_tools(_nobody, [])
 	names = [t.name for t in tools]
 	assert names[names.index("glob") + 1] == "grep", names
 	# 描述里得说清楚什么时候用它、什么时候该用 glob 和它的已知边界
@@ -156,9 +155,9 @@ def test_进工具集_挨着glob():
 
 
 def test_子agent的工具集_给grep_两个记忆不给(monkeypatch):
-	""""给什么"没有常量可查 —— 它是 run_task 里现算的,所以直接跑一次
-	run_task,把它交给循环的那份工具集截下来看。grep 是通用能力,不像
-	task / memory 有理由排除。"""
+	""""给什么"没有常量可查 —— 它是 run_agent 里现算的,所以直接跑一次
+	run_agent,把它交给循环的那份工具集截下来看。grep 是通用能力,不像
+	agent / memory 有理由排除。"""
 	import tools.subagent as subagent
 	from agent import TurnOutcome
 
@@ -169,11 +168,13 @@ def test_子agent的工具集_给grep_两个记忆不给(monkeypatch):
 		return TurnOutcome("completed", "结论")
 
 	monkeypatch.setattr(subagent, "agent_loop", fake_loop)
-	assert subagent.run_task("去看看") == "结论"
+	assert subagent.run_agent("去看看") == "结论"
 
 	names = [t.name for t in seen["tools"]]
 	assert "grep" in names, names
-	for excluded in ("task", "memory", "user_memory"):
+	# agent 不在名单里挡着,而是**根本不在 BASE_TOOLS 里** —— 派活的工具
+	# 由调用方挂上去,子 agent 那份不挂,套娃于是没有入口。
+	for excluded in ("agent", "memory", "user_memory"):
 		assert excluded not in names, (excluded, names)
 
 

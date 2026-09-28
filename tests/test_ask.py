@@ -25,7 +25,6 @@ import time
 import pytest
 
 from tools import build_tools
-from tools.todo import TodoManager
 
 # 用 importlib 而不是 `import tools.ask as A`:`as` 形式取的是**包上的属性**
 # 而不是 sys.modules,而属性会被同名变量覆掉。现在两个写法都对(模块里没有
@@ -154,7 +153,7 @@ def test_描述说了别拿它问权限():
 # ---------- 四、接线:每轮现造 ----------
 
 def test_进工具集():
-	names = [t.name for t in build_tools(TodoManager(), lambda q, o: "")]
+	names = [t.name for t in build_tools(lambda q, o: "", [])]
 	assert "ask" in names, names
 
 
@@ -168,8 +167,8 @@ def test_每次build都绑当时那个提问器():
 	def make(tag):
 		return lambda question, options: tag
 
-	first = [t for t in build_tools(TodoManager(), make("A")) if t.name == "ask"][0]
-	second = [t for t in build_tools(TodoManager(), make("B")) if t.name == "ask"][0]
+	first = [t for t in build_tools(make("A"), []) if t.name == "ask"][0]
+	second = [t for t in build_tools(make("B"), []) if t.name == "ask"][0]
 	assert first is not second, "两次 build 拿到同一个 ToolDesc"
 	assert first.handler("问") == "A"
 	assert second.handler("问") == "B"
@@ -180,7 +179,7 @@ def test_ask_user没有默认值():
 	而"错"的样子是页面一直转圈,或者 ask 在那个前端静默地永远不能用。"""
 	params = inspect.signature(build_tools).parameters
 	assert params["ask_user"].default is inspect.Parameter.empty
-	assert params["todo"].default is inspect.Parameter.empty
+	assert params["per_turn"].default is inspect.Parameter.empty
 
 
 def test_子agent拿不到ask(monkeypatch):
@@ -194,7 +193,7 @@ def test_子agent拿不到ask(monkeypatch):
 		return TurnOutcome("completed", "结论")
 
 	monkeypatch.setattr(subagent, "agent_loop", fake_loop)
-	assert subagent.run_task("去看看") == "结论"
+	assert subagent.run_agent("去看看") == "结论"
 
 	names = [t.name for t in seen["tools"]]
 	assert "ask" not in names, names

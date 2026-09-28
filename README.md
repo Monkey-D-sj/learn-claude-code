@@ -89,8 +89,9 @@ python server.py     # 然后打开 http://localhost:8765/
 
 ## 工具
 
-`tools/__init__.py` 里 `BASE_TOOLS` 那 14 个 + `build_tools()` 现造的 2 个,合起来
-16 个,就是模型能看到的全部:
+`tools/__init__.py` 里 `BASE_TOOLS` 那 13 个 + `build_tools()` 每轮现造的
+`ask` 和 `agent`,再加上会话开着 task 时才有的 5 个 `task_*`,就是模型能看到的
+全部:
 
 | 工具 | 作用 |
 |---|---|
@@ -98,24 +99,48 @@ python server.py     # 然后打开 http://localhost:8765/
 | `read_file` / `write_file` / `edit_file` | 文件读写改 |
 | `glob` | 列文件,支持 `**` 跨目录 |
 | `grep` | 按内容搜,返回 `路径:行号: 内容`;命中封顶 200 条 |
-| `todo_write` | 任务清单,同时让 agent 别跑偏 |
 | `skill` | 按名字加载一份技能正文 |
 | `skill_manage` | 实时列出、创建、更新、删除项目技能 |
 | `memory` | 项目级记忆:这个仓库的约定和坑。`add` / `remove` / `update` |
 | `user_memory` | 用户级记忆:你这个人的喜好和习惯。同上三个动作 |
 | `vision` | 看一眼图片(PNG/JPEG/GIF/WebP),答一个关于它的问题。图不进上下文 |
 | `ask` | 问用户一个问题,等他的回答。可以带一组选项,页面上画成按钮 |
-| `task` | 派一个子 agent,独立上下文,只回结论 |
+| `agent` | 派一个子 agent,独立上下文,只回结论。也可以给 `task_id` 执行一条已有任务 |
 | `compress` | 把一段干完的活按号段压成一句话(见下面的上下文压缩) |
 | `recall` | 按号把压掉的那段原文取回来(号就是库里那一行的行号,见下面的上下文压缩) |
+| `task_read` / `task_create` / `task_edit` / `task_dependency` / `task_status` | 跨会话的任务表(见下面「任务」) |
 
 每个工具都是一个 `ToolDesc`(dataclass):名字 + 描述 + input schema + handler。
 加工具 = 新建一个文件、写个 `ToolDesc`、在 `tools/__init__.py` 里加进
 `BASE_TOOLS`。
 
-要是它得绑一个**每轮或每会话才存在**的东西(某个 agent 的任务清单、这一轮的
-问题该往哪条流上问),就写成工厂,由 `build_tools` 现造 —— `todo_write` 和
-`ask` 就是这两个,`BASE_TOOLS` 里没有它们。
+要是它得绑一个**每轮或每会话才存在**的东西(这一轮的问题该往哪条流上问、
+用哪个库、这是哪一轮),就写成工厂,由 `build_tools` 的 `per_turn` 参数现造
+—— `ask`、`agent`、`task_*` 都是这一类,`BASE_TOOLS` 里没有它们。
+`build_tools` 两个参数都**不给默认值**:默认值等于把"这个会话到底能不能用
+task"这个决定藏起来。
+
+## 任务
+
+任务是一张**跨会话**的表(`sessions.db` 里的 `tasks` / `task_dependencies`),
+不绑创建它的会话 —— 新会话打开 task 就能接着做旧会话留下的活。这是它跟
+被它取代的 `todo_write` 最根本的区别:那份清单活在进程内存里,重启就没了。
+
+- 开关在**会话**上(`sessions.task_enabled`),新会话默认**关**。关着的时候
+  那 5 个工具根本不进工具集,而不是"列出来但调不动";任务数据一条都不动。
+- 落库的状态只有 `pending` / `in_progress` / `completed` / `cancelled` 四个;
+  `ready` 和 `blocked` 由依赖**实时算**,不落库 —— 存下来的话,一个前置变了
+  就得回头改所有受影响的后续任务,改漏了还不报错。
+- 认领(把 `pending` 改成 `in_progress`)**依赖检查和状态改写是同一条
+  UPDATE**:先读后写的话,两个会话同时抢一条 ready 任务会双双成功,而后果
+  是同一个任务被两个子 agent 同时改同一批文件。
+- **任务不会自动重试。** 失败、中断、进程重启之后它停在 `in_progress` 等人
+  核对,只有显式 `task_status(retry)` 才回到 `pending`。
+- 子 agent 返回**不等于**任务完成:它只表示这次调用结束了,提交由主 agent
+  调 `task_status(complete)` 决定。
+
+页面右侧那个「任务:开/关」按钮就是那个开关(活动轮次或未处理的中断轮次
+存在时会被拒),侧栏下方那块是任务列表。
 
 `compress` / `recall` 这一对也属于"要绑东西"的一类,但它俩绑的东西都没有
 "造工具的那一刻"可以挂上去 —— 所以两个都走 `contextvar`,各绑各的

@@ -56,7 +56,10 @@ def test_建会话_连空上下文一起(db, store):
 	              " FROM session_contexts") == [("[]", 1, None)]
 	assert raw(db, "SELECT memory_snapshot, user_snapshot FROM sessions") \
 		== [("项目记忆", "用户记忆")]
-	assert store.list_sessions() == [out], store.list_sessions()
+	# 新会话的 task 开关默认是**关**。开着的默认值等于给每个新会话都发一张
+	# 全局任务表的读写权,而那是用户该主动开的东西。
+	assert store.list_sessions() == [{**out, "task_enabled": False}], \
+		store.list_sessions()
 
 
 def test_开轮_发号_标题只认第一次(db, store):
@@ -327,7 +330,8 @@ def test_空库一次建到当前版本_表齐了(db, store):
 	assert raw(db, "PRAGMA user_version") == [(sessions.SCHEMA_VERSION,)]
 	# sqlite_sequence 是 events 那个自增主键自带的内部表
 	assert tables(db) == ["events", "session_contexts", "sessions",
-	                      "sqlite_sequence", "tool_execs", "turn_messages", "turns"]
+	                      "sqlite_sequence", "task_dependencies", "tasks",
+	                      "tool_execs", "turn_messages", "turns"]
 	sid = store.create_session("项目记忆", "用户记忆")["id"]
 	store.begin_turn(sid, "问题")
 	assert len(store.list_turns(sid)["turns"]) == 1
@@ -407,9 +411,14 @@ def test_从v3迁到v4_数据一条不少(db, monkeypatch):
 	# 外键和索引都还在
 	assert raw(db, "PRAGMA foreign_key_check") == []
 	assert tables(db) == ["events", "session_contexts", "sessions",
-	                      "sqlite_sequence", "tool_execs", "turn_messages", "turns"]
+	                      "sqlite_sequence", "task_dependencies", "tasks",
+	                      "tool_execs", "turn_messages", "turns"]
 	assert "tool_execs_turn" in [r[0] for r in raw(
 		db, "SELECT name FROM sqlite_master WHERE type='index'")]
+	# v5 那条只是加表和加列,老会话的开关取默认的**关** —— 迁移不许顺手
+	# 把老会话的 task 打开:那等于替用户做了一个他没做过的决定。
+	assert raw(db, "SELECT task_enabled FROM sessions") == [(0,)]
+	assert store.list_tasks() == []
 	# 老库照常能聊:读上下文、开新轮
 	assert store.load_context(sid) == [{"role": "user", "content": "老历史"}]
 	assert store.begin_turn(sid, "新问题")["turn_no"] == 2

@@ -24,7 +24,6 @@ from types import SimpleNamespace
 import pytest
 
 from tools import build_tools
-from tools.todo import TodoManager
 
 # 变量就叫 vision,tools/__init__.py 那句 import 会把包上的 tools.vision 属性
 # 覆成 ToolDesc —— `as` 形式取的是属性,所以得走 importlib。详见 vision.py 末尾。
@@ -213,7 +212,7 @@ def test_handler的签名是agent_loop要的那种():
 
 
 def test_进工具集():
-	names = [t.name for t in build_tools(TodoManager(), lambda q, o: "")]
+	names = [t.name for t in build_tools(lambda q, o: "", [])]
 	assert "vision" in names, names
 
 
@@ -255,5 +254,5 @@ def test_子agent拿得到(monkeypatch):
 		return TurnOutcome("completed", "结论")
 
 	monkeypatch.setattr(subagent, "agent_loop", fake_loop)
-	assert subagent.run_task("去看看") == "结论"
+	assert subagent.run_agent("去看看") == "结论"
 	assert "vision" in [t.name for t in seen["tools"]]

@@ -232,7 +232,7 @@ def test_子agent_关掉流式(monkeypatch):
 		return agent.TurnOutcome("completed", "结论")
 
 	monkeypatch.setattr(subagent, "agent_loop", fake_loop)
-	assert subagent.run_task("去看看") == "结论"
+	assert subagent.run_agent("去看看") == "结论"
 	assert seen.get("stream") is False, seen.get("stream")
 
 

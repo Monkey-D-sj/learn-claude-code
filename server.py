@@ -70,12 +70,13 @@ from config import MAX_ROUNDS, MEMORY_PATH, USER_MEMORY_PATH, WORKDIR
 from context import ContextCompactor
 from hooks import trigger_hooks
 from sessions import (DB_PATH, INTERRUPT_CHECKPOINT_FAILED,
-                      INTERRUPT_PERSIST_FAILED, CheckpointConflict,
+                      INTERRUPT_PERSIST_FAILED, TASK_STATES, CheckpointConflict,
                       PersistError, SessionStore, TurnStateConflict)
 from tools import build_tools
 from tools.memory import load_memory
 from tools.compress import bind_recall, make_recall
-from tools.todo import TodoManager
+from tools.subagent import make_agent_tool
+from tools.task import make_task_tools, release_turn
 import usage
 
 # 端口可以用环境变量顶掉(AGENT_PORT),理由同 sessions.DB_PATH:进程级测试
@@ -119,11 +120,11 @@ def open_store():
 # 让它涨:本机工具,会话数是几十。
 LOCKS: dict[str, threading.Lock] = {}
 
-# 每个会话一份任务清单。也一样只增不删,理由同上(而且清单本来就跨轮次
-# 活着:模型每三轮会被提醒更新一次)。为什么不是全局一份,见 tools/todo.py。
-TODOS: dict[str, TodoManager] = {}
-
-# 护上面两个容器的**增删**。它不护任何别的东西 —— 尤其不护 SQL。
+# 护上面那个容器的**增删**。它不护任何别的东西 —— 尤其不护 SQL。
+#
+# 以前这儿还有一个 TODOS(每会话一份待办清单)。它跟着 todo_write 一起没了:
+# 任务清单现在在库里,是跨会话的(见 tools/task.py)。**那才是这一版真正
+# 改掉的东西** —— 一份只活在进程内存里的清单,进程一重启就没有了。
 REGISTRY = threading.Lock()
 
 
@@ -147,12 +148,24 @@ def is_running(sid: str) -> bool:
 	return lock is not None and lock.locked()
 
 
-def todo_for(sid: str) -> TodoManager:
-	with REGISTRY:
-		todo = TODOS.get(sid)
-		if todo is None:
-			todo = TODOS[sid] = TodoManager()
-		return todo
+def turn_tools(sid: str, turn_id: str) -> list:
+	"""这一轮多的那些工具:`agent`,以及 task 开启时的五个 task 工具。
+
+	**每轮现造**,跟以前造 todo 那个工具是同一个理由,只是范围大了:
+	它们全都绑着"哪个库、哪一轮",而这两样每轮才存在。顺带把会话开关
+	读进来 —— 关闭的会话里那五个工具**根本不进工具集**,不是进了再拒绝:
+	列在那儿的话,模型会去用,然后拿到一句错误,而它会以为自己的调用方式
+	不对,换着法儿重试。
+
+	开关在**这一轮开始时读一次**:设计 §6 要求"一轮执行期间的工具集和
+	恢复签名保持不变",中途改了值会让这一轮的工具集和它写下的恢复签名
+	对不上,那一轮就再也恢复不了。
+	"""
+	enabled = STORE.task_enabled(sid)
+	tools = [make_agent_tool(STORE, turn_id, enabled)]
+	if enabled:
+		tools.extend(make_task_tools(STORE, turn_id))
+	return tools
 
 
 def clean_query(raw) -> str:
@@ -490,37 +503,23 @@ def recovery_signature(system: str, tools: list) -> str:
 	return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
 
 
-def _signature_tools():
+def signature_tools(sid: str) -> list:
 	"""算签名用的工具集:只要 schema,不要任何每轮才有的东西。
 
-	所以 ask 和 todo 随便给个不动的实现 —— 它们的 schema 跟谁绑着无关。
-	少写这一句的话,算签名就得多造一条响应流出来,而那意味着签名这件事
-	被绑在了"正在跑的一轮"上。
+	ask / agent / task 那些 handler 都不会被调到这里 —— 签名只读 name 和
+	to_wire()。所以随便是谁当库都行,这一句在,签名这件事就不必依赖
+	"正在跑的那一轮"或者一个真库。
+
+	**按 task 开关算两套,这是必须的。** 开关不同的会话,工具集真的不一样
+	(五个 task 工具在不在、agent 的 task_id 参数在不在),而恢复签名回答的
+	正是"模型当时看到的还是这一套吗"。用同一套签名糊过去的话,一个关着
+	task 的会话能恢复一轮当时开着 task 的检查点 —— 模型会拿着一条它现在
+	根本没有的工具调用往下跑。
 	"""
-	return build_tools(TodoManager(), lambda question, options: None)
-
-
-def restore_todos(sid: str, items) -> tuple[int, int]:
-	"""把快照里的待办清单装回这个会话。返回(装回去几条,丢掉几条)。
-
-	**要校验,不能直接塞进 manager。** 这份内容来自库里,而库里的东西
-	原则上是**不可信资料**(它最初来自模型的一次工具调用)。直接赋值等于
-	绕过了 TodoManager.update 那一整套校验,往后每一次 render 都在拿
-	一份没人检查过的结构去拼字符串。
-
-	丢掉的东西不吭声是不行的:那是"我再打开这个会话,清单少了两条" ——
-	所以数字交回调用方,由它发一条事件说清楚。
-	"""
-	todo = todo_for(sid)
-	kept, dropped = [], 0
-	for item in items if isinstance(items, list) else []:
-		if isinstance(item, dict) and isinstance(item.get("content"), str) \
-				and item.get("status") in ("pending", "in_progress", "completed"):
-			kept.append({"content": item["content"], "status": item["status"]})
-		else:
-			dropped += 1
-	todo.items = kept
-	return len(kept), dropped
+	extra = [make_agent_tool(None, "", False)]
+	if STORE is not None and STORE.task_enabled(sid):
+		extra = [make_agent_tool(None, "", True), *make_task_tools(None, "")]
+	return build_tools(lambda question, options: None, extra)
 
 
 def _interrupt_note(info: dict) -> str:
@@ -637,6 +636,8 @@ class Handler(BaseHTTPRequestHandler):
 			self._pet_image()
 		elif parts == ["sessions"]:
 			self._get_sessions()
+		elif parts == ["tasks"]:
+			self._get_tasks(query)
 		elif len(parts) == 3 and parts[0] == "session" and parts[2] == "events":
 			self._get_events(parts[1], query)
 		elif len(parts) == 3 and parts[0] == "session" and parts[2] == "turns":
@@ -677,6 +678,29 @@ class Handler(BaseHTTPRequestHandler):
 			 "waiting": row["id"] in waiting}
 			for row in STORE.list_sessions()
 		]})
+
+	def _get_tasks(self, query: dict):
+		"""任务列表。**全局的**,不带 session 段 —— 任务不绑会话。
+
+		页面拿它画任务面板。刷新那条路上页面不重放事件去重建任务:事件是
+		过程记录(任务在跑、任务改了),而任务本身在库里是完整的,两边都画
+		一遍就得写一套去重规则,而那种规则迟早会漏(跟 _get_turns 上面那段
+		同一个理由)。
+
+		status 收 'all' 是有用的:默认只给未完成的,而"上周那些做完的"只有
+		显式要才拿得到。
+		"""
+		owner = (query.get("owner") or [""])[0]
+		status = (query.get("status") or [""])[0] or None
+		if status and status not in (*TASK_STATES, "ready", "blocked", "all"):
+			self.send_error(400, "bad status filter")
+			return
+		try:
+			tasks = STORE.list_tasks(owner=owner or None, status=status)
+		except Exception as e:
+			self.send_error(500, f"task list failed: {type(e).__name__}: {e}")
+			return
+		self._send_json({"tasks": tasks, "count": len(tasks)})
 
 	def _get_turns(self, sid: str):
 		"""这一页要的东西:每一轮,连同它自己的原始消息。
@@ -812,6 +836,9 @@ class Handler(BaseHTTPRequestHandler):
 			self._post_session()
 		elif len(parts) == 3 and parts[0] == "session" and parts[2] == "delete":
 			self._post_delete(parts[1])
+		elif (len(parts) == 3 and parts[0] == "session"
+		      and parts[2] == "tasks-enabled"):
+			self._post_tasks_enabled(parts[1])
 		elif (len(parts) == 5 and parts[0] == "session" and parts[2] == "turn"
 		      and parts[4] == "resume"):
 			self._post_resume(parts[1], parts[3])
@@ -860,9 +887,55 @@ class Handler(BaseHTTPRequestHandler):
 			STORE.delete_session(sid)
 		finally:
 			lock.release()
-		# 进程里那两份(LOCKS/TODOS)不跟着收:它们只增不删,理由见上面。
+		# 进程里那份(LOCKS)不跟着收:它只增不删,理由见上面。
 		# 剩下几个没人用的 dict,在本机工具里不值得为它引入删除的竞态。
+		#
+		# task 那份占用记录(ACTIVE)也不用管:它按**轮**算,而轮末一律松手
+		# (见 _drive 的 finally),跟会话还在不在没关系。
 		self._send_json({"ok": True})
+
+	def _post_tasks_enabled(self, sid: str):
+		"""开/关这个会话的 task 能力。
+
+		**两道闸,都不是走过场。**
+
+		  1. 会话锁(非阻塞抢一把)。活动的一轮正在用它开头那一刻的工具集
+		     跑,而工具集进恢复签名 —— 中途换了开关,那一轮写下的检查点就
+		     跟它自己的签名对不上了,之后谁也恢复不了它。
+		  2. 尚未解决的中断轮次。跟上面同一个理由:那一轮迟早要**恢复**,
+		     而恢复时算的签名是"现在这套工具"。开着 task 的中断轮次在关掉
+		     之后恢复,模型会拿着一份少了五个工具的历史接着跑 —— 它上一步
+		     刚调用过的工具,这一步就从列表里消失了。
+
+		两道闸都不改数据,只是拒绝 —— 拒绝之后用户可以先去把那一轮续跑或
+		放弃,再回来切。
+		"""
+		body = self._json_body('{"enabled": true}')
+		if body is None:
+			return
+		if not isinstance(body.get("enabled"), bool):
+			self.send_error(400, "enabled must be a boolean")
+			return
+		lock = session_lock(sid)
+		if not lock.acquire(blocking=False):
+			self.send_error(409, "this session has a turn running")
+			return
+		try:
+			if not STORE.session_exists(sid):
+				self.send_error(404, "no such session")
+				return
+			pending = STORE.unresolved_interrupt(sid)
+			if pending:
+				self.send_error(
+					409, "this session has an unresolved interrupted turn"
+					     " - resume or abandon it first")
+				return
+			STORE.set_task_enabled(sid, body["enabled"])
+			# 回的是**库里那份**的值,不是请求里那个:两者不一样时(比如
+			# 将来加了别的闸),页面画的应该是真相。
+			self._send_json({"ok": True, "task_enabled": STORE.task_enabled(sid)})
+		finally:
+			lock.release()
 
 	def _review_info(self, sid: str, tid: str) -> dict:
 		"""算一份"这一轮现在什么状况"。锁内调用,页面和两个入口都用它。
@@ -874,7 +947,7 @@ class Handler(BaseHTTPRequestHandler):
 		system = build_system(*STORE.get_memory_snapshots(sid))
 		return STORE.checkpoint_info(sid, tid, MAX_ROUNDS,
 		                             recovery_signature(system,
-		                                                _signature_tools()))
+		                                                signature_tools(sid)))
 
 	def _get_review(self, sid: str, tid: str):
 		"""这一轮的中断详情:页面拿它画"继续 / 放弃"和那段证据清单。
@@ -935,10 +1008,10 @@ class Handler(BaseHTTPRequestHandler):
 				                 "detail": str(e)}, 409)
 				return
 
-			# 待办清单是从库里装回来的,而这个进程可能刚起来(内存里那份
-			# 是空的)。装不回去的条数要说出来 —— 悄悄少两条,模型下一轮
-			# 就会按一份少了东西的清单干活。
-			kept, dropped = restore_todos(sid, runtime.get("todos"))
+			# 待办清单不在这儿装回来了 —— 它以前活在这一轮的 runtime_json 里,
+			# 现在活在库里,而且是**跨会话的权威来源**。装回来这件事本身没意义
+			# 了:模型要清单就调 task_read,task 关着的会话根本没有那个工具,
+			# 也就不该有清单。
 			turn = {"id": tid, "turn_no": info["turn_no"]}
 			self.send_response(200)
 			self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
@@ -946,10 +1019,6 @@ class Handler(BaseHTTPRequestHandler):
 			self._cors()
 			self.end_headers()
 			emit = recording_emit(sid, ndjson_emit(self.wfile), turn)
-			if dropped:
-				emit_quietly(emit, {"kind": "note", "source": "store",
-				                    "text": f"待办清单里有 {dropped} 条认不出来,"
-				                            f"只装回了 {kept} 条"})
 			emit_quietly(emit, {"kind": "note", "source": "resume",
 			                    "text": f"从第 {info['turn_no']} 轮的检查点继续"
 			                            f"(用了 {info['rounds_used']}/{MAX_ROUNDS} 回合预算)"})
@@ -966,7 +1035,6 @@ class Handler(BaseHTTPRequestHandler):
 			            emit=emit,
 			            start_rounds=max(int(runtime.get("rounds") or 0),
 			                             int(info.get("rounds_used") or 0)),
-			            rounds_since_todo=int(runtime.get("rounds_since_todo") or 0),
 			            first_time=False)
 		finally:
 			lock.release()
@@ -1187,8 +1255,7 @@ class Handler(BaseHTTPRequestHandler):
 
 	def _drive(self, sid: str, turn: dict, history: list, memories: tuple,
 	           active_request: str, record, emit,
-	           start_rounds: int = 0, rounds_since_todo: int = 0,
-	           first_time: bool = True) -> None:
+	           start_rounds: int = 0, first_time: bool = True) -> None:
 		"""跑这一轮,然后收尾。**新提问和恢复走的是同一条路。**
 
 		两边不同的只有:历史从哪儿来、号从几号接着发、计数从多少接着数、
@@ -1202,16 +1269,23 @@ class Handler(BaseHTTPRequestHandler):
 			       → 最后才发 reply
 		"""
 		silent = quiet(emit)
-		tools = build_tools(todo_for(sid),
-		                    # 提问器绑在这一轮这条流上,所以每轮现造。
-		                    # 跟 ask= 那份不同:那个的答案是是/否(权限),
-		                    # 这个是一段文字(模型提问)。
-		                    make_ask_text(emit, sid, turn["id"]))
+		tools = build_tools(
+			# 提问器绑在这一轮这条流上,所以每轮现造。
+			# 跟 ask= 那份不同:那个的答案是是/否(权限),
+			# 这个是一段文字(模型提问)。
+			make_ask_text(emit, sid, turn["id"]),
+			turn_tools(sid, turn["id"]))
 		system = build_system(*memories)
 		# 恢复兼容性签名:把"模型当时看到的这一套"压成一个短串,写进快照。
 		# 恢复时拿现在的再算一遍比对 —— 中间换过模型、改过提示词、动过
 		# 工具集或代码,恢复出来的就不是同一个任务了,那种"接着跑"比停下
 		# 来更糟:模型会拿着一份不是自己的历史继续做决定。
+		#
+		# **工具集是上面这一份,而恢复时算的是 signature_tools(sid)** ——
+		# 两者必须逐字节等价。它们的 handler 不一样(一个绑着真库和本轮 id,
+		# 一个是空的),但签名只读 name 和 schema,而那两样只跟
+		# task_enabled 有关。哪天有人让工具 schema 依赖本轮的具体值,这个
+		# 等价就断了,而断的表现是"所有检查点都恢复不了"。
 		frozen = {
 			"format": 1,
 			"active_request": active_request,
@@ -1222,11 +1296,15 @@ class Handler(BaseHTTPRequestHandler):
 		}
 
 		def checkpoint(messages: list, loop_state: dict, compacted: bool) -> None:
-			# 循环只知道自己那两个数(第几回合、多久没更新待办),别的都从
-			# 这儿补 —— 它不知道也不该知道模型名、system、工作目录这些。
+			# 循环只知道自己那个数(第几回合),别的都从这儿补 —— 它不知道
+			# 也不该知道模型名、system、工作目录这些,更不知道任务清单。
+			#
+			# **任务清单不进快照了。** 它以前跟着 runtime_json 走(每轮把内存
+			# 里那份 todo 序列化进去),现在它在库里,是权威来源 —— 再存一份
+			# 就等于给同一件事留两个真相,而恢复时拿哪一份都说得通,那才是
+			# 最坏的情况。
 			self._checkpoint(sid, turn, record, messages,
-			                 {**frozen, **loop_state,
-			                  "todos": todo_for(sid).items}, compacted)
+			                 {**frozen, **loop_state}, compacted)
 
 		# 兜底那份:正常路径下会被覆盖。事先摆一个失败,是为了万一控制流
 		# 以预料之外的方式跳出去,收尾时手里也有个说得通的终态,而不是
@@ -1276,8 +1354,7 @@ class Handler(BaseHTTPRequestHandler):
 						# 调用前先占额度,理由见 sessions.reserve_round。
 						reserve_round=lambda:
 							STORE.reserve_round(turn["id"], MAX_ROUNDS),
-						rounds_start=start_rounds,
-						rounds_since_todo_start=rounds_since_todo)
+						rounds_start=start_rounds)
 		except PersistError as e:
 			# 恢复关键的一条记录没落库(assistant 响应、工具结果、控制消息、
 			# 或者回合快照)。**停在这儿,而且绝不把内存里这份历史存下去** ——
@@ -1291,6 +1368,15 @@ class Handler(BaseHTTPRequestHandler):
 			outcome = TurnOutcome("failed", f"Error: {type(e).__name__}: {e}",
 			                      f"{type(e).__name__}: {e}")
 		finally:
+			# **轮末松开这一轮攥着的所有任务。** 放在 finally 的第一句,而不是
+			# 跟着"成功"那条路走:失败和中断的那两条路上任务一样要松手,不放
+			# 的话那几条 task 会被一个已经结束的轮次永远攥着,后面谁都不能
+			# complete、也不能 retry(见 tools/task.py 的 held_by)。
+			#
+			# 松手**不改库里的状态**:任务还停在 in_progress,那正是设计 §5
+			# 要的 —— "这一轮跑完了但没提交结果"要留成一条等人核对的状态,
+			# 而不是假装它没发生过。
+			release_turn(turn["id"])
 			if interrupted:
 				# 只动 turns。上下文一个字都不写 —— 手上这份历史没验证过,
 				# 而库里那份是最后一个可信点(见 mark_interrupted)。

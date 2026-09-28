@@ -36,7 +36,6 @@ from tools.base import ToolDesc
 from tools.compress import bind_recall, make_recall, run_recall
 from tools.compress import compress as compress_tool
 from tools.compress import recall as recall_tool
-from tools.todo import TodoManager
 
 
 def msg(role: str, text: str) -> dict:
@@ -675,7 +674,7 @@ def test_子agent手里没有compress也没有recall(monkeypatch):
 		return SimpleNamespace(text="", status="completed")
 
 	monkeypatch.setattr(subagent, "agent_loop", fake_agent_loop)
-	subagent.run_task("查一下")
+	subagent.run_agent("查一下")
 
 	names = [tool.name for tool in given["tools"]]
 	assert "compress" not in names, names
