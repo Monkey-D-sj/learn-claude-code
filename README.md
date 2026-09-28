@@ -84,7 +84,7 @@ python server.py     # 然后打开 http://localhost:8765/
 | `memory/` | 项目级记忆(`MEMORY.md`),一条一行,常驻 system prompt |
 | `user/` | 用户级记忆(`USER.md`),同上;被 `.gitignore` 挡掉 |
 | `notes/context.md` | 压缩的原始设计稿,**不是现行设计** —— 哪些落地了见文件头的状态说明 |
-| `example.py` | 压缩流程的原始设计稿(独立脚本,不被引用),`context.py` 的前身 |
+| `example.py` | 任务系统的原始设计稿(独立脚本,不被引用),任务用 `.tasks/*.json` 落盘;现行走 SQLite,见 `tools/task.py` |
 | `tests/` | pytest。`test_context.py` 按模块直接测,不是端到端 |
 
 ## 工具
