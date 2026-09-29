@@ -75,8 +75,8 @@ def wiring(monkeypatch, tmp_path):
 		events.append(event)
 
 	def checkpoint(messages, loop_state, compacted):
-		server.Handler._checkpoint(
-			SimpleNamespace(), sid, turn, record, messages,
+		server.checkpoint_turn(
+			sid, turn, record, messages,
 			{**loop_state, "active_request": "干活", "signature": "sig"}, compacted)
 
 	return {"db": db, "store": store, "sid": sid, "turn": turn, "record": record,
@@ -219,7 +219,7 @@ def test_真循环_记录先于事件(wiring, monkeypatch):
 	orders = []
 	real_record = wiring["record"]
 
-	def record(kind, role, content, tool_use_id=None):
+	def record(kind, role, content, tool_use_id=None, claim_job=None):
 		rows = _rows(wiring, "SELECT COUNT(*) FROM turn_messages")[0][0]
 		orders.append(("record", kind, rows))
 		return real_record(kind, role, content, tool_use_id=tool_use_id)

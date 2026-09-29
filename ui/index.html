@@ -186,6 +186,50 @@
   #head .name { color: var(--fg); font-weight: 600; letter-spacing: .2px; }
   #head .spacer { flex: 1; }
 
+  /* ---- 后台执行 ----
+     一条窄状态带,挂在头顶和日志之间。它跟着 --col 对齐,但**不参与滚动**
+     —— 它是"现在有什么在跑",翻历史的时候也该看得见。 */
+  #jobs {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    width: 100%;
+    max-width: var(--col);
+    margin: 0 auto;
+    padding: 12px 20px 0;
+  }
+  /* hidden 要显式写回来:上面那句 display:flex 会盖掉 UA 对 [hidden] 的
+     display:none —— 于是"藏起来"这个属性在页面上毫无效果,还不报错。 */
+  #jobs[hidden] { display: none; }
+
+  .job {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    font: 12px/1.6 var(--mono);
+    color: var(--dim);
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 5px 10px;
+  }
+  .job .tool { color: var(--fg); }
+  .job .id { color: var(--faint); }
+  .job .state { margin-left: auto; }
+  /* 状态颜色跟着 data-status 走,理由同 .thead(见上面那段)。 */
+  .job[data-status="running"] .state,
+  .job[data-status="queued"] .state { color: var(--tool); }
+  .job[data-status="failed"] .state { color: var(--err); }
+
+  /* 后台续跑那一轮的来源标记。不标的话,页面上会凭空出现一轮用户没说过
+     的话 —— 而那看起来像是页面出了错。 */
+  .thead .src {
+    color: var(--tool);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 0 4px;
+  }
+
   /* ---- 日志 ---- */
   #log {
     flex: 1;
@@ -1079,6 +1123,17 @@
   <span id="hint">Enter 发送 · Shift+Enter 换行</span>
 </header>
 
+<!-- 后台执行的状态条。**它不在 #stream 里**,理由有两条:
+
+     一、后台 job 的结果是在**原轮结束之后**才回来的。挂在那一轮的容器里的话,
+         它要么落进一个已经收尾的轮次框(那是在改历史),要么得凭空造一个新框;
+     二、它是"当前会话的后台状态",不是对话内容 —— 切会话、刷新时它由
+         /turns 和 /events 重建,跟轮次展示走的是两套来源。
+
+     里面每个格子按 job_id 原地更新(见 renderJobs):跑起来、完成了、失败了
+     都是同一个格子换个状态,不是往流上一句句追加日志。 -->
+<div id="jobs" hidden></div>
+
 <div id="log"><div class="inner" id="stream"></div></div>
 
 <form id="bar">
@@ -1357,6 +1412,55 @@ function add(node, target) {
   follow();
 }
 
+// ---- 后台执行的状态格子 ----
+//
+// 每个 job 一个格子,按 job_id 认,**原地更新** —— 起跑、完成、失败都是同一个
+// 格子换个状态,不是往流上追加一行日志。"它在跑"和"它跑完了"是同一件事的两个
+// 瞬间,画成两条的话,读的人得自己去把它们对上,而对不上的时候没人会报错。
+//
+// **只画结果还没进对话的那些**(还在跑,或者跑完了还没交付):交付之后内容就
+// 在对话里了,格子再留着只是把同一份东西画两遍。所以这个列表不会一直涨。
+//
+// 数据是"当前快照"、不是事件,所以从接口拿而不从事件流推:
+//   /events 每一拍带一份 —— 页面本来就在轮询,顺路就更新了;
+//   /turns  切会话、刷新时一份 —— 这样刷新之后格子还在。
+// 从事件推的话要写一套"我见过哪条没见过的"规则,而那种规则迟早会漏 ——
+// 漏的表现是这个格子卡在"执行中"不动。
+const jobsPanel = document.getElementById("jobs");
+
+const JOB_TEXT = { queued: "排队中", running: "执行中", completed: "完成",
+                   failed: "失败" };
+
+const JOBS = new Map();
+
+function renderJobs(jobs) {
+  const seen = new Set();
+  for (const job of jobs || []) {
+    const open = job.status === "queued" || job.status === "running";
+    if (!open && job.notice !== "pending") continue;
+    seen.add(job.id);
+    let card = JOBS.get(job.id);
+    if (!card) {
+      card = el("div", "job");
+      card.appendChild(el("span", "tool", job.tool));
+      card.appendChild(el("span", "id", job.id));
+      card.appendChild(el("span", "state"));
+      JOBS.set(job.id, card);
+      jobsPanel.appendChild(card);
+    }
+    card.dataset.status = job.status;
+    card.querySelector(".state").textContent = JOB_TEXT[job.status] || job.status;
+    // 悬停给完整原因/摘要:格子上只有几个字,而"为什么失败"才是要看的。
+    card.title = [job.error, job.summary].filter(Boolean).join("\n");
+  }
+  for (const [id, card] of JOBS) {
+    if (seen.has(id)) continue;
+    card.remove();
+    JOBS.delete(id);
+  }
+  jobsPanel.hidden = JOBS.size === 0;
+}
+
 // ---- 轮次 ----
 //
 // 屏幕上一条轮次就是一个 <section class="turn">,里面是抬头(轮号 + 状态)
@@ -1372,12 +1476,19 @@ function add(node, target) {
 const STATE_TEXT = { running: "运行中", completed: "完成", failed: "失败",
                      unsaved: "未入库", interrupted: "中断" };
 
-function turnBox(id, no) {
+function turnBox(id, no, source) {
   let box = TURNS.get(id);
   if (box) return box;
   box = el("section", "turn");
   const head = el("header", "thead");
   head.appendChild(el("span", "no", no == null ? "一轮" : "第 " + no + " 轮"));
+  // 来源是'background'的那几轮是**服务端自己开的**(后台结果要送回来)。
+  // 不标的话,页面上会凭空出现一轮用户从没说过的话 —— 那看起来像页面出错了。
+  // 直播那一路拿不到来源(事件里没带),它会在下一次刷新/切会话时由 /turns 补上。
+  if (source === "background") {
+    box.dataset.source = "background";
+    head.appendChild(el("span", "src", "后台结果"));
+  }
   head.appendChild(el("span", "state"));
   box.appendChild(head);
   TURNS.set(id, box);
@@ -1482,6 +1593,10 @@ async function loadTurns(sid) {
     if (ask.turn_id) turn = turnBox(ask.turn_id, null);
     add(renderAsk(ask));
   }
+
+  // 后台执行的状态也跟着重建。它不在 turn_messages 里,所以上面那一步
+  // 重建不出来 —— 少了这一句,刷新之后"有个 job 还在跑"就看不见了。
+  renderJobs(data.jobs);
   return true;
 }
 
@@ -1539,7 +1654,7 @@ function renderToolCall(name, input) {
 }
 
 function renderTurn(t) {
-  const box = turnBox(t.id, t.turn_no);
+  const box = turnBox(t.id, t.turn_no, t.source);
   setState(t.id, t.status, t.error_message);
 
   // 一条 assistant 消息里可以有好几个 tool_use,结果散在后面那条消息里。
@@ -1832,8 +1947,15 @@ async function catchUp() {
     return null;
   }
   for (const ev of data.events) renderIfNew(ev);
+  renderJobs(data.jobs);
+  // 输入框**只看 running** —— 它回答的是"这个会话正攥着锁跑一轮吗"。
+  // 后台 job 待交付时用户完全可以发新消息,把它算进去等于把输入框锁上,
+  // 正好跟"后台执行不占会话锁"那条打架(见 docs 的 §6)。
   setComposer(!data.running);
-  return data.running;
+  // 而**要不要接着轮询**是另一个问题,判据是"还有没有后台 job 要盯"。
+  // 只看 running 的话,一轮跑完、后台 job 还在跑,页面就地停下 —— 那条完成
+  // 通知和紧接着的自动续跑轮,页面上永远看不见。
+  return data.running || data.jobs_pending;
 }
 
 // 轮询的一拍,也是"收尾那一拍"。**两条路必须走同一个函数** —— 这是这次修的东西:
@@ -1938,6 +2060,11 @@ function blankScreen() {
   TURNS = new Map();            // 屏幕清空了,那些盒子的引用也跟着作废
   SINK = null;
   screenBuilt = false;
+  // 后台格子是**当前会话**的,换会话必须一起清:留着的话,上一个会话
+  // 那个还没跑完的 job 会挂在新会话上,而它跟新会话毫无关系。
+  JOBS.clear();
+  jobsPanel.replaceChildren();
+  jobsPanel.hidden = true;
 }
 
 async function switchTo(sid) {

@@ -62,3 +62,28 @@ usage.USAGE_PATH = _SCRATCH / "usage.jsonl"
 def _cleanup_scratch():
 	yield
 	shutil.rmtree(_SCRATCH, ignore_errors=True)
+
+
+@pytest.fixture(autouse=True)
+def _quiesce_background_scheduler():
+	"""每条用例结束后,等后台调度线程收工。
+
+	maybe_continue 起的是一条 daemon 线程(它自己立刻返回,真正的活在那边
+	跑)。用例一结束 monkeypatch 就把 server.STORE 还原成了 None,而那条
+	线程可能还没走到第一句数据库调用 —— 于是它带着一个作废的库往下跑,在
+	自己的线程栈里抛一句**没人看见**的 AttributeError。
+
+	它只会以 pytest 的 thread-exception warning 形式冒出来,很容易被当成
+	噪声忽略 —— 而那种"测试里飘着一条没人看的异常"正是最该在它还小的时候
+	掐掉的东西。
+	"""
+	yield
+	import time
+
+	import server
+	deadline = time.time() + 20
+	while time.time() < deadline:
+		with server._SCHED_LOCK:
+			if not server._SCHEDULED:
+				return
+		time.sleep(0.05)

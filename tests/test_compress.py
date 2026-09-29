@@ -381,7 +381,7 @@ def test_号是落库拿到的行号(monkeypatch):
 	"""
 	ids = iter([41, 42])
 
-	def record(kind, role, content, tool_use_id=None):
+	def record(kind, role, content, tool_use_id=None, claim_job=None):
 		return next(ids) if kind == "tool_result" else None
 
 	first, second = _bodies(_run(monkeypatch, record, calls=1))
@@ -398,7 +398,7 @@ def test_拿不到行号就不发号(monkeypatch):
 	不填一个编出来的号:那种号查不回来,而模型看到号就会去点它 —— 换来的是
 	"这个号不在上下文里",看起来像它自己点错了。
 	"""
-	history = _run(monkeypatch, lambda kind, role, content, tool_use_id=None: None, calls=1)
+	history = _run(monkeypatch, lambda kind, role, content, tool_use_id=None, claim_job=None: None, calls=1)
 	assert all("<message-id" not in body for body in _bodies(history)), _bodies(history)
 
 
@@ -508,7 +508,7 @@ def test_整条路串起来(monkeypatch, tmp_path):
 	history = [{"role": "user", "content": "问题"}]
 	original = "那个长东西" * 20
 
-	def record(kind, role, content, tool_use_id=None):
+	def record(kind, role, content, tool_use_id=None, claim_job=None):
 		if kind != "tool_result":
 			return None
 		row = store.append_turn_message(turn["id"], len(numbers) + 2, kind, role,
@@ -602,8 +602,6 @@ class _Handler:
 	"""只够把 _run_turn 跑起来:不建 socket、不走路由。"""
 
 	_run_turn = server.Handler._run_turn
-	_drive = server.Handler._drive
-	_checkpoint = server.Handler._checkpoint
 
 	def __init__(self):
 		self.wrote = b""

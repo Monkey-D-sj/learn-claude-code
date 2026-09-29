@@ -3,7 +3,7 @@
 本机自用,一个进程一个文件。这个模块只干"存取",不懂 agent —— 谁在
 什么时候调它,是 server.py 的事。
 
-现在有七个活着的对象:
+现在有八个活着的对象:
 
 	sessions          会话本身,外加会话开始那一刻的记忆快照,以及那个 task 开关
 	turns             一轮执行,状态机只有 running -> completed / failed
@@ -12,6 +12,7 @@
 	events            页面重放的流水账,只追加
 	tasks             跨会话的工作项,不绑任何会话
 	task_dependencies 任务之间的先后关系,有向无环
+	background_jobs   一次后台工具执行的元数据与结果索引,不跨进程重启
 
 三条贯穿全文件的规矩,每条都有理由:
 
@@ -79,7 +80,7 @@ from pathlib import Path
 DB_PATH = Path(os.environ.get("AGENT_DB_PATH")
                or (Path(__file__).resolve().parent / "sessions.db"))
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # 每条一个语句,不写成一个大字符串走 executescript。
 # 理由:executescript 在遇到已挂起的事务时会先隐式 COMMIT —— 那会把
@@ -333,10 +334,77 @@ _MIGRATION_5 = (
 	" DEFAULT 0 CHECK (task_enabled IN (0, 1))",
 )
 
+# v6 是后台执行那一版:一张 job 表,外加 turns 上的来源列。
+#
+# **job 只跨 turn,不跨进程重启。** 进程退出时正在跑的 job 和还没交付的结果
+# 一起丢弃(见 docs/background-jobs-design.md §1),所以这张表回答的是"原 turn
+# 结束之后,这份完成结果还要不要自动触发该会话续跑" —— 启动时整张表清空
+# (clear_background_jobs),既没有"重启后辨认被截断的执行"这一步,也没有通知
+# 状态的崩溃重试去重。
+#
+# **session_id 挂 CASCADE,跟 v5 的 task 表正相反。** 那边不挂是因为 task 是
+# 跨会话的工作项,删一个来源会话不该带走它;这里 job 本来就是"某个会话的某一次
+# 执行",会话没了它就没有归宿。挂 CASCADE 之后"删会话时正在跑的 job 不许把结果
+# 写回一个不存在的会话"是白拿的:worker 收尾那句是条件 UPDATE,行没了就匹配 0 行,
+# 它再往下走也没有会话可写。代价是结果文件不会跟着行一起没,所以
+# server._post_delete 要在删之前把那些文件删掉(它拿得到行的 id)。
+#
+# source_turn_id 不挂外键:它只是溯源和页面归属,而 turn 行有它自己的生命周期
+# (reap 会改状态,将来也可能被清理),让 job 被它牵着没有必要 —— 这个字段为空的
+# job 照样是合法的(会话级发起,没有具体轮次)。
+#
+# **没有 interrupted 终态。** 它原来唯一的来源是"启动时核对被截断的执行",而那条
+# 路在这一版被砍掉了:被进程退出截断的执行随进程一起消失,不留一行需要辨认的
+# 中间状态。于是状态机只有 queued → running → completed | failed。
+#
+# name 用 tool 而不是 name:这两个字在库里读起来是一回事,但表里已经有 turns /
+# tasks 两张带 name 语义的东西,tool 说得更死(它就是工具名 bash / agent)。
+#
+# summary 和 result_path 是一对:通知和页面只吃 summary(必要摘要),要完整结果
+# 就按 result_path 去读那个文件。**正文不进库** —— Bash 的输出可以到 40 万字符,
+# 存进 SQLite 等于让每一次读 job 状态的查询都驮着它。
+_MIGRATION_6 = (
+	"""
+	CREATE TABLE background_jobs (
+		id             TEXT PRIMARY KEY,
+		session_id     TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+		source_turn_id TEXT,
+		tool           TEXT NOT NULL,
+		status         TEXT NOT NULL CHECK (status IN (
+			'queued', 'running', 'completed', 'failed')),
+		created_at     REAL NOT NULL,
+		started_at     REAL,
+		finished_at    REAL,
+		error          TEXT,
+		summary        TEXT NOT NULL DEFAULT '',
+		result_path    TEXT,
+		notice         TEXT NOT NULL DEFAULT 'pending' CHECK (notice IN (
+			'pending', 'delivered')),
+		CHECK ((status IN ('queued', 'running') AND finished_at IS NULL)
+		    OR (status IN ('completed', 'failed') AND finished_at IS NOT NULL))
+	)
+	""",
+	# 页面和调度器都按 (会话, 还没交付) 找行 —— 两个查询共用这一条。
+	"CREATE INDEX background_jobs_session ON background_jobs(session_id, notice)",
+
+	# turns 的来源列。**加列而不是加 kind。**
+	#
+	# turn_messages.kind 的 CHECK 只有那四种,加第五种要重建表;而 v4 重建
+	# turns 的坑已经踩过一次(开着外键 DROP TABLE 会顺着 CASCADE 把所有原始
+	# 消息删光,还不报错),为一个标记付那个代价不值。
+	#
+	# 默认 'user':所有已经存在的轮次都是用户发起的。CHECK 是给新行兜底的 ——
+	# 来源一共就这两种,写第三个值的代码是 bug,该当场报错而不是静默存下。
+	#
+	# SQLite 允许 ADD COLUMN 带 CHECK(约束只对之后写入的行生效),已实测。
+	"ALTER TABLE turns ADD COLUMN source TEXT NOT NULL DEFAULT 'user'"
+	" CHECK (source IN ('user', 'background'))",
+)
+
 # 下标 = 目标版本 - 1。加一次改动就往后接一个,并把 SCHEMA_VERSION 加一。
 # 每一项是一串 SQL 字符串,逐条执行。
 MIGRATIONS = (_MIGRATION_1, _MIGRATION_2, _MIGRATION_3, _MIGRATION_4,
-              _MIGRATION_5)
+              _MIGRATION_5, _MIGRATION_6)
 
 # 必须在**关掉外键的连接**里跑的那几条迁移。目前只有 v4,理由见它上面
 # 那段(turns 重建:开着外键 DROP TABLE 会顺着 CASCADE 删光原始消息)。
@@ -391,6 +459,34 @@ def _tool_use_id_of(content_json: str) -> str | None:
 		value = blocks[0].get("tool_use_id")
 		return value if isinstance(value, str) else None
 	return None
+
+class _ClaimLost(RuntimeError):
+	"""这一批 job 里至少有一条已经被别的交付路径认领过了。
+
+	**内部信号,不出这个模块。** 见到它就等于"两条交付路径撞上了",而那件事的
+	处置是固定的一句:整个事务回滚、调用方什么都不做。让调用方去认一个异常类型
+	只会把这条规矩分散到几个地方,而漏掉一处的表现是"同一份结果被送进上下文
+	两遍" —— 模型会看到两条一模一样的通知,然后自己去猜哪条是真的。
+
+	它不是错误,所以不叫 Error 之外的东西,也不带给人看的话:没有任何用户
+	动作能改变它。
+	"""
+
+
+def _job_row(row) -> dict:
+	"""background_jobs 那一行的列序,只写一遍。
+
+	三个读方法(get_job / jobs_for / deliverable_jobs)共用同一串 SELECT 列的
+	顺序 —— 抄三遍的话,将来加一列时改了两处、漏了一处,而漏掉的那处不报错,
+	只是那个字段永远是 None。
+	"""
+	return {
+		"id": row[0], "session_id": row[1], "source_turn_id": row[2],
+		"tool": row[3], "status": row[4], "created_at": row[5],
+		"started_at": row[6], "finished_at": row[7], "error": row[8],
+		"summary": row[9], "result_path": row[10], "notice": row[11],
+	}
+
 
 class PersistError(RuntimeError):
 	"""一条**恢复关键**的记录没写进库。
@@ -456,6 +552,37 @@ class TaskError(RuntimeError):
 INTERRUPT_PROCESS_RESTART = "process_restart"
 INTERRUPT_PERSIST_FAILED = "persist_failed"
 INTERRUPT_CHECKPOINT_FAILED = "checkpoint_failed"
+
+
+# 后台 job 的状态。跟 turns 那三个一字面值("running"/"completed"/"failed")
+# 重合,但**是另一套** —— 一个是一次工具执行,一个是模型的一轮对话,两者的
+# 状态机不同(job 多一个 queued,少一个 interrupted),生命周期也不同。
+# 共用一个常量只会让"这个 running 说的是哪一个"变成要读上下文才知道的事。
+#
+# queued 只在"容量满时先排队"那种实现里用得上;本版选择"容量满直接拒绝启动"
+# (见 jobs.py),所以正常路径上只会看到后三个 —— 表里留着它是给那个选择留的
+# 位置,而不是给了一个没实现的承诺。
+JOB_STATES = ("queued", "running", "completed", "failed")
+JOB_TERMINAL_STATES = ("completed", "failed")
+
+# 通知状态。pending = 这份结果还没进过任何上下文,delivered = 已经交付过。
+#
+# 它跟 status 是两个正交的轴:status 说"执行得怎么样",notice 说"结果送到没有"。
+# 合成一个字段的话,"跑完了但还没送到"这种情况就没有地方站 —— 而那正是
+# 后台执行里最常见的一瞬间。
+NOTICE_PENDING = "pending"
+NOTICE_DELIVERED = "delivered"
+
+# "这个会话还有后台 job 要盯"的判据。**只写一份**,因为它出现在三处(会话列表、
+# 轮次接口、调度器挑待交付的),而漏掉一处的表现是"后台执行的结果没人接" ——
+# 不报错,只是那个 job 永远停在待交付。
+#
+# 它问的是两件事的并集:还没跑完的(queued/running),和跑完了但结果还没进过
+# 上下文的(pending)。少任何一半都不对 —— 只算前者,页面会在 job 完成那一刻
+# 停止轮询,而那条完成通知正好是它该看见的东西。
+#
+# 拼进 SQL 时要求那张表别名叫 j。
+JOBS_PENDING_SQL = "(j.status IN ('queued', 'running') OR j.notice = 'pending')"
 
 
 class SessionStore:
@@ -617,13 +744,23 @@ class SessionStore:
 		task_enabled 跟着一起给:侧栏那个开关要画成"开"还是"关",只能从
 		这儿知道。页面不从聊天事件推它 —— 推出来的和库里那份迟早不一样,
 		而用户不会知道该信哪个。
+
+		jobs_pending 同理,而且它就是**页面决定还要不要接着轮询**的那一个
+		字段(见 ui/index.html 的 pollTick)。它必须跟 running 分开给:
+		running 是"这个会话正攥着锁跑一轮",页面拿到它是去锁输入框的;
+		而后台 job 待交付时用户完全可以发新消息(见 docs 的 §6)。塞进
+		running 的后果是输入框被锁上,正好跟那条打架。
 		"""
 		with self._lock:
 			rows = self._conn.execute(
-				"SELECT id, title, updated_at, task_enabled FROM sessions"
+				"SELECT id, title, updated_at, task_enabled,"
+				f" EXISTS(SELECT 1 FROM background_jobs j"
+				f"        WHERE j.session_id = sessions.id AND"
+				f" {JOBS_PENDING_SQL}) AS jobs_pending"
+				" FROM sessions"
 				" ORDER BY updated_at DESC, rowid DESC LIMIT 50").fetchall()
 		return [{"id": row[0], "title": row[1], "updated_at": row[2],
-		         "task_enabled": bool(row[3])}
+		         "task_enabled": bool(row[3]), "jobs_pending": bool(row[4])}
 		        for row in rows]
 
 	def task_enabled(self, sid: str) -> bool:
@@ -698,7 +835,7 @@ class SessionStore:
 			turns = conn.execute(
 				"SELECT id, turn_no, status, created_at, updated_at,"
 				" finished_at, error_message, interrupt_reason,"
-				" model_rounds_started FROM turns"
+				" model_rounds_started, source FROM turns"
 				" WHERE session_id = ? ORDER BY turn_no", (sid,)).fetchall()
 			messages = conn.execute(
 				"SELECT m.turn_id, m.message_no, m.kind, m.role,"
@@ -722,7 +859,7 @@ class SessionStore:
 				"id": row[0], "turn_no": row[1], "status": row[2],
 				"created_at": row[3], "updated_at": row[4], "finished_at": row[5],
 				"error_message": row[6], "interrupt_reason": row[7],
-				"model_rounds_started": row[8],
+				"model_rounds_started": row[8], "source": row[9],
 				"messages": by_turn.get(row[0], []),
 			} for row in turns],
 			"cursor": cursor,
@@ -790,6 +927,253 @@ class SessionStore:
 				" title = CASE WHEN title = '' THEN ? ELSE title END"
 				" WHERE id = ?", (now, title, sid))
 		return {"id": turn_id, "turn_no": turn_no, "status": "running"}
+
+	def begin_background_turn(self, sid: str, text: str, blocks: list,
+	                          job_ids: list[str]) -> dict | None:
+		"""开一轮**后台结果续跑**,连带把那条完成通知写进去、把 job 认领掉。
+
+		**它是 begin_turn 的兄弟,不是它的一个参数。** 三处不一样,每一处都
+		是必须的:
+
+		  1. 第一条消息的 kind 是 'control',不是 'user_input'。页面见到
+		     user_input 就按"你说的"原样画出来,而这条是服务端事件,不是用户
+		     说过的话(ui/index.html 的 renderMessage 里那条注释说的正是这件事)。
+		  2. turns.source 写 'background'。页面按它给整轮标来源 —— 否则用户
+		     会看到一轮凭空出现、自己没有发过的对话。
+		  3. **不碰 sessions.title。** begin_turn 会拿 query 去补空标题,而这条
+		     通知是一段机器写的文本;写成标题的话,侧栏上会出现一个叫
+		     "[background_results …]" 的会话。
+
+		四件事一个事务:认领、建轮、写第一条消息、把会话排到最前。**认领必须
+		和它们同一笔提交** —— 分开写的话,中间那个窗口里标志已经成了 delivered
+		而这条通知还没进上下文,进程一崩这份结果就再也不会自动注入了(见 §3)。
+
+		job_ids 里有一条已经被别的路径交付过时**整笔回滚并返回 None**:那不是
+		错误,是两条交付路径撞上了,撞上时的正确处置是"让先到的那个说了算"。
+
+		返回 None 之外的场合给的是 {id, turn_no, status, messages} —— messages
+		是调用方要接到模型历史尾巴上的那一条。
+		"""
+		now = time.time()
+		turn_id = uuid.uuid4().hex
+		message = {"role": "user", "content": blocks}
+		try:
+			with self._tx() as conn:
+				self._claim(conn, job_ids)
+				turn_no = conn.execute(
+					"SELECT COALESCE(MAX(turn_no), 0) + 1 FROM turns"
+					" WHERE session_id = ?", (sid,)).fetchone()[0]
+				conn.execute(
+					"INSERT INTO turns (id, session_id, turn_no, status,"
+					" created_at, updated_at, finished_at, error_message, source)"
+					" VALUES (?, ?, ?, 'running', ?, ?, NULL, NULL, 'background')",
+					(turn_id, sid, turn_no, now, now))
+				# message_no=1 是那条通知。后面由 record 回调从 2 接着发。
+				conn.execute(
+					"INSERT INTO turn_messages (turn_id, message_no, kind, role,"
+					" content_json, created_at) VALUES (?, 1, 'control', 'user',"
+					" ?, ?)",
+					(turn_id, json.dumps(blocks, ensure_ascii=False), now))
+				# updated_at 跟着动(这个会话确实刚发生了事,该排到前面),
+				# 但**标题一个字不碰** —— 理由见上面第 3 条。
+				conn.execute("UPDATE sessions SET updated_at = ? WHERE id = ?",
+				             (now, sid))
+		except _ClaimLost:
+			return None
+		return {"id": turn_id, "turn_no": turn_no, "status": "running",
+		        "message": message}
+
+	@staticmethod
+	def _claim(conn, job_ids: list[str]) -> None:
+		"""把这一批 job 的通知状态从 pending 翻成 delivered。锁内调用。
+
+		**判据在 WHERE 里,不是先 SELECT 再决定。** 两条交付路径(agent 循环
+		的检查点、background_result 的主动读取)都会把同一份结果送进上下文,
+		而"先查一眼 notice 是不是 pending、是就注入"关不掉中间的窗口:判定和
+		写入之间隔着一次模型调用,而模型调用期间不持有事务是这条流水线的
+		硬规矩。写成条件 UPDATE 就没有那个窗口 —— 数据库来回答"谁先到"。
+
+		rowcount 对不上就是有人先交付过(或者行已经跟着会话没了),抛出去让
+		整个事务回滚:调用方那一笔里除了认领还有"结果进 messages、写原始
+		消息、存快照",只做一半等于留下一份自相矛盾的状态。
+		"""
+		changed = conn.execute(
+			"UPDATE background_jobs SET notice = ?"
+			f" WHERE id IN ({','.join('?' * len(job_ids))}) AND notice = ?",
+			(NOTICE_DELIVERED, *job_ids, NOTICE_PENDING)).rowcount
+		if changed != len(job_ids):
+			raise _ClaimLost(f"{len(job_ids) - changed} 条 job 已经被交付过")
+
+	def deliver_jobs(self, sid: str, turn_id: str, message_no: int, blocks: list,
+	                 messages: list, job_ids: list[str],
+	                 runtime: dict) -> bool:
+		"""在**当前这一轮**里注入一份后台完成通知。返回 False 表示没注入。
+
+		跟 begin_background_turn 是同一件事的两条路:那条是"原 turn 已经结束,
+		另开一轮",这条是"原 turn 还活着,就在下一个检查点插进去"。两者的
+		原子性要求一模一样 —— 认领、写原始消息、存快照三件事**一笔提交**。
+
+		**先写原始消息(那条 kind='control'),再存快照**:快照里的 messages
+		已经包含这条了,所以水位必须盖过它,否则这份快照自己就带着一条
+		"水位之后的记录",而恢复判定会据此把它判成不可恢复。
+
+		rowcount 对不上就整笔回滚、返回 False,调用方什么都不做 —— 那说明另一条
+		路径已经交付过,而"让先到的那个说了算"正是要的结果。调用方拿到 False
+		要把已经拼进内存的那条消息撤回,所以它必须**先算好、后追加**。
+		"""
+		now = time.time()
+		text = json.dumps(messages, ensure_ascii=False, default=_block_json)
+		payload = json.dumps(runtime, ensure_ascii=False)
+		try:
+			with self._tx() as conn:
+				self._claim(conn, job_ids)
+				conn.execute(
+					"INSERT INTO turn_messages (turn_id, message_no, kind, role,"
+					" content_json, created_at) VALUES (?, ?, 'control', 'user',"
+					" ?, ?)",
+					(turn_id, message_no, json.dumps(blocks, ensure_ascii=False),
+					 now))
+				self._put_context(conn, sid, text, now, False, turn_id=turn_id,
+				                  covered=message_no, runtime=payload)
+		except _ClaimLost:
+			return False
+		return True
+
+	def begin_job(self, job_id: str, sid: str, tool: str,
+	              source_turn_id: str | None) -> None:
+		"""登一条 job,状态 queued。**严格写** —— 写不进去要抛。
+
+		调用方(工具 handler)拿到这一行的前提是"后台执行已经登记",而它接下来
+		要把 job_id 交给模型。写不进去还往下走的话,模型手里就有一个**查不回来
+		的 job_id**,而且它会照着那个号去调 background_result。
+
+		先 queued 再 running 两步,是为了让"启动失败"和"跑起来了"在库里分得开
+		(见 jobs.py:权限、容量、进程创建都可能在真正开跑之前失败)。
+		"""
+		with self._tx() as conn:
+			conn.execute(
+				"INSERT INTO background_jobs (id, session_id, source_turn_id,"
+				" tool, status, created_at, started_at, finished_at, error,"
+				" summary, result_path, notice)"
+				" VALUES (?, ?, ?, ?, 'queued', ?, NULL, NULL, NULL, '',"
+				" NULL, ?)",
+				(job_id, sid, source_turn_id, tool, time.time(), NOTICE_PENDING))
+
+	def start_job(self, job_id: str) -> bool:
+		"""queued → running。返回 False 表示这一行已经不在 queued 了。
+
+		条件写在 WHERE 里:worker 真正开跑之前,行可能已经被删了(会话没了,
+		或者进程正准备退出)。匹配 0 行时调用方**必须放弃执行** —— 那个 job
+		已经没有归宿,跑完也没有地方交结果。
+		"""
+		with self._tx() as conn:
+			changed = conn.execute(
+				"UPDATE background_jobs SET status = 'running', started_at = ?"
+				" WHERE id = ? AND status = 'queued'",
+				(time.time(), job_id)).rowcount
+			return bool(changed)
+
+	def finish_job(self, job_id: str, status: str, error: str | None,
+	               summary: str, result_path: str | None) -> bool:
+		"""记终态。返回 False 表示那一行已经不在了(会话被删,或者进程重启清理过)。
+
+		**返回 False 不是错误,而且调用方必须就此打住** —— 具体说:不能再拿这个
+		会话去开续跑轮。会话已经不在了,开出来的是一个外键错误,而用户看到的
+		会是一条莫名其妙的报错。
+
+		status 只收终态两个值:中间态不经过这儿(queued→running 是 start_job)。
+		"""
+		if status not in JOB_TERMINAL_STATES:
+			raise ValueError(f"不是终态:{status}")
+		with self._tx() as conn:
+			changed = conn.execute(
+				"UPDATE background_jobs SET status = ?, finished_at = ?,"
+				" error = ?, summary = ?, result_path = ? WHERE id = ?",
+				(status, time.time(), error, summary, result_path,
+				 job_id)).rowcount
+			return bool(changed)
+
+	def get_job(self, job_id: str) -> dict | None:
+		"""按 id 读一条。不在(或者已经被清理)返回 None。"""
+		with self._lock:
+			row = self._conn.execute(
+				"SELECT id, session_id, source_turn_id, tool, status, created_at,"
+				" started_at, finished_at, error, summary, result_path, notice"
+				" FROM background_jobs WHERE id = ?", (job_id,)).fetchone()
+		return _job_row(row) if row else None
+
+	def jobs_for(self, sid: str) -> list[dict]:
+		"""这个会话的全部 job,新的在后。页面重建展示走这条。
+
+		不筛状态:页面要画的正是"这个 job 现在怎么样了",而筛掉终态等于让
+		刷新之后那些已经完成的 job 从屏幕上消失。
+		"""
+		with self._lock:
+			rows = self._conn.execute(
+				"SELECT id, session_id, source_turn_id, tool, status, created_at,"
+				" started_at, finished_at, error, summary, result_path, notice"
+				" FROM background_jobs WHERE session_id = ?"
+				" ORDER BY created_at, id", (sid,)).fetchall()
+		return [_job_row(row) for row in rows]
+
+	def deliverable_jobs(self, sid: str) -> list[dict]:
+		"""这个会话里"跑完了、但结果还没进过上下文"那些 job。
+
+		调度器每次醒来先问它一句:空就是"没事可做",什么都不用开。
+		"""
+		with self._lock:
+			rows = self._conn.execute(
+				"SELECT id, session_id, source_turn_id, tool, status, created_at,"
+				" started_at, finished_at, error, summary, result_path, notice"
+				" FROM background_jobs WHERE session_id = ?"
+				" AND status IN ('completed', 'failed') AND notice = ?"
+				" ORDER BY finished_at, id", (sid, NOTICE_PENDING)).fetchall()
+		return [_job_row(row) for row in rows]
+
+	def jobs_pending(self, sid: str) -> bool:
+		"""这个会话还有没有后台 job 要盯(没跑完的,或者跑完了没交付的)。
+
+		判据跟会话列表那个 jobs_pending 共用一条 SQL(见 JOBS_PENDING_SQL):
+		两处各写一份的话,"页面在轮询"和"调度器认为还有事"迟早会分家,
+		而分家的表现是结果没人接、页面也不再刷新 —— 两边都很安静。
+		"""
+		with self._lock:
+			row = self._conn.execute(
+				"SELECT 1 FROM background_jobs j WHERE j.session_id = ?"
+				f" AND {JOBS_PENDING_SQL} LIMIT 1", (sid,)).fetchone()
+		return row is not None
+
+	def clear_background_jobs(self) -> list[str]:
+		"""清空整张 job 表,返回那些结果文件的路径(交给调用方去删)。
+
+		**启动时调,语义是"清理",不是"核对"。** 上一版设计里有过一条"重启后
+		辨认哪些执行被截断了"的路,现在砍掉了:重启之后表里每一行都是上个
+		进程的遗物,既没有活的 worker,也没有打算补交的结果 —— 不用挑着删,
+		"删干净"就是这件事的全部含义。
+
+		返回路径而不是自己删,是因为这个模块只干存取(见文件头):文件在
+		WORKDIR 里,而 WORKDIR 是运行期的事。
+		"""
+		with self._tx() as conn:
+			paths = [row[0] for row in conn.execute(
+				"SELECT result_path FROM background_jobs"
+				" WHERE result_path IS NOT NULL").fetchall()]
+			conn.execute("DELETE FROM background_jobs")
+		return paths
+
+	def job_result_paths(self, sid: str) -> list[str]:
+		"""这个会话所有 job 的结果文件路径。删会话之前拿它去删文件。
+
+		**必须在 delete_session 之前调。** 表上挂了 CASCADE,会话一删行就跟着
+		没了 —— 那时候再想找这些路径已经没有地方查了,而文件会永远留在
+		WORKDIR 里。
+		"""
+		with self._lock:
+			rows = self._conn.execute(
+				"SELECT result_path FROM background_jobs"
+				" WHERE session_id = ? AND result_path IS NOT NULL",
+				(sid,)).fetchall()
+		return [row[0] for row in rows]
 
 	def save_context(self, sid: str, messages: list, compacted: bool = False) -> None:
 		"""中途存一个上下文检查点。压缩之后存,是给"这一轮跑到一半进程没了"
@@ -1291,7 +1675,8 @@ class SessionStore:
 
 	def append_turn_message(self, turn_id: str, message_no: int, kind: str,
 	                        role: str, content, strict: bool = False,
-	                        close_exec: str | None = None) -> int | None:
+	                        close_exec: str | None = None,
+	                        claim_job: str | None = None) -> int | None:
 		"""记一条原始消息,返回它的行号(写不进去给 None)。
 
 		message_no 由调用方发(它是内存里数的),所以失败会留下一个空号。
@@ -1320,6 +1705,16 @@ class SessionStore:
 		库里的状态是"开始了、没结果",而结果其实已经落库了;恢复判定会为此
 		把这轮判进人工核对(结果未知),明明它有结果。宁可一起写,让状态只有
 		两种:没开始,或者开始了并且有结果。
+
+		claim_job 给的是 job_id:**模型主动用 background_result 读走一份结果的
+		那条路,认领就发生在这一刻**。位置是这一条的要点 —— 不是工具 handler
+		返回的时候。在 handler 里顺手标掉的话,模型拿到结果、而这条 tool_result
+		还没进原始消息那一轮就崩了或被中断,标志已经成了 delivered,这份结果
+		再也不会自动注入:正是要防的静默丢失。反过来,标位落在这儿刚好卡在
+		同一个 turn 的下一个检查点之前,模型看不到重复的一份。
+
+		认领**允许匹配 0 行**(另一条路径已经交付过):模型手上已经有这份结果
+		了,这里的正确做法是照样把 tool_result 记下来,只是标志不再动。
 		"""
 		try:
 			text = json.dumps(content, ensure_ascii=False, default=_block_json)
@@ -1333,6 +1728,11 @@ class SessionStore:
 						"UPDATE tool_execs SET finished_at = ?, message_id = ?"
 						" WHERE tool_use_id = ? AND turn_id = ?",
 						(time.time(), cursor.lastrowid, close_exec, turn_id))
+				if claim_job is not None:
+					conn.execute(
+						"UPDATE background_jobs SET notice = ? WHERE id = ?"
+						" AND notice = ?",
+						(NOTICE_DELIVERED, claim_job, NOTICE_PENDING))
 				return cursor.lastrowid
 		except Exception as e:
 			if strict:

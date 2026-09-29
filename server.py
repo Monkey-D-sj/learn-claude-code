@@ -58,12 +58,12 @@ import os
 import sys
 import threading
 import uuid
-from itertools import count
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 import dblock
+import jobs
 from agent import TurnOutcome, agent_loop
 from app import MODEL, build_system, make_compactor
 from config import MAX_ROUNDS, MEMORY_PATH, USER_MEMORY_PATH, WORKDIR
@@ -303,19 +303,37 @@ def make_recorder(turn_id: str, start_no: int = 1):
 	没有尾部"。所以它必须严格跟着成功的写入走 —— 写失败了要抛,不能把它
 	往前推。
 	"""
-	next_no = count(start_no + 1)
-
 	class Recorder:
 		def __init__(self):
 			self.last_no = start_no
+			# 号从一个**普通计数器**发,不再用 itertools.count。差别只有一处,
+			# 但那一处是必须的:后台结果注入会**在别处**写掉一个号,而那个号
+			# 也要从这一串里排掉(见 reserve)。
+			self._next_no = start_no + 1
 
 		def __call__(self, kind: str, role: str, content,
-		             tool_use_id: str | None = None) -> int:
-			no = next(next_no)
+		             tool_use_id: str | None = None,
+		             claim_job: str | None = None) -> int:
+			no = self._next_no
+			self._next_no += 1
 			row = STORE.append_turn_message(turn_id, no, kind, role, content,
-			                                strict=True, close_exec=tool_use_id)
+			                                strict=True, close_exec=tool_use_id,
+			                                claim_job=claim_job)
 			self.last_no = no
 			return row
+
+		def reserve(self, no: int) -> None:
+			"""把一个号占掉 —— 它已经由别处(后台结果的原子注入)写进库里了。
+
+			**不占的话下一条 record 会撞 UNIQUE(turn_id, message_no)**,而更坏的
+			那一种失败是"号重复之后,模型手里那个 m 号指向了另一条消息",不报错。
+			号本来就该连续,而注入那条也是这一轮的消息。
+
+			watermark(last_no)跟着抬到 no:它就是"已经落库的最大 message_no",
+			而那一行确实已经落库了(同一个事务里)。
+			"""
+			self._next_no = max(self._next_no, no + 1)
+			self.last_no = max(self.last_no, no)
 
 	return Recorder()
 
@@ -376,7 +394,7 @@ UNSAVED: dict[str, dict] = {}
 
 
 def _ask_and_wait(emit, sid: str, turn_id: str, mode: str,
-                  **fields) -> tuple[dict | None, str]:
+                  live: bool = True, **fields) -> tuple[dict | None, str]:
 	"""把一条 ask 挂到流上,然后挂住等回答。返回 (槽, 没答上的原因)。
 
 	槽是 None 就表示没人答上,第二项是给人看的原因(写进 record);答上了
@@ -387,15 +405,25 @@ def _ask_and_wait(emit, sid: str, turn_id: str, mode: str,
 	这里拿到的是**不安静**的 emit,不能换成 quiet():emit_quietly 的返回值
 	就是"还有人能回答吗",安静版把失败吞掉了,于是页面关掉之后这儿会干等
 	满 300 秒才走。
+
+	**live 是"有没有人正看着这条流",而且是两回事里的一件。** 内部续跑那一轮
+	没有 wfile(它是服务端自己开的,不挂在任何 HTTP 响应上),喂给它的 emit 写
+	得进去、没有异常,可**没有人在看**。照搬上面那句"写不出去 = 没人能回答"的
+	话,续跑一遇到权限确认就会拿到一个空槽、当场按拒绝处理 —— 而正确答案是
+	"没人直播,但页面会从轮次接口里把这个挂起的问题读出来"(见 _get_turns 的
+	pending,它就是为这件事存在的)。所以 live=False 时**跳过那个判断,照旧等**:
+	超时规则不变(见 ASK_TIMEOUT),人不在就还是没答上。
 	"""
 	rid = uuid.uuid4().hex
 	slot = {"event": threading.Event(), "mode": mode, "session": sid,
 	        "turn_id": turn_id, **fields}
 	PENDING[rid] = slot
 	try:
-		if not emit_quietly(emit, {"kind": "ask", "id": rid, "mode": mode,
-		                           **fields}):
+		event = {"kind": "ask", "id": rid, "mode": mode, **fields}
+		if live and not emit_quietly(emit, event):
 			return None, "流已经断了,没人能回答"
+		if not live:
+			emit_quietly(emit, event)
 		if not slot["event"].wait(ASK_TIMEOUT):
 			emit_quietly(emit, {"kind": "note", "source": "ask",
 			                    "text": f"no answer in {ASK_TIMEOUT:.0f}s"})
@@ -406,7 +434,7 @@ def _ask_and_wait(emit, sid: str, turn_id: str, mode: str,
 		PENDING.pop(rid, None)
 
 
-def make_ask(emit, sid: str, turn_id: str, record):
+def make_ask(emit, sid: str, turn_id: str, record, live: bool = True):
 	"""造一个把问题推给浏览器、然后挂起等回答的**权限确认器**。
 
 	和 emit 一样按请求建:它绑在那条响应流上,而流是每请求一条。这也正好
@@ -422,9 +450,11 @@ def make_ask(emit, sid: str, turn_id: str, record):
 	模型提问那个(make_ask_text)不记 —— 问题在模型那条 tool_use 里、回答在
 	紧随其后的 tool_result 里,agent_loop 两头都记了,再记一条是同一个决定
 	在库里存两遍。
+
+	live 见 _ask_and_wait:内部续跑那条路传 False。
 	"""
 	def ask(question: str) -> bool:
-		slot, why = _ask_and_wait(emit, sid, turn_id, "confirm",
+		slot, why = _ask_and_wait(emit, sid, turn_id, "confirm", live=live,
 		                          question=question)
 		if slot is None:
 			allowed, verdict = False, f"{why},按拒绝处理"
@@ -436,7 +466,7 @@ def make_ask(emit, sid: str, turn_id: str, record):
 	return ask
 
 
-def make_ask_text(emit, sid: str, turn_id: str):
+def make_ask_text(emit, sid: str, turn_id: str, live: bool = True):
 	"""造一个模型提问用的提问器:推到浏览器,挂起等一段文字。
 
 	返回 None = 没人答上(超时 / 页面关了),**不是空字符串** —— 空回答是
@@ -446,7 +476,7 @@ def make_ask_text(emit, sid: str, turn_id: str):
 	跟 make_ask 一样按请求建,理由也一样:它绑在那条响应流上。
 	"""
 	def ask_text(question: str, options: list[str]) -> str | None:
-		slot, _ = _ask_and_wait(emit, sid, turn_id, "question",
+		slot, _ = _ask_and_wait(emit, sid, turn_id, "question", live=live,
 		                        question=question, options=options)
 		return None if slot is None else slot.get("answer")
 	return ask_text
@@ -469,12 +499,19 @@ def _code_fingerprint() -> str:
 	而"改了代码、重启、点继续"正是最需要拦住的一种不兼容。指纹取的是
 	真正会影响 agent 行为的那几个文件,读一次缓存一份 —— 进程活着的期间
 	代码不会变(要变就得重启,那时缓存也跟着没了)。
+
+	**后台执行那一版之后这个清单也变了**:工具集多了 background_result、
+	bash / agent 的 schema 各多了一个参数,而实现它们的 jobs.py /
+	tools/background.py 也在行为里。少列一个的后果不是"签名不一致"(不一致
+	是安全的,它会拒绝恢复),而是**该不一致的时候不一致** —— 部署了新代码
+	却还能恢复旧检查点,而模型会拿着一份少了那个工具的历史接着跑。
 	"""
 	global _CODE_FP
 	if _CODE_FP is None:
 		digest = hashlib.sha256()
-		for name in ("agent.py", "app.py", "context.py", "sessions.py",
-		             "server.py", "tools/__init__.py"):
+		for name in ("agent.py", "app.py", "context.py", "jobs.py", "sessions.py",
+		             "server.py", "tools/__init__.py", "tools/background.py",
+		             "tools/bash.py", "tools/subagent.py"):
 			try:
 				digest.update(Path(__file__).resolve().parent.joinpath(
 					name).read_bytes())
@@ -586,6 +623,531 @@ def trim_dangling_tool_use(history: list) -> int:
 RESUME_NOTE = ("服务在这一轮中断的地方继续了(同一个任务,不是新任务)。"
                "前面已经完成的部分仍然有效,不要去重做它们;"
                "从当前状态接着往下做,或者直接给出结论。")
+
+
+# --------------------------------------------------------------- 开轮的闸门
+
+
+def flush_unsaved(sid: str) -> bool:
+	"""把上一轮没存进库的那份补写进去。补上了(或者本来就没有)返回 True。
+
+	**它不重跑模型、也不重跑工具** —— 手上就有最终上下文和终态,补的是写。
+	"恢复保存时工具执行次数不增加"那条验收说的就是这件事。
+
+	补写在开新的一轮**之前**,而且在同一把会话锁里:补不上就不开新轮
+	(调用方回 503),因为开了的话模型会拿着一份少了上一轮的上下文往下跑,
+	而它看不出少了什么。
+	"""
+	pending = UNSAVED.get(sid)
+	if pending is None:
+		return True
+	try:
+		STORE.finish_turn(sid, pending["turn_id"], pending["status"],
+		                  pending["error"], pending["messages"])
+	except Exception:
+		# 还是写不进去。记录留着,下一次请求再试 —— 补写这件事本身是幂等
+		# 的(同一个事务里的 upsert + 条件更新)。
+		return False
+	UNSAVED.pop(sid, None)
+	return True
+
+
+def start_gate(sid: str) -> tuple[bool, int, str]:
+	"""开一轮之前必须过的闸。返回 (放不放行, 状态码, 那句话)。**调用方须持锁。**
+
+	两件事,顺序不能反:
+
+	  1. 补上一轮欠的那次保存。补不上就不许开 —— 开了的话模型会拿着一份少了
+	     一整轮的历史往下跑。
+	  2. 有没有还没处理完的中断轮。那份中断的快照是这个会话**唯一**的恢复点,
+	     而新任务第一次 checkpoint 就会把它盖掉。
+
+	**抽成公共入口是因为它现在有三个调用方了**:用户提问(_post_ask)、恢复
+	(_post_resume)、服务端自己的内部续跑(_drain,后台结果要送回来的时候)。
+	抄一份新的这种事已经发生过一次 —— _post_resume / _post_abandon /
+	_post_tasks_enabled 各抄了自己需要的那一半,于是"什么情况下不许开一轮"
+	在库里没有唯一答案,而内部续跑正好是那种"绕过去很难被发现"的新调用方:
+	它会在一轮中断任务还挂着的时候插进去,那之后那一轮**永久**不能恢复了
+	(见 checkpoint_info 的 has_later_turn)。
+
+	状态码那句话**只能用 ASCII** —— send_error 的第二段是 HTTP 状态行,按
+	latin-1 写出去,一个中文就会让 send_response 抛 UnicodeEncodeError,而
+	浏览器那边看到的是"连接被断开、没有任何响应"(实测栽的就是这个)。人话
+	放在页面那边,它按状态码再读一次轮次。
+	"""
+	if not STORE.session_exists(sid):
+		return False, 404, "no such session"
+	if not flush_unsaved(sid):
+		return False, 503, "previous turn result is not saved yet"
+	pending = STORE.unresolved_interrupt(sid)
+	if pending is not None:
+		return False, 409, (
+			"this session has an unfinished interrupted turn"
+			f" (turn {pending['turn_id']}, no {pending['turn_no']}):"
+			" resume or abandon it first")
+	return True, 0, ""
+
+
+# ------------------------------------------------------- 后台结果的交付与续跑
+
+
+def _background_notice(pending: list[dict]) -> str:
+	"""把一批完成的 job 合成一条内部事件。**这个格式是给模型读的**。
+
+	开头那句"服务端事件,并非用户输入"不是客套:这条在协议上是一条 user 消息
+	(Anthropic 只有 user / assistant 两个角色),而模型对 user 消息的默认理解
+	是"用户对我说的话"。不点破的话,它可能把它当成一条新的指令去执行,而真正
+	的用户从没说过这些字。
+
+	每条带 job_id 和 tool:模型可能同时派了好几件,而"哪件是哪件"只能靠这个
+	对上它自己发出去的那几次调用。
+
+	result 那行是"完整结果在哪儿"。摘要可能被截过(见 SUMMARY_CHARS),而模型
+	手上有 bash 和 read_file,给它路径比给它更长的摘要有用 —— 后者只是把同一
+	份东西换个地方堆着。
+	"""
+	lines = [
+		"[background_results — 服务端事件,并非用户输入]",
+		"以下是你先前派出去的后台执行的结果,现在完成了。按结果继续干活;"
+		"它们不是用户说的话。",
+	]
+	for job in pending:
+		lines.append("")
+		lines.append(f"job_id: {job['id']}")
+		lines.append(f"tool: {job['tool']}")
+		lines.append(f"status: {job['status']}")
+		if job.get("error"):
+			lines.append(f"error: {job['error']}")
+		if job.get("result_path"):
+			lines.append(f"result: {job['result_path']}")
+		body = (job.get("summary") or "").strip()
+		lines.append(f"output: {body}" if body else "output: (没有输出)")
+	return "\n".join(lines)
+
+
+def _no_stream_emit(event: dict) -> None:
+	"""内部续跑那一轮的"直播流":什么都不做。
+
+	那一轮没有 wfile —— 它是服务端自己开的,不挂在任何 HTTP 响应上。但它照样
+	要过 recording_emit(事件进库,页面重放和轮询看得到),而 recording_emit
+	最后会调一次 emit。给它这个,**不是**给它 None:None 会在
+	`emit(event)` 那儿炸 TypeError,而那个异常发生在事件刚落库之后。
+	"""
+
+
+# 正在被调度线程处理着的会话。见 maybe_continue。
+_SCHEDULED: set[str] = set()
+# 护上面那个集合。**不护任何别的东西**,尤其不跨数据库调用 —— 所以它跟
+# SessionStore 那把锁、跟会话锁都不构成锁序问题。
+_SCHED_LOCK = threading.Lock()
+
+
+def maybe_continue(sid: str) -> None:
+	"""该会话有没交付的后台结果时,起一条调度线程把它们送回去。
+
+	**它自己立刻返回**,不在这儿跑那一轮:调用方里有 HTTP 线程(_post_ask 释放
+	锁之后那一下),而一轮对话可以跑几分钟 —— 在那儿跑等于把用户那个请求挂着,
+	页面会一直转圈(见 docs 的 §5)。
+
+	什么时候被调,三个时刻缺一不可:
+
+	  1. 一个 job 跑到终态时(jobs.py 的 worker 收完终态调 notify);
+	  2. 一次用户轮次**释放会话锁之后**;
+	  3. 一次内部续跑自己结束之后(下一圈的 while 里)。
+
+	2 和 3 不能省。job 完全可能恰好在一次用户轮次的尾巴上完成 —— 那时锁还在
+	手里,notify 拿不到。而那一轮如果从**绕开检查点的出口**结束(回合上限、
+	额度耗尽、max_tokens、API 错误),结果就滞留在 pending 上,而 pending
+	状态没有别的东西会再来推它。
+
+	同会话只允许一条调度线程(见 _SCHEDULED):两条一起跑的话,第二条拿不到
+	会话锁、白起一趟,而它至少会让"谁在负责这个会话"变得说不清。
+
+	**先问一句再起线程。** 没有待交付的结果时直接返回 —— 不起线程、不进
+	_SCHEDULED。这条早退不是省那一两个毫秒:它意味着**从没用过后台执行的
+	会话,每问一句都不会凭空多一条线程**。而"起了线程才发现没事可做"那种
+	写法还有个更难看的后果:那条线程会在调用方(一次 HTTP 请求)已经收工之后
+	才去碰 STORE,而 STORE 在进程退出/测试拆卸时是会变成 None 的。
+
+	判据用 deliverable_jobs(有没有"跑完了还没交付"的),不是 jobs_pending
+	(那还包含"还在跑")—— 后者会为一条正在跑的 job 白起一趟线程,而
+	它跑完时自己会再调一次这个函数(见 jobs.py 的 worker 收尾)。
+	"""
+	if not STORE.session_exists(sid) or not STORE.deliverable_jobs(sid):
+		return
+	with _SCHED_LOCK:
+		if sid in _SCHEDULED:
+			return
+		_SCHEDULED.add(sid)
+	try:
+		threading.Thread(target=_drain, args=(sid,), name=f"jobs-{sid[:8]}",
+		                 daemon=True).start()
+	except Exception:
+		with _SCHED_LOCK:
+			_SCHEDULED.discard(sid)
+		raise
+
+
+def _drain(sid: str) -> None:
+	"""调度线程:把这个会话里还没交付的后台结果一个一个送回去。
+
+	**拿不到会话锁就收工,不排队、不重试、不忙等。** 锁在别人手里说明这个
+	会话有一轮正在跑,而那一轮自己的检查点会把结果取走;取不走的话,它释放
+	锁之后会再调一次 maybe_continue(那一刻 _SCHEDULED 里已经没有这个会话了,
+	所以那次调用起得来)。短间隔轮询在这儿没有位置:它换来的是一个永远在转的
+	后台循环,而它要等的那件事本来就有明确的信号。
+
+	一轮走完再回到循环顶部,是为了"第一批交付掉之后又完成了一个 job"这种情况
+	不用等下一次唤醒。循环的出口是 deliverable_jobs 空 —— 每执行一圈它只可能
+	变少(认领过的行不再出现在里面)。
+	"""
+	try:
+		while True:
+			lock = session_lock(sid)
+			if not lock.acquire(blocking=False):
+				return
+			try:
+				if not STORE.session_exists(sid):
+					return
+				# **闸门拦住时就停在这儿,结果继续待交付。**
+				# 有没处理完的中断轮、或者上一轮的结果还没补写进库时,不许
+				# 绕过它开一轮(见 start_gate);而这一条的后果要说清楚:那些
+				# 结果会一直挂在 pending 上,直到用户把中断那一轮续掉或放弃。
+				# 页面那边看得见 —— jobs_pending 一直是真,轮次接口里也有这条
+				# job 的状态,不是静默丢失。
+				ok, _code, _msg = start_gate(sid)
+				if not ok:
+					return
+				if not run_background_turn(sid):
+					return
+			finally:
+				lock.release()
+	finally:
+		with _SCHED_LOCK:
+			_SCHEDULED.discard(sid)
+
+
+def run_background_turn(sid: str) -> bool:
+	"""把待交付的后台结果开成一轮**内部续跑**。返回有没有真的开起来。
+
+	**不抛。** 调用方是一条没有 HTTP 响应的调度线程 —— 抛出去只有 threading
+	的默认钩子接得住(打一行 stderr,而那一行跟这个会话的对应关系要靠线程名
+	去猜)。开不起来时结果是继续待交付,不是丢失。
+
+	这一轮跟用户那一轮走**同一条**执行路径(drive_turn),所以记录、收尾、用量、
+	事件全都一样;不同的只有三样,而且每样都是必须的:
+
+	  · 第一条消息是 kind='control'、source='background'(见 begin_background_turn)
+	  · 不触发 UserPromptSubmit(那是"用户提交了一条指令",而这儿没有用户)
+	  · emit 的直播那一半是空的(没有 HTTP 响应可写,见 _no_stream_emit)
+	"""
+	pending = STORE.deliverable_jobs(sid)
+	if not pending:
+		return False
+	text = _background_notice(pending)
+	blocks = [{"type": "text", "text": text}]
+	try:
+		turn = STORE.begin_background_turn(sid, text, blocks,
+		                                   [job["id"] for job in pending])
+	except Exception as e:
+		print(f"[background] 续跑没能开轮:{type(e).__name__}: {e}", flush=True)
+		return False
+	if turn is None:
+		# 认领的时候发现已经被交付过了。**这不是错误** —— 两条交付路径撞上,
+		# 让先到的那个说了算,这一趟就什么都不做。
+		return False
+
+	memories = STORE.get_memory_snapshots(sid)
+	history = STORE.load_context(sid)
+	history.append(turn["message"])
+	emit = recording_emit(sid, _no_stream_emit, turn)
+	# live=False:这一轮没有直播流,权限确认和模型提问要靠页面从轮次接口里
+	# 读出来(见 _ask_and_wait 的 live 那一段)。
+	drive_turn(sid, turn, history, memories, text,
+	           record=make_recorder(turn["id"]), emit=emit, first_time=False,
+	           live=False)
+	return True
+
+
+def drive_turn(sid: str, turn: dict, history: list, memories: tuple,
+           active_request: str, record, emit,
+           start_rounds: int = 0, first_time: bool = True,
+           live: bool = True) -> None:
+	"""跑这一轮,然后收尾。**新提问和恢复走的是同一条路。**
+
+	两边不同的只有:历史从哪儿来、号从几号接着发、计数从多少接着数、
+	以及要不要再触发一次 UserPromptSubmit —— 全在这几个参数里。别处
+	一模一样,所以必须共用:任何一处"收尾不一样",迟早会长成两种自己
+	会漂的行为,而恢复那条路平时没人走,漂了也看不出来。
+
+	整段的顺序(收尾那段尤其别动):
+		跑循环 → 成功就 finish_turn(上下文和终态同事务)
+		       → 关键记录存不上就 mark_interrupted(只动 turns)
+		       → 最后才发 reply
+
+	live 是"这一轮有没有一条直播流"。用户提问和恢复有(页面正读着那条
+	NDJSON),**内部续跑没有** —— 它是服务端自己开的,不挂在任何 HTTP 响应上
+	(见 run_background_turn)。区别只有一处,但那一处是必须的:权限确认和
+	模型提问要等人回答,而有直播流时"写不出去"就等于"没人能回答"(见
+	_ask_and_wait);没有直播流时那句话不成立,人可能正在另一个标签页里看着。
+	"""
+	silent = quiet(emit)
+	tools = build_tools(
+		# 提问器绑在这一轮这条流上,所以每轮现造。
+		# 跟 ask= 那份不同:那个的答案是是/否(权限),
+		# 这个是一段文字(模型提问)。
+		make_ask_text(emit, sid, turn["id"], live=live),
+		turn_tools(sid, turn["id"]))
+	system = build_system(*memories)
+	# 恢复兼容性签名:把"模型当时看到的这一套"压成一个短串,写进快照。
+	# 恢复时拿现在的再算一遍比对 —— 中间换过模型、改过提示词、动过
+	# 工具集或代码,恢复出来的就不是同一个任务了,那种"接着跑"比停下
+	# 来更糟:模型会拿着一份不是自己的历史继续做决定。
+	#
+	# **工具集是上面这一份,而恢复时算的是 signature_tools(sid)** ——
+	# 两者必须逐字节等价。它们的 handler 不一样(一个绑着真库和本轮 id,
+	# 一个是空的),但签名只读 name 和 schema,而那两样只跟
+	# task_enabled 有关。哪天有人让工具 schema 依赖本轮的具体值,这个
+	# 等价就断了,而断的表现是"所有检查点都恢复不了"。
+	frozen = {
+		"format": 1,
+		"active_request": active_request,
+		"model": MODEL,
+		"max_rounds": MAX_ROUNDS,
+		"cwd": str(WORKDIR),
+		"signature": recovery_signature(system, tools),
+	}
+
+	def checkpoint(messages: list, loop_state: dict, compacted: bool) -> None:
+		# 循环只知道自己那个数(第几回合),别的都从这儿补 —— 它不知道
+		# 也不该知道模型名、system、工作目录这些,更不知道任务清单。
+		#
+		# **任务清单不进快照了。** 它以前跟着 runtime_json 走(每轮把内存
+		# 里那份 todo 序列化进去),现在它在库里,是权威来源 —— 再存一份
+		# 就等于给同一件事留两个真相,而恢复时拿哪一份都说得通,那才是
+		# 最坏的情况。
+		checkpoint_turn(sid, turn, record, messages,
+		                {**frozen, **loop_state}, compacted)
+
+	def background(messages: list, loop_state: dict,
+	               compacted: bool) -> bool:
+		"""把这一会话新完成的后台结果注入上下文。返回有没有注入。
+
+		它跟 checkpoint 是**同一个位置的两条路**(见 agent.py 里那段):
+		注入成功时它自己就是这一回合的检查点,循环不再单独调 checkpoint。
+
+		它做四件事,而且四件必须一起成立:
+
+		  1. 挑出还没交付的结果(只读,事务外);
+		  2. 拼那条通知(读结果文件,事务外);
+		  3. **一个事务里**:认领 notice、写那条原始消息、存快照 ——
+		     见 sessions.deliver_jobs。分两次写的话,中间那个窗口里标志
+		     已经成了 delivered 而通知还没进上下文,进程一崩这份结果就
+		     再也不会自动注入了;
+		  4. 把消息接到内存里那份历史尾巴上,并把号占掉。
+
+		第 4 步排在事务**成功之后**:认领失败时(另一条路径已经交付过)
+		内存里就必须原样不动 —— 先追加再回滚的话,那段历史里会留下一条
+		库里没有的消息,而它会被 finish_turn 存下去,于是模型看到一条
+		凭空出现的通知。
+		"""
+		pending = STORE.deliverable_jobs(sid)
+		if not pending:
+			return False
+		text = _background_notice(pending)
+		blocks = [{"type": "text", "text": text}]
+		message = {"role": "user", "content": blocks}
+		no = record.last_no + 1
+		delivered = STORE.deliver_jobs(
+			sid, turn["id"], no, blocks, [*messages, message],
+			[job["id"] for job in pending], {**frozen, **loop_state})
+		if not delivered:
+			return False
+		messages.append(message)
+		# 号占掉,否则下一条 record 会撞 UNIQUE(turn_id, message_no)。
+		record.reserve(no)
+		emit_quietly(emit, {"kind": "note", "source": "background",
+		                    "text": f"{len(pending)} 条后台结果已经送进来了"})
+		return True
+
+	# 兜底那份:正常路径下会被覆盖。事先摆一个失败,是为了万一控制流
+	# 以预料之外的方式跳出去,收尾时手里也有个说得通的终态,而不是
+	# NameError —— 那会让这一轮永远停在 running。
+	outcome = TurnOutcome("failed", "", "这一轮没有跑完")
+	# "模型跑出什么"和"存没存上"分开记:后者在下面的 finally 里被改写。
+	# 放在 try 外面,是因为 finally 要写它们,而 finally 在任何一条路径上
+	# 都会跑到 —— 只写在 except 里的话,正常跑完那条路上它们是未定义的。
+	saved, save_error = True, ""
+	# 中断是第三种收尾,跟"跑失败"和"没存上"都不一样:它意味着**库里
+	# 有一份值得接着用的状态**,而手上这份内存里的历史不可信。
+	interrupted, interrupt_reason = False, ""
+	try:
+		# 只有新提问才触发 —— 恢复时再触发一遍,等于把用户那条指令
+		# 又提交了一次,而它的 hook 可能不是纯观察的。
+		if first_time:
+			trigger_hooks("UserPromptSubmit", active_request)
+
+		# 归属:这一轮里所有的 API 调用都带上 session / turn。压缩器和 vision
+		# 都在这一层里面,所以它们自动跟着 —— 传参是传不到工具 handler 里的
+		# (agent_loop 只给 handler 传 **block.input)。
+		#
+		# recall 那个工具同理:它得查"本会话"的库,还要按预览那套渲染,两样
+		# 都是 handler 够不着的东西 —— 所以绑一层环境递进去。压缩器先拿出来,
+		# 是因为取回器要用它渲染(大块原文落盘 + 头尾预览),跟外面这个
+		# 是同一个实例。
+		#
+		# jobs 那份一模一样:后台执行的归属(哪个会话、哪一轮、结果交给谁)
+		# 也是 handler 够不着的东西,所以绑一层(见 tools/background.py)。
+		compactor = make_compactor(silent)
+		with usage.span(session=sid, turn=turn["id"]):
+			with bind_recall(make_recall(STORE, sid, compactor)):
+				with jobs.bind_jobs(jobs.JobContext(
+						store=STORE, session_id=sid, turn_id=turn["id"],
+						notify=maybe_continue)):
+					outcome = agent_loop(
+						history,
+						active_request=active_request,
+						system=system,
+						tools=tools,
+						model=MODEL,
+						max_rounds=MAX_ROUNDS,
+						compactor=compactor,
+						# live 传的是"有没有直播流":用户那一轮有(页面正
+						# 读着那条 NDJSON),内部续跑那一条没有(见 _ask_and_wait)。
+						ask=make_ask(emit, sid, turn["id"], record, live=live),
+						emit=silent,
+						record=record,
+						checkpoint=checkpoint,
+						background=background,
+						# 两阶段标记的前一半。只给有副作用的工具写,哪些
+						# 算有副作用由循环自己按 ToolDesc 判断(agent.py 里
+						# 的 side_effects)。
+						begin_exec=lambda uid, name, data:
+							STORE.begin_tool_exec(turn["id"], uid, name, data),
+						# 调用前先占额度,理由见 sessions.reserve_round。
+						reserve_round=lambda:
+							STORE.reserve_round(turn["id"], MAX_ROUNDS),
+						rounds_start=start_rounds)
+	except PersistError as e:
+		# 恢复关键的一条记录没落库(assistant 响应、工具结果、控制消息、
+		# 或者回合快照)。**停在这儿,而且绝不把内存里这份历史存下去** ——
+		# 它已经缺了一块,存下去等于拿一份残史盖掉最后一个可信快照。
+		# 库里那一轮标 interrupted,恢复入口据此决定能不能续、要不要核对。
+		interrupted, interrupt_reason = True, f"{type(e).__name__}: {e}"
+		outcome = TurnOutcome("interrupted", f"Stopped: {e}", interrupt_reason)
+	except Exception as e:
+		# 兜底:异常不该把 history 一起带走,也不该让流断在半截
+		# 而没有下文 —— 前端会一直转圈。这一轮记 failed。
+		outcome = TurnOutcome("failed", f"Error: {type(e).__name__}: {e}",
+		                      f"{type(e).__name__}: {e}")
+	finally:
+		# **轮末松开这一轮攥着的所有任务。** 放在 finally 的第一句,而不是
+		# 跟着"成功"那条路走:失败和中断的那两条路上任务一样要松手,不放
+		# 的话那几条 task 会被一个已经结束的轮次永远攥着,后面谁都不能
+		# complete、也不能 retry(见 tools/task.py 的 held_by)。
+		#
+		# 松手**不改库里的状态**:任务还停在 in_progress,那正是设计 §5
+		# 要的 —— "这一轮跑完了但没提交结果"要留成一条等人核对的状态,
+		# 而不是假装它没发生过。
+		release_turn(turn["id"])
+		if interrupted:
+			# 只动 turns。上下文一个字都不写 —— 手上这份历史没验证过,
+			# 而库里那份是最后一个可信点(见 mark_interrupted)。
+			marked = STORE.mark_interrupted(sid, turn["id"],
+			                                INTERRUPT_PERSIST_FAILED,
+			                                interrupt_reason)
+			emit_quietly(emit, {"kind": "note", "source": "store",
+			                    "text": _interrupted_text(marked)})
+		else:
+			dropped = trim_dangling_tool_use(history)
+			if dropped:
+				emit_quietly(emit, {"kind": "note", "source": "round",
+				                    "text": f"这一轮被打断,{dropped} 条没有结果的消息没有存"})
+			try:
+				# 最终上下文和 Turn 终态同一个事务。分两次写的话,中间那个
+				# 窗口里下一轮会读到少了一整轮的历史,而且不报错。
+				STORE.finish_turn(sid, turn["id"], outcome.status,
+				                  outcome.error, history)
+			except Exception as e:
+				# **模型跑出什么,和这一轮存没存上,是两件事。** 这里只改后
+				# 一件:保存失败不能跟着 outcome.status 一起发出去 —— 页面会
+				# 把它画成普通的"完成",而库里那一轮还是 running、工作上下文
+				# 还是旧的,用户接着问就静默地少了一整轮。
+				saved, save_error = False, f"{type(e).__name__}: {e}"
+				# 状态冲突单独说:那不是"库坏了",是这一轮在库里已经是终态
+				# (被 reap 收过)。它重试也没用(finish_turn 会一直抛),所以
+				# 不进 UNSAVED 那道闸 —— 进了的话这个会话就永远问不下去了。
+				conflict = isinstance(e, TurnStateConflict)
+				if not conflict:
+					UNSAVED[sid] = {"turn_id": turn["id"],
+					                "status": outcome.status,
+					                "error": outcome.error,
+					                "messages": history}
+				emit_quietly(emit, {"kind": "note", "source": "store",
+				                    "text": _save_failure_text(conflict, save_error)})
+
+	# reply 排在收尾**之后**发。反过来的话,页面收到 reply 时库里的
+	# status 还是 running,而它的游标已经越过这条事件 —— 刷新也补不
+	# 回来,那一轮会一直显示"运行中"。
+	#
+	# 花费跟着一起发,理由同上一句:这一轮的所有调用都发生在上面,
+	# 到这儿账已经记完了。放在这里面,页面不用为一个数字再跑一趟 ——
+	# 而且那一趟还得解决"什么时候去要"的问题,而"这一轮刚结束"正好
+	# 就是这里。
+	#
+	# **status 发的是"这个页面该显示成什么",不是模型的心气。** 保存失败
+	# 时发 unsaved:发 completed 就等于告诉页面"存好了,可以接着聊",而
+	# 库里那一轮还是 running、上下文还是旧的。中断发 interrupted,而且
+	# 带上原因 —— 页面据此画"继续 / 放弃"两个按钮,以及一句人话。
+	emit_quietly(emit, {"kind": "reply", "text": outcome.text,
+	                    "status": ("interrupted" if interrupted
+	                               else outcome.status if saved else "unsaved"),
+	                    "model_status": outcome.status,
+	                    "interrupted": interrupted,
+	                    "save_error": save_error, "saved": saved,
+	                    "usage": usage.turn_line(
+		                    usage.read_turn(sid, turn["id"]))})
+
+	# 同一行也打到终端。**一处生成,两处显示**:这一行是
+	# usage.turn_line 渲染好的,页面和终端拿的是同一个字符串 —— 各写一遍
+	# 会在钱、命中率、币种这些地方慢慢分家,而那正是这一行要回答的问题。
+	#
+	# 位置在收尾之后:这一轮所有的调用都发生在上面,到这儿账才记完。
+	# 例外是"保存失败"那条路(finish_turn 抛了)—— 那也不影响这一行,
+	# 账在调用发生时就一笔笔记下了(见 usage.meter),不靠收尾补。
+	#
+	# 状态词只在**不是正常完成**时补上:终端上没有页面上那个轮次框,
+	# 一行数字孤零零地摆着,看不出这一轮是跑完了还是被打断了。
+	line = usage.turn_line(usage.read_turn(sid, turn["id"]))
+	if line:
+		mark = "" if outcome.status == "completed" and not interrupted else (
+			" · 中断" if interrupted
+			else " · 没入库" if not saved else " · 失败")
+		print(f"[第 {turn['turn_no']} 轮] {line}{mark}", flush=True)
+
+def checkpoint_turn(sid: str, turn: dict, record, messages: list,
+                runtime: dict, compacted: bool) -> None:
+	"""每个完整回合存一份快照。**存不上就抛 PersistError,这一轮停下。**
+
+	跟以前那版(压缩器回调,存不上只发一条旁注)的差别是有意的。这份
+	快照现在是恢复的唯一基础,涵盖的是"到这个完整回合为止"的历史。
+	存不上还接着跑,后面那些回合就全在"没有恢复点"的状态里 —— 进程一崩
+	丢掉的是好几个回合的工作,而且没有任何迹象。代价是:一次写失败会
+	让这一轮停下来,而以前它会跑完。这个交换在这一版是划算的,因为
+	"停下来"现在有出路了(库里那份能续跑),以前没有。
+
+	水位取 record.last_no,不另外数:它就是"这个 turn 里已经落库的最大
+	message_no",而快照正文里包含的正是这些记录。两者在同一个地方往前
+	走,才不会出现"正文里有、水位说没有"这种自相矛盾的快照。
+	"""
+	try:
+		STORE.save_checkpoint(sid, turn["id"], record.last_no, messages,
+		                      runtime, compacted=compacted)
+	except Exception as e:
+		raise PersistError(
+			f"这一轮的回合快照没存上({type(e).__name__}: {e})—— 停在这儿,"
+			f"库里保留的是上一个完整回合那份") from e
+
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -717,6 +1279,16 @@ class Handler(BaseHTTPRequestHandler):
 			return
 		payload = STORE.list_turns(sid)
 		payload["running"] = is_running(sid)
+		# 后台状态跟着一起给,而且**跟 running 分开**(理由见 sessions.list_sessions
+		# 的 jobs_pending 那段):页面拿它决定还要不要接着轮询,而输入框仍旧只看
+		# running。
+		#
+		# jobs 那一份是"刷新之后能把页面重建出来"的唯一来源:页面上那些 job
+		# 格子(哪个还在跑、哪个完成了、输出是什么)在库里是完整的,不必也不该
+		# 从事件流里反推 —— 反推就得写一套去重规则,而那种规则迟早会漏(跟上面
+		# 那段同一个理由)。
+		payload["jobs"] = STORE.jobs_for(sid)
+		payload["jobs_pending"] = STORE.jobs_pending(sid)
 
 		# 每一轮花了多少。账本里的归属键就是上面那个 turn.id —— 写的时候是
 		# usage.span(session=sid, turn=turn["id"]),读的时候同一个字符串,不用
@@ -802,7 +1374,17 @@ class Handler(BaseHTTPRequestHandler):
 				# 不能因为"它是从库里读出来的"就当成历史。
 				event["live"] = event.get("id") in PENDING
 			events.append(event)
-		self._send_json({"events": events, "running": is_running(sid)})
+		# jobs_pending 跟在这个轮询接口上,是为了**让轮询知道什么时候该继续**:
+		# 后台 job 没跑完或结果没交付时,页面不能像以前那样一看到 running=false
+		# 就停下来 —— 一停,那条完成通知和紧接着的自动续跑轮就都看不见了
+		# (见 docs 的 §6)。
+		#
+		# jobs 那份不是事件、也不进重放:它是"这些 job 现在什么样"的当前快照,
+		# 跟 running 一样是这个接口顺带报的页面状态。页面拿它原地更新 job 格子,
+		# 不必为此把整个轮次列表重建一遍(那会闪)。
+		self._send_json({"events": events, "running": is_running(sid),
+		                 "jobs": STORE.jobs_for(sid),
+		                 "jobs_pending": STORE.jobs_pending(sid)})
 
 	def _json_body(self, expect: str):
 		"""读并解析请求体。解析不了就自己回 400 并返回 None。
@@ -883,6 +1465,15 @@ class Handler(BaseHTTPRequestHandler):
 			if not STORE.session_exists(sid):
 				self.send_error(404, "no such session")
 				return
+			# **结果文件必须在删会话之前删。** background_jobs 上挂了
+			# ON DELETE CASCADE,会话一删行就跟着没了 —— 那时候再想找这些路径
+			# 已经没有地方查了,而文件会永远留在工作区里。两处清理(这里和
+			# 启动时)各有一个明确的所有者,这是其中的一处。
+			#
+			# 删了也不影响正在跑的 worker:它收尾那句是条件 UPDATE,匹配 0 行
+			# 就不再往下走(见 sessions.finish_job),所以它不会把结果写回一个
+			# 已经不存在的会话,也不会去开一轮续跑。
+			jobs.sweep_results(STORE.job_result_paths(sid))
 			STORE.delete_session(sid)
 		finally:
 			lock.release()
@@ -985,10 +1576,12 @@ class Handler(BaseHTTPRequestHandler):
 			self.send_error(409, "this session already has a turn running")
 			return
 		try:
+			# 存在性和"补写上一轮欠的"走公共入口(见 start_gate),跟用户提问、
+			# 内部续跑同一份 —— 恢复自己额外多一条:这一轮得真的可恢复。
 			if not STORE.session_exists(sid):
 				self.send_error(404, "no such session")
 				return
-			if not self._flush_unsaved(sid):
+			if not flush_unsaved(sid):
 				self.send_error(503, "previous turn result is not saved yet")
 				return
 			info = self._review_info(sid, tid)
@@ -1026,7 +1619,7 @@ class Handler(BaseHTTPRequestHandler):
 			#                 库里的数只增不减(每次请求前预留),而快照可能
 			#                 比真实进度旧。取小的那侧等于白送额度。
 			#   start_no      record 接着库里最大的号往下发,不能从头开始
-			self._drive(sid, turn, started["messages"], 
+			drive_turn(sid, turn, started["messages"], 
 			            STORE.get_memory_snapshots(sid),
 			            runtime.get("active_request") or "",
 			            record=make_recorder(tid,
@@ -1037,6 +1630,10 @@ class Handler(BaseHTTPRequestHandler):
 			            first_time=False)
 		finally:
 			lock.release()
+		# 同 _post_ask:锁一放开就问一句"有没有后台结果要送回去"。恢复这一轮
+		# 可能正是那道闸拦着的原因(中断轮没处理完时结果一直待交付)——
+		# 现在处理完了,该放它们走了。
+		maybe_continue(sid)
 
 	def _post_abandon(self, sid: str, tid: str):
 		"""放弃一次中断的任务。
@@ -1082,6 +1679,8 @@ class Handler(BaseHTTPRequestHandler):
 			self._send_json({"ok": True, "version": out["version"]})
 		finally:
 			lock.release()
+		# 放弃之后那道闸就撤了 —— 待交付的后台结果该放它们走了(同 _post_ask)。
+		maybe_continue(sid)
 
 	def _post_answer(self):
 		"""回答一条挂起的问题。确认和提问都走这儿,靠槽自己的 mode 分派。
@@ -1123,29 +1722,6 @@ class Handler(BaseHTTPRequestHandler):
 		self.end_headers()
 		self.wfile.write(out)
 
-	def _flush_unsaved(self, sid: str) -> bool:
-		"""把上一轮没存进库的那份补写进去。补上了(或者本来就没有)返回 True。
-
-		**它不重跑模型、也不重跑工具** —— 手上就有最终上下文和终态,补的是写。
-		"恢复保存时工具执行次数不增加"那条验收说的就是这件事。
-
-		补写在开新的一轮**之前**,而且在同一把会话锁里:补不上就不开新轮
-		(调用方回 503),因为开了的话模型会拿着一份少了上一轮的上下文往下跑,
-		而它看不出少了什么。
-		"""
-		pending = UNSAVED.get(sid)
-		if pending is None:
-			return True
-		try:
-			STORE.finish_turn(sid, pending["turn_id"], pending["status"],
-			                  pending["error"], pending["messages"])
-		except Exception:
-			# 还是写不进去。记录留着,下一次请求再试 —— 补写这件事本身是幂等
-			# 的(同一个事务里的 upsert + 条件更新)。
-			return False
-		UNSAVED.pop(sid, None)
-		return True
-
 	def _post_ask(self):
 		body = self._json_body('{"session": "...", "query": "..."}')
 		if body is None:
@@ -1163,47 +1739,34 @@ class Handler(BaseHTTPRequestHandler):
 		if not lock.acquire(blocking=False):
 			# 含义跟以前不同了:以前是"有一轮在跑",现在是"**这个会话**有
 			# 一轮在跑"。别的会话照跑不误。
+			#
+			# **跟用户请求撞上时是"当场拒绝",不是"排队随后处理"。** 内部续跑
+			# 也走这一条(它抢的是同一把锁),所以它不会插进用户这一轮里;
+			# 反过来,它正在跑时用户也会拿到这个 409,得自己重发。两边对称、
+			# 都是立刻给答案 —— 而"排到后面再处理"要一条会挂住 HTTP 线程几分钟
+			# 的路,那条路不要。
 			self.send_error(409, "this session already has a turn running")
 			return
 		try:
-			# 拿到锁之后再查一次存在性 —— 上面那次(pre-lock)是给明显不合法
-			# 的 id 一个快一点的 404;这一次才是权威的:删除要拿同一把锁,
-			# 所以"锁在我手里"就等于"此刻没人能把它删掉"。少了这一下,
-			# 删除先拿到锁那条路径上,这一轮会走到 begin_turn 才撞外键,
-			# 用户拿到的是一句 500 "cannot start turn" —— 而事实是会话
-			# 已经没了。
-			if not STORE.session_exists(sid):
-				self.send_error(404, "no such session")
-				return
-			# 上一轮的结果没存进库的话,先把那份补上再开新的一轮。补不进去就
-			# 不开 —— 503 而不是 200:这不是"这个会话忙",是"后端现在不能
-			# 接着往下跑"。用户重发一次就再试一遍。
-			if not self._flush_unsaved(sid):
-				self.send_error(503, "previous turn result is not saved yet")
-				return
-			# 有还没处理的中断任务时,不开新的一轮。理由见 unresolved_interrupt:
-			# 那份中断的快照是这个会话**唯一**的恢复点,而新任务的第一次
-			# checkpoint 就会把它盖掉。用户先点继续或者放弃,再问新的。
-			#
-			# 没有这个闸的话,表现是:进程重启 → 用户没注意那一轮的提示,
-			# 直接问了下一个问题 → 上一轮的工作上下文被覆盖,而页面上那轮
-			# 还写着"中断、可以继续",点下去发现恢复不了。不如一开始就拦住。
-			pending = STORE.unresolved_interrupt(sid)
-			if pending is not None:
-				# **这条消息只能用 ASCII。** send_error 的第二段是 HTTP 状态行
-				# 里的 reason phrase,而状态行是按 latin-1 编码写出去的 ——
-				# 一个中文就会让 send_response 抛 UnicodeEncodeError,浏览器
-				# 那边看到的是"连接被断开、没有任何响应"(实测栽的就是这个)。
-				# 人话放在页面那边:它按这个 409 再读一次轮次,把中断那一轮
-				# 连同两个按钮画出来。
-				self.send_error(
-					409, "this session has an unfinished interrupted turn"
-					     f" (turn {pending['turn_id']}, no {pending['turn_no']}):"
-					     " resume or abandon it first")
+			# 拿到锁之后再走闸门 —— 它里面的存在性检查才是权威的:删除要拿
+			# 同一把锁,所以"锁在我手里"就等于"此刻没人能把它删掉"。少了这一
+			# 下,删除先拿到锁那条路径上,这一轮会走到 begin_turn 才撞外键,
+			# 用户拿到的是一句 500 "cannot start turn" —— 而事实是会话已经没了。
+			ok, code, message = start_gate(sid)
+			if not ok:
+				self.send_error(code, message)
 				return
 			self._run_turn(sid, query)
 		finally:
 			lock.release()
+		# **锁放开之后再调度内部续跑。** 不能放在解锁之前:jobs.pending 的结果
+		# 可能正好是在这一轮跑的时候完成的,而那一轮如果是绕开检查点的出口
+		# 结束的(回合上限、额度耗尽、max_tokens、API 错误),它就滞留了 ——
+		# 这一句是它唯一的第二次机会(见 maybe_continue)。
+		#
+		# 它自己立刻返回(真正的活在一条新线程里),所以用户这个请求不会被它
+		# 拖住。
+		maybe_continue(sid)
 
 	def _run_turn(self, sid: str, query: str):
 		"""跑一轮。全程攥着这个会话的锁(由 _post_ask 拿着并负责释放)。
@@ -1249,230 +1812,8 @@ class Handler(BaseHTTPRequestHandler):
 		# 这一条走安静版:页面正好在这时关掉的话,不安静的那版会抛
 		# OSError,把整轮带走 —— 而"切走了照跑"要的正好相反。
 		emit_quietly(emit, {"kind": "you", "text": query})
-		self._drive(sid, turn, history, memories, query,
+		drive_turn(sid, turn, history, memories, query,
 		            record=make_recorder(turn["id"]), emit=emit)
-
-	def _drive(self, sid: str, turn: dict, history: list, memories: tuple,
-	           active_request: str, record, emit,
-	           start_rounds: int = 0, first_time: bool = True) -> None:
-		"""跑这一轮,然后收尾。**新提问和恢复走的是同一条路。**
-
-		两边不同的只有:历史从哪儿来、号从几号接着发、计数从多少接着数、
-		以及要不要再触发一次 UserPromptSubmit —— 全在这几个参数里。别处
-		一模一样,所以必须共用:任何一处"收尾不一样",迟早会长成两种自己
-		会漂的行为,而恢复那条路平时没人走,漂了也看不出来。
-
-		整段的顺序(收尾那段尤其别动):
-			跑循环 → 成功就 finish_turn(上下文和终态同事务)
-			       → 关键记录存不上就 mark_interrupted(只动 turns)
-			       → 最后才发 reply
-		"""
-		silent = quiet(emit)
-		tools = build_tools(
-			# 提问器绑在这一轮这条流上,所以每轮现造。
-			# 跟 ask= 那份不同:那个的答案是是/否(权限),
-			# 这个是一段文字(模型提问)。
-			make_ask_text(emit, sid, turn["id"]),
-			turn_tools(sid, turn["id"]))
-		system = build_system(*memories)
-		# 恢复兼容性签名:把"模型当时看到的这一套"压成一个短串,写进快照。
-		# 恢复时拿现在的再算一遍比对 —— 中间换过模型、改过提示词、动过
-		# 工具集或代码,恢复出来的就不是同一个任务了,那种"接着跑"比停下
-		# 来更糟:模型会拿着一份不是自己的历史继续做决定。
-		#
-		# **工具集是上面这一份,而恢复时算的是 signature_tools(sid)** ——
-		# 两者必须逐字节等价。它们的 handler 不一样(一个绑着真库和本轮 id,
-		# 一个是空的),但签名只读 name 和 schema,而那两样只跟
-		# task_enabled 有关。哪天有人让工具 schema 依赖本轮的具体值,这个
-		# 等价就断了,而断的表现是"所有检查点都恢复不了"。
-		frozen = {
-			"format": 1,
-			"active_request": active_request,
-			"model": MODEL,
-			"max_rounds": MAX_ROUNDS,
-			"cwd": str(WORKDIR),
-			"signature": recovery_signature(system, tools),
-		}
-
-		def checkpoint(messages: list, loop_state: dict, compacted: bool) -> None:
-			# 循环只知道自己那个数(第几回合),别的都从这儿补 —— 它不知道
-			# 也不该知道模型名、system、工作目录这些,更不知道任务清单。
-			#
-			# **任务清单不进快照了。** 它以前跟着 runtime_json 走(每轮把内存
-			# 里那份 todo 序列化进去),现在它在库里,是权威来源 —— 再存一份
-			# 就等于给同一件事留两个真相,而恢复时拿哪一份都说得通,那才是
-			# 最坏的情况。
-			self._checkpoint(sid, turn, record, messages,
-			                 {**frozen, **loop_state}, compacted)
-
-		# 兜底那份:正常路径下会被覆盖。事先摆一个失败,是为了万一控制流
-		# 以预料之外的方式跳出去,收尾时手里也有个说得通的终态,而不是
-		# NameError —— 那会让这一轮永远停在 running。
-		outcome = TurnOutcome("failed", "", "这一轮没有跑完")
-		# "模型跑出什么"和"存没存上"分开记:后者在下面的 finally 里被改写。
-		# 放在 try 外面,是因为 finally 要写它们,而 finally 在任何一条路径上
-		# 都会跑到 —— 只写在 except 里的话,正常跑完那条路上它们是未定义的。
-		saved, save_error = True, ""
-		# 中断是第三种收尾,跟"跑失败"和"没存上"都不一样:它意味着**库里
-		# 有一份值得接着用的状态**,而手上这份内存里的历史不可信。
-		interrupted, interrupt_reason = False, ""
-		try:
-			# 只有新提问才触发 —— 恢复时再触发一遍,等于把用户那条指令
-			# 又提交了一次,而它的 hook 可能不是纯观察的。
-			if first_time:
-				trigger_hooks("UserPromptSubmit", active_request)
-
-			# 归属:这一轮里所有的 API 调用都带上 session / turn。压缩器和 vision
-			# 都在这一层里面,所以它们自动跟着 —— 传参是传不到工具 handler 里的
-			# (agent_loop 只给 handler 传 **block.input)。
-			#
-			# recall 那个工具同理:它得查"本会话"的库,还要按预览那套渲染,两样
-			# 都是 handler 够不着的东西 —— 所以绑一层环境递进去。压缩器先拿出来,
-			# 是因为取回器要用它渲染(大块原文落盘 + 头尾预览),跟外面这个
-			# 是同一个实例。
-			compactor = make_compactor(silent)
-			with usage.span(session=sid, turn=turn["id"]):
-				with bind_recall(make_recall(STORE, sid, compactor)):
-					outcome = agent_loop(
-						history,
-						active_request=active_request,
-						system=system,
-						tools=tools,
-						model=MODEL,
-						max_rounds=MAX_ROUNDS,
-						compactor=compactor,
-						ask=make_ask(emit, sid, turn["id"], record),
-						emit=silent,
-						record=record,
-						checkpoint=checkpoint,
-						# 两阶段标记的前一半。只给有副作用的工具写,哪些
-						# 算有副作用由循环自己按 ToolDesc 判断(agent.py 里
-						# 的 side_effects)。
-						begin_exec=lambda uid, name, data:
-							STORE.begin_tool_exec(turn["id"], uid, name, data),
-						# 调用前先占额度,理由见 sessions.reserve_round。
-						reserve_round=lambda:
-							STORE.reserve_round(turn["id"], MAX_ROUNDS),
-						rounds_start=start_rounds)
-		except PersistError as e:
-			# 恢复关键的一条记录没落库(assistant 响应、工具结果、控制消息、
-			# 或者回合快照)。**停在这儿,而且绝不把内存里这份历史存下去** ——
-			# 它已经缺了一块,存下去等于拿一份残史盖掉最后一个可信快照。
-			# 库里那一轮标 interrupted,恢复入口据此决定能不能续、要不要核对。
-			interrupted, interrupt_reason = True, f"{type(e).__name__}: {e}"
-			outcome = TurnOutcome("interrupted", f"Stopped: {e}", interrupt_reason)
-		except Exception as e:
-			# 兜底:异常不该把 history 一起带走,也不该让流断在半截
-			# 而没有下文 —— 前端会一直转圈。这一轮记 failed。
-			outcome = TurnOutcome("failed", f"Error: {type(e).__name__}: {e}",
-			                      f"{type(e).__name__}: {e}")
-		finally:
-			# **轮末松开这一轮攥着的所有任务。** 放在 finally 的第一句,而不是
-			# 跟着"成功"那条路走:失败和中断的那两条路上任务一样要松手,不放
-			# 的话那几条 task 会被一个已经结束的轮次永远攥着,后面谁都不能
-			# complete、也不能 retry(见 tools/task.py 的 held_by)。
-			#
-			# 松手**不改库里的状态**:任务还停在 in_progress,那正是设计 §5
-			# 要的 —— "这一轮跑完了但没提交结果"要留成一条等人核对的状态,
-			# 而不是假装它没发生过。
-			release_turn(turn["id"])
-			if interrupted:
-				# 只动 turns。上下文一个字都不写 —— 手上这份历史没验证过,
-				# 而库里那份是最后一个可信点(见 mark_interrupted)。
-				marked = STORE.mark_interrupted(sid, turn["id"],
-				                                INTERRUPT_PERSIST_FAILED,
-				                                interrupt_reason)
-				emit_quietly(emit, {"kind": "note", "source": "store",
-				                    "text": _interrupted_text(marked)})
-			else:
-				dropped = trim_dangling_tool_use(history)
-				if dropped:
-					emit_quietly(emit, {"kind": "note", "source": "round",
-					                    "text": f"这一轮被打断,{dropped} 条没有结果的消息没有存"})
-				try:
-					# 最终上下文和 Turn 终态同一个事务。分两次写的话,中间那个
-					# 窗口里下一轮会读到少了一整轮的历史,而且不报错。
-					STORE.finish_turn(sid, turn["id"], outcome.status,
-					                  outcome.error, history)
-				except Exception as e:
-					# **模型跑出什么,和这一轮存没存上,是两件事。** 这里只改后
-					# 一件:保存失败不能跟着 outcome.status 一起发出去 —— 页面会
-					# 把它画成普通的"完成",而库里那一轮还是 running、工作上下文
-					# 还是旧的,用户接着问就静默地少了一整轮。
-					saved, save_error = False, f"{type(e).__name__}: {e}"
-					# 状态冲突单独说:那不是"库坏了",是这一轮在库里已经是终态
-					# (被 reap 收过)。它重试也没用(finish_turn 会一直抛),所以
-					# 不进 UNSAVED 那道闸 —— 进了的话这个会话就永远问不下去了。
-					conflict = isinstance(e, TurnStateConflict)
-					if not conflict:
-						UNSAVED[sid] = {"turn_id": turn["id"],
-						                "status": outcome.status,
-						                "error": outcome.error,
-						                "messages": history}
-					emit_quietly(emit, {"kind": "note", "source": "store",
-					                    "text": _save_failure_text(conflict, save_error)})
-
-		# reply 排在收尾**之后**发。反过来的话,页面收到 reply 时库里的
-		# status 还是 running,而它的游标已经越过这条事件 —— 刷新也补不
-		# 回来,那一轮会一直显示"运行中"。
-		#
-		# 花费跟着一起发,理由同上一句:这一轮的所有调用都发生在上面,
-		# 到这儿账已经记完了。放在这里面,页面不用为一个数字再跑一趟 ——
-		# 而且那一趟还得解决"什么时候去要"的问题,而"这一轮刚结束"正好
-		# 就是这里。
-		#
-		# **status 发的是"这个页面该显示成什么",不是模型的心气。** 保存失败
-		# 时发 unsaved:发 completed 就等于告诉页面"存好了,可以接着聊",而
-		# 库里那一轮还是 running、上下文还是旧的。中断发 interrupted,而且
-		# 带上原因 —— 页面据此画"继续 / 放弃"两个按钮,以及一句人话。
-		emit_quietly(emit, {"kind": "reply", "text": outcome.text,
-		                    "status": ("interrupted" if interrupted
-		                               else outcome.status if saved else "unsaved"),
-		                    "model_status": outcome.status,
-		                    "interrupted": interrupted,
-		                    "save_error": save_error, "saved": saved,
-		                    "usage": usage.turn_line(
-			                    usage.read_turn(sid, turn["id"]))})
-
-		# 同一行也打到终端。**一处生成,两处显示**:这一行是
-		# usage.turn_line 渲染好的,页面和终端拿的是同一个字符串 —— 各写一遍
-		# 会在钱、命中率、币种这些地方慢慢分家,而那正是这一行要回答的问题。
-		#
-		# 位置在收尾之后:这一轮所有的调用都发生在上面,到这儿账才记完。
-		# 例外是"保存失败"那条路(finish_turn 抛了)—— 那也不影响这一行,
-		# 账在调用发生时就一笔笔记下了(见 usage.meter),不靠收尾补。
-		#
-		# 状态词只在**不是正常完成**时补上:终端上没有页面上那个轮次框,
-		# 一行数字孤零零地摆着,看不出这一轮是跑完了还是被打断了。
-		line = usage.turn_line(usage.read_turn(sid, turn["id"]))
-		if line:
-			mark = "" if outcome.status == "completed" and not interrupted else (
-				" · 中断" if interrupted
-				else " · 没入库" if not saved else " · 失败")
-			print(f"[第 {turn['turn_no']} 轮] {line}{mark}", flush=True)
-
-	def _checkpoint(self, sid: str, turn: dict, record, messages: list,
-	                runtime: dict, compacted: bool) -> None:
-		"""每个完整回合存一份快照。**存不上就抛 PersistError,这一轮停下。**
-
-		跟以前那版(压缩器回调,存不上只发一条旁注)的差别是有意的。这份
-		快照现在是恢复的唯一基础,涵盖的是"到这个完整回合为止"的历史。
-		存不上还接着跑,后面那些回合就全在"没有恢复点"的状态里 —— 进程一崩
-		丢掉的是好几个回合的工作,而且没有任何迹象。代价是:一次写失败会
-		让这一轮停下来,而以前它会跑完。这个交换在这一版是划算的,因为
-		"停下来"现在有出路了(库里那份能续跑),以前没有。
-
-		水位取 record.last_no,不另外数:它就是"这个 turn 里已经落库的最大
-		message_no",而快照正文里包含的正是这些记录。两者在同一个地方往前
-		走,才不会出现"正文里有、水位说没有"这种自相矛盾的快照。
-		"""
-		try:
-			STORE.save_checkpoint(sid, turn["id"], record.last_no, messages,
-			                      runtime, compacted=compacted)
-		except Exception as e:
-			raise PersistError(
-				f"这一轮的回合快照没存上({type(e).__name__}: {e})—— 停在这儿,"
-				f"库里保留的是上一个完整回合那份") from e
 
 	def log_message(self, fmt, *args):
 		# 默认实现往 stderr 打一行每个请求。这个服务是本机自用的,前端
@@ -1503,6 +1844,20 @@ if __name__ == "__main__":
 	reaped = STORE.reap_running()
 	if reaped:
 		print(f"上次没跑完的 {reaped} 轮已标记为失败")
+
+	# 清掉上个进程留下的后台 job 行和它们的结果文件。**顺序:排在 reap_running
+	# 之后、开始收请求之前。** 两者收的**不是一回事**,别看成同一件:reap_running
+	# 收的是**轮**(turns),它照旧存在、跟 job 无关;job 这边只是删行。
+	#
+	# **是清理,不是核对。** 上一版设计里有过一条"重启后辨认哪些执行被截断了"
+	# 的路,这一版砍掉了:重启之后表里每一行都是上个进程的遗物,既没有活的
+	# worker,也没有打算补交的结果 —— 不用挑着删,"删干净"就是它的全部含义。
+	# 所以这里既不标终态、也不重启工具、更不核对(见 docs 的 §4)。
+	#
+	# 排在这儿还因为:拿排他锁、迁移都是这之前的事,而此刻还没有任何请求进来,
+	# 所以不会有新 job 被误删。
+	jobs.sweep_results(STORE.clear_background_jobs())
+
 	print(f"http://localhost:{PORT}/")
 	try:
 		ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()

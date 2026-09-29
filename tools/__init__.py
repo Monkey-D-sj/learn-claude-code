@@ -1,4 +1,5 @@
 from tools.ask import make_ask_tool
+from tools.background import background_result
 from tools.base import ToolDesc
 from tools.bash import bash
 from tools.compress import compress, recall
@@ -22,11 +23,19 @@ from tools.write import write_file
 #   compress 绑当前那份 messages,由 agent_loop 每轮 bind
 #   recall   绑这个会话的取回器(库 + 会话 id + 压缩器),由 server.py 每轮 bind
 #
+# background_result 走的是 recall 那条路,理由一模一样:它必须知道"我是哪个
+# 会话"(后台 job 是按会话归属的),而 agent_loop 只给 handler 传 **block.input。
+# 它跟 recall 的区别只是绑的东西换了一份(见 jobs.bind_jobs)。
+#
+# **它不能走 per_turn。** 那条路要同时在 server.py 的 signature_tools() 里补
+# 一遍,漏了的话所有检查点都恢复不了 —— 而漏掉是不报错的,只是"继续"按钮
+# 从此永远灰着。
+#
 # **这里没有 todo_write,也没有 agent。** 前者随任务清单迁入数据库而删除；
 # 后者由 server.py 挂到主 agent 的工具集，子 agent 不获得委派工具。
 BASE_TOOLS = [
 	bash, read_file, write_file, edit_file, glob, grep, skill, skill_manage_tool, vision,
-	memory_tool, user_memory_tool, compress, recall,
+	memory_tool, user_memory_tool, compress, recall, background_result,
 ]
 
 

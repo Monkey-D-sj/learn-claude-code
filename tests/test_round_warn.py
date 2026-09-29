@@ -103,7 +103,7 @@ def run(monkeypatch, payloads: list, answer_at: int | None = None,
 	                           tools=[], model="m", max_rounds=max_rounds,
 	                           compactor=_Pass(), emit=lambda e: None,
 	                           ask=lambda question: False, stream=False,
-	                           record=lambda kind, role, content, tool_use_id=None: None)
+	                           record=lambda kind, role, content, tool_use_id=None, claim_job=None: None)
 	return history, outcome
 
 

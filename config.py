@@ -72,6 +72,22 @@ ROUND_WARN = 3
 TRANSCRIPT_DIR = WORKDIR / ".transcripts"
 TOOL_RESULTS_DIR = WORKDIR / ".task_outputs" / "tool-results"
 
+# 后台 job 的结果正文落在这儿。跟上面两个并排,理由相同:都在 WORKDIR 里,
+# 所以模型拿 read_file / bash 就能取回完整结果,而 permission_hook 现成管着。
+#
+# **它不需要自己那套过期策略**,因为它的生命周期是跟着 background_jobs 表走的:
+# 启动时清空整张表,这些文件一起删;job 所属的会话被删时也删(见 server.py)。
+# 两处清理各有一个明确的所有者,而不是"谁想起来谁扫一遍"。
+JOBS_DIR = WORKDIR / ".task_outputs" / "jobs"
+
+# 同时能跑几个后台 job。**必须有上限** —— 每一条都是一根真线程加一个真进程,
+# 没有上限的话模型可以一次派出几十条,而它自己是看不见代价的。
+#
+# 满了**直接拒绝**,不排队:排队要一个队列、一个调度器,以及"轮到时那个会话
+# 可能已经不在了"这一整套状态,而这一版明确不做跨重启的保全 —— 排到一半进程
+# 没了,那个 job 既没跑也说不出为什么。拒绝至少是一句模型能据以改主意的实话。
+MAX_BACKGROUND_JOBS = 4
+
 # 账本。一次 API 调用一行,append-only。
 #
 # 跟上面两个放一起(都在 WORKDIR 里),但**有一条重要区别:它不给模型看**。

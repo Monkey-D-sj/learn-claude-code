@@ -36,9 +36,6 @@ class _FakeHandler:
 
 	# 这几步是按 handler 调的,接到真实现上去
 	_run_turn = server.Handler._run_turn
-	_drive = server.Handler._drive
-	_checkpoint = server.Handler._checkpoint
-	_flush_unsaved = server.Handler._flush_unsaved
 
 	def __init__(self, body=None):
 		self.body = body

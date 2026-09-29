@@ -73,8 +73,9 @@ python server.py     # 然后打开 http://localhost:8765/
 | `emit.py` | 把事件打成终端文字。只给子 agent 用(打在主进程的 stdout 上) |
 | `app.py` | SYSTEM 提示词 / `MODEL` / 压缩器工厂 —— 前端从这儿接线 |
 | `server.py` | HTTP 前端:`GET /` 给页面,`POST /ask` 回一条 NDJSON 流 |
+| `jobs.py` | 后台执行的运行时:登记 / 守护线程 / Windows 作业对象(进程树) |
 | `ui/index.html` | 页面。单文件,每次请求现读,改完刷新即可生效 |
-| `sessions.py` | SQLite 会话库(会话 / 轮次 / 原始消息 / 工作上下文 / 事件 / 工具执行标记) |
+| `sessions.py` | SQLite 会话库(会话 / 轮次 / 原始消息 / 工作上下文 / 事件 / 工具执行标记 / 后台 job) |
 | `usage.py` | 账本:一次 API 调用一行,append-only JSONL,写到 `.traces/usage.jsonl` |
 | `pricing.py` | 价目表(人民币、两个时段)。数据,不是代码 |
 | `report.py` | 把 `usage.jsonl` 渲染成几张表。`python report.py` |
@@ -89,13 +90,13 @@ python server.py     # 然后打开 http://localhost:8765/
 
 ## 工具
 
-`tools/__init__.py` 里 `BASE_TOOLS` 那 13 个 + `build_tools()` 每轮现造的
+`tools/__init__.py` 里 `BASE_TOOLS` 那 14 个 + `build_tools()` 每轮现造的
 `ask` 和 `agent`,再加上会话开着 task 时才有的 5 个 `task_*`,就是模型能看到的
 全部:
 
 | 工具 | 作用 |
 |---|---|
-| `bash` | 跑 shell 命令(黑名单 + 越界需确认) |
+| `bash` | 跑 shell 命令(黑名单 + 越界需确认)。`run_in_background` 放后台跑 |
 | `read_file` / `write_file` / `edit_file` | 文件读写改 |
 | `glob` | 列文件,支持 `**` 跨目录 |
 | `grep` | 按内容搜,返回 `路径:行号: 内容`;命中封顶 200 条 |
@@ -105,9 +106,10 @@ python server.py     # 然后打开 http://localhost:8765/
 | `user_memory` | 用户级记忆:你这个人的喜好和习惯。同上三个动作 |
 | `vision` | 看一眼图片(PNG/JPEG/GIF/WebP),答一个关于它的问题。图不进上下文 |
 | `ask` | 问用户一个问题,等他的回答。可以带一组选项,页面上画成按钮 |
-| `agent` | 按 `prompt` 派一个独立上下文的子 agent,只回结论;不依赖 task |
+| `agent` | 按 `prompt` 派一个独立上下文的子 agent,只回结论;不依赖 task。`run_in_background` 放后台跑 |
 | `compress` | 把一段干完的活按号段压成一句话(见下面的上下文压缩) |
 | `recall` | 按号把压掉的那段原文取回来(号就是库里那一行的行号,见下面的上下文压缩) |
+| `background_result` | 查一个后台执行现在怎么样了(见下面「后台执行」) |
 | `task_read` / `task_create` / `task_edit` / `task_dependency` / `task_status` | 跨会话的任务表(见下面「任务」) |
 
 每个工具都是一个 `ToolDesc`(dataclass):名字 + 描述 + input schema + handler。
@@ -120,6 +122,33 @@ python server.py     # 然后打开 http://localhost:8765/
 不传 task 状态;子 agent 自己拿不到这个委派工具。
 `build_tools` 两个参数都**不给默认值**:默认值等于把"这个会话到底能不能用
 task"这个决定藏起来。
+
+## 后台执行
+
+给 `bash` 和 `agent` 传 `run_in_background: true`,原调用立刻拿到一条占位结果
+(带 `job_id`),主 agent 接着干别的;结果完成时**服务端自己把它送回来** ——
+原轮还活着就在下一次模型调用前注入,原轮已经结束就自动开一轮「后台结果续跑」,
+不用等用户再问一句。
+
+设计稿见 `docs/background-jobs-design.md`,那儿写了每条决定的理由。几条不显然的:
+
+- **默认同步,后台必须是模型显式要的。** 后台执行不代表"可以安全并发改同一个
+  文件",所以工具描述里明说:只有能独立推进的活才放后台。
+- **结果只交一次。** 两条交付路径(检查点自动注入、`background_result` 主动读取)
+  之间是一场数据库里的 CAS,不是"先查一眼再决定" —— 后者关不掉中间的窗口。
+- **进程要收干净。** 后台 Bash 从**第一条指令起**就在一个 Windows 作业对象里
+  (`CreateProcessW` + `CREATE_SUSPENDED` → 塞进作业 → 才 `ResumeThread`;
+  `Popen` 给不了这个时机)。服务进程一退出,句柄关闭,其中的进程整棵树跟着结束
+  —— 包括被强杀那几条路径,那些路径上我们自己的清理代码一行都不会跑。
+- **不跨重启保全。** 退出时正在跑的 job 和还没交付的结果一起丢弃,下次启动把
+  残留的行和结果文件清掉。这是**清理,不是核对**:重启后每一行都是上个进程的
+  遗物,没有活的 worker,也没有打算补交的结果。
+- **和 task 无关。** 后台执行不认领、不创建、不修改任何 task;会话关着 task
+  照样能用。
+- 结果是**边读边落盘**的,进上下文的只有一段摘要(完整结果在
+  `.task_outputs/jobs/<job_id>.txt`,模型自己能去读)。
+- 页面顶部那条状态带按 `job_id` 原地更新;`jobs_pending` 是**独立字段**,
+  页面拿它决定还要不要接着轮询,而输入框仍旧只看 `running`。
 
 ## 任务
 

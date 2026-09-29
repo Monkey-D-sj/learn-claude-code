@@ -45,13 +45,10 @@ class _Handler:
 
 	_post_ask = server.Handler._post_ask
 	_run_turn = server.Handler._run_turn
-	_drive = server.Handler._drive
-	_checkpoint = server.Handler._checkpoint
 	_post_resume = server.Handler._post_resume
 	_post_abandon = server.Handler._post_abandon
 	_review_info = server.Handler._review_info
 	_get_review = server.Handler._get_review
-	_flush_unsaved = server.Handler._flush_unsaved
 
 	def __init__(self, body=None):
 		self.body = body

@@ -1,9 +1,11 @@
 """子 agent 与 `agent(prompt)` 委派工具，独立于可选的 task 系统。"""
 
+import jobs
 from agent import agent_loop, client
 from config import MAX_ROUNDS, TOOL_RESULTS_DIR, TRANSCRIPT_DIR, WORKDIR
 from context import ContextCompactor
 from emit import terminal_emit
+from tools.background import Refused, launch, placeholder
 from tools.base import ToolDesc
 import usage
 
@@ -59,7 +61,26 @@ def _nobody_to_ask(question: str, options) -> None:
 	return None
 
 
-def run_agent(prompt: str) -> str:
+def run_agent(prompt: str, label: str = "subagent") -> str:
+	"""派一个子 agent,把它的结论摊平成一段文本。
+
+	label 是**这笔钱记在谁名下**(usage 的那一栏)。默认 subagent;后台执行那条路
+	传 background —— 两者都落在"另 N 次"里(is_main_loop 只认 main),所以这条
+	区别不改变任何统计口径,它只是让账上看得出来"这一笔是后台跑的"。
+
+	工具 handler 只能回字符串,所以 TurnOutcome 到这儿要摊平。失败必须
+	说出来:主 agent 看不到子 agent 的中间过程,它唯一的信息源就是这段
+	返回文本。"跑了一半就停下"和"干完了"给出的结论长得一样的话,主 agent
+	会拿着一个半成品当结果往下做。
+	"""
+	outcome = _run_subagent(prompt, label)
+	if outcome.status == "failed":
+		return f"[subagent failed: {outcome.error}]\n{outcome.text}"
+	return outcome.text
+
+
+def _run_subagent(prompt: str, label: str = "subagent") -> "TurnOutcome":
+	"""跑一遍子 agent,返回结构化结果。后台那条路要 status,不能只要文本。"""
 	# 延迟导入:子 agent 要"所有工具",而本模块由 tools/__init__ 加载,
 	# 模块级 from tools import build_tools 会拿到半初始化的包。
 	from tools import build_tools
@@ -89,24 +110,28 @@ def run_agent(prompt: str) -> str:
 	# 定位就是"干完报结论、上下文随用随弃",而它交回来的那句话才是主 agent
 	# 要的东西。
 	#
+	# background_result 排除:它查的是**这个会话**的后台 job,而子 agent 拿到的
+	# 是一份一次性上下文,把结果交给它等于开第二条口子 —— 而且那份结果本来
+	# 就该由主 agent 处置(见 docs 的接点表)。
+	#
 	# `agent` 不在这个名单里,因为它**根本不在 BASE_TOOLS 里**了:派活的工具
 	# 由调用方挂上去(server.py),子 agent 那份工具集不挂,于是"套娃"这件事
 	# 从"靠名单挡"变成了"压根没有"。名单在这儿留着是给别的工具的。
 	_DENIED = ("memory", "user_memory", "skill_manage", "ask",
-	           "compress", "recall")
+	           "compress", "recall", "background_result")
 	sub_tools = [
 		t for t in build_tools(_nobody_to_ask, [])
 		if t.name not in _DENIED
 	]
 
 	print("\n\033[35m[Subagent started]\033[0m")
-	# 嵌套 span:只把 agent 改成 "subagent",session / turn 从外层继承。
+	# 嵌套 span:只把 agent 改成 label,session / turn 从外层继承。
 	#
 	# **合并而不是覆盖**是必须的 —— 覆盖的话子 agent 花的钱会变成一条没有归属
 	# 的孤儿记录。而它恰恰是最该被看见的一笔:嵌套、没人看、没人问,而且是整个
 	# 系统里最容易失控的地方(它可以继续派活,只被 _DENIED 挡住)。
-	with usage.span(agent="subagent"):
-		outcome = agent_loop(
+	with usage.span(agent=label):
+		return agent_loop(
 			[{"role": "user", "content": prompt}],
 			active_request=prompt,
 			system=SYSTEM,
@@ -122,30 +147,77 @@ def run_agent(prompt: str) -> str:
 			# 连接超时,这一轮就只能整个失败交回主 agent。
 			stream=False,
 		)
-	# 工具 handler 只能回字符串,所以 TurnOutcome 到这儿要摊平。失败必须
-	# 说出来:主 agent 看不到子 agent 的中间过程,它唯一的信息源就是这段
-	# 返回文本。"跑了一半就停下"和"干完了"给出的结论长得一样的话,主 agent
-	# 会拿着一个半成品当结果往下做。
-	if outcome.status == "failed":
-		return f"[subagent failed: {outcome.error}]\n{outcome.text}"
-	return outcome.text
+
+
+def _preview(text: str) -> str:
+	"""后台那条路进上下文的摘要。完整结论在结果文件里。"""
+	if len(text) <= jobs.SUMMARY_CHARS:
+		return text
+	return f"{text[:jobs.SUMMARY_CHARS]}\n... [完整结论在结果文件里]"
+
+
+def _background_work(prompt: str):
+	"""造一个 work 函数,交给 jobs.start 在新线程里跑。
+
+	**预算自己一份。** 后台子 agent 不碰 source_turn 的回合预留 ——
+	sessions.reserve_round 是条件 UPDATE(带 `status = 'running'`),而它跑起来时
+	那一轮多半已经收尾,匹配 0 行;而 agent_loop 把"预留失败"读成"额度已耗尽",
+	子 agent 会在第一次调用就自己停下(见 docs 的 §4)。所以这里传 reserve_round
+	的默认值 None:预算就是本地的 MAX_ROUNDS,一个字都不往 turns 表里写。
+
+	**不写 turns.model_rounds_started 是必须的,不只是省事**:那一列正是
+	checkpoint_info 判 rounds_exhausted 的依据,让后台执行往上加,一个中断轮
+	就会因为"额度被后台吃掉了"而永久不能恢复。
+	"""
+	def work(job_id: str, ctx) -> jobs.JobResult:
+		# 在 worker 线程里重建归属:后台 agent 里再起后台 Bash 时,那一条要能
+		# 找到自己的会话。不重建的话它会被拒绝启动,而理由("不知道属于哪个
+		# 会话")在这里其实是假的 —— 归属一直都有,只是没跨线程传过来。
+		with jobs.bind_jobs(ctx):
+			outcome = _run_subagent(prompt, label="background")
+		body = outcome.text or ""
+		if outcome.status == "failed":
+			# 失败也要把已经说出来的那半截交回去 —— 它是模型唯一的信息源
+			# (同 run_agent 那条注释)。摘要里带上失败原因,因为进上下文的是
+			# 摘要,而"跑了一半停下"和"干完了"必须一眼分得开。
+			return jobs.JobResult(
+				"failed", f"[subagent failed: {outcome.error}]\n{_preview(body)}",
+				body, outcome.error)
+		return jobs.JobResult("completed", _preview(body), body)
+
+	return work
 
 
 
 def make_agent_tool() -> ToolDesc:
-	"""`agent` 只接收自包含的 prompt，与 task 开关无关。"""
-	def run(prompt: str) -> str:
+	"""`agent` 只接收自包含的 prompt，与 task 开关无关。
+
+	后台那条路**不接入 task 状态机**,也不读那张表:后台执行是"一次工具调用
+	怎么跑",task 是"一件跨会话的活归谁"。把两者搅在一起的话,关闭 task 的会话
+	就用不了后台执行 —— 而它跟 task 开关本来就无关(见 docs 的 §1)。
+	"""
+	def run(prompt: str, run_in_background: bool = False) -> str:
 		prompt = (prompt or "").strip()
 		if not prompt:
 			return "Error: prompt is empty. Describe what the subagent should do."
-		return run_agent(prompt)
+		if not run_in_background:
+			return run_agent(prompt)
+		try:
+			job_id = launch("agent", _background_work(prompt))
+		except Refused as e:
+			return f"Error: {e}"
+		return placeholder(job_id, "agent")
 
 	return ToolDesc(
 		name="agent",
 		description=(
 			"Delegate a self-contained prompt to a subagent with its own "
 			"separate context window. It reports back only a final summary "
-			"and cannot ask questions. Say what to do and what to report."
+			"and cannot ask questions. Say what to do and what to report.\n"
+			"Set run_in_background to true when you have other work to do "
+			"meanwhile: you get a job_id right away and the subagent's report "
+			"is delivered to you automatically when it finishes - do not poll "
+			"for it."
 		),
 		input_schema={
 			"type": "object",
@@ -154,6 +226,11 @@ def make_agent_tool() -> ToolDesc:
 					"type": "string",
 					"description": "A self-contained task description, including "
 					               "what to report back.",
+				},
+				"run_in_background": {
+					"type": "boolean",
+					"description": "Run it in the background and return a job_id "
+					               "right away. Default false (wait for it).",
 				},
 			},
 			"required": ["prompt"],

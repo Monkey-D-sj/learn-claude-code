@@ -340,7 +340,9 @@ def test_agent只接受prompt(env):
 	db, store, sid = env
 	enable(store, sid)
 	agent = tools_for(sid)["agent"]
-	assert set(agent.input_schema["properties"]) == {"prompt"}
+	# 入参是 prompt(必填)+ run_in_background(可选,后台执行那一版加的)。
+	# **没有 task_id** —— "agent 跟 task 开关无关"这条就落在这一句上。
+	assert set(agent.input_schema["properties"]) == {"prompt", "run_in_background"}
 	assert agent.input_schema["required"] == ["prompt"]
 	assert agent.handler(prompt=" ").startswith("Error:")
 	with pytest.raises(TypeError):
@@ -419,7 +421,8 @@ def test_关着的时候模型看不到任务工具_但agent还在(env, monkeypa
 	names = [t.name for t in server.turn_tools(sid, "t1")]
 	assert names == ["agent"], names
 	agent_tool = server.turn_tools(sid, "t1")[0]
-	assert set(agent_tool.input_schema["properties"]) == {"prompt"}
+	assert set(agent_tool.input_schema["properties"]) == {
+		"prompt", "run_in_background"}
 	assert agent_tool.handler(prompt="查个东西") == "结论"
 	with pytest.raises(TypeError):
 		agent_tool.handler(task_id="随便")
@@ -432,7 +435,8 @@ def test_开着的时候task工具不改变agent接口(env, monkeypatch):
 	assert set(names) == {"agent", "task_read", "task_create", "task_edit",
 	                      "task_dependency", "task_status"}, names
 	agent_tool = [t for t in server.turn_tools(sid, "t1") if t.name == "agent"][0]
-	assert set(agent_tool.input_schema["properties"]) == {"prompt"}
+	assert set(agent_tool.input_schema["properties"]) == {
+		"prompt", "run_in_background"}
 
 	seen = {}
 	monkeypatch.setattr(subagent, "agent_loop",

@@ -243,12 +243,13 @@ class TurnOutcome:
 	error: str | None = None
 
 
-def _drop(kind: str, role: str, content, tool_use_id: str | None = None) -> None:
+def _drop(kind: str, role: str, content, tool_use_id: str | None = None,
+          claim_job: str | None = None) -> None:
 	"""没给 record 时的占位。子 agent 没有会话库可记。
 
-	tool_use_id 收下不用:它跟有库那条路上的 close_exec 是同一个参数,
-	签名必须对得上 —— 不然子 agent 那一轮会在调 record 时炸 TypeError,
-	而它炸的地方在工具循环中间。
+	tool_use_id / claim_job 收下不用:它们跟有库那条路上的 close_exec 和
+	认领是同一组参数,签名必须对得上 —— 不然子 agent 那一轮会在调 record 时
+	炸 TypeError,而它炸的地方在工具循环中间。
 	"""
 
 
@@ -296,7 +297,7 @@ def agent_loop(messages: list, active_request: str, system: str, tools: list,
                model: str, max_rounds: int, compactor, emit, ask,
                record=_drop, checkpoint=None, stream: bool = True,
                begin_exec=None, reserve_round=None,
-               rounds_start: int = 0) -> TurnOutcome:
+               rounds_start: int = 0, background=None) -> TurnOutcome:
 	"""跑一轮完整的 agent 循环,返回这一轮的结果(TurnOutcome)。
 
 	只负责机制。提示词、工具集、模型、轮数上限、压缩器都从外面传进来 ——
@@ -341,12 +342,30 @@ def agent_loop(messages: list, active_request: str, system: str, tools: list,
 	而那个没有 delta 分支,碎片打进去等于丢掉,所以流式对它唯一的实际影响是
 	**把重试禁掉** —— call_api 里"吐过字就不再重试"那条跟 emit 收到什么无关,
 	模型吐第一个字的那一刻起,后面一个 500 或连接超时就没得重试了。
+
+	background 是"这一轮有没有后台结果要送进来",签名
+	background(messages, loop_state, compacted) -> bool,由服务端注入 ——
+	循环不知道 job 是什么,更不知道结果在哪个文件里(理由跟 checkpoint 一样:
+	它只负责在**对的位置**问一句"现在有东西要给我吗")。
+
+	它必须在两个位置被问到,而且**两处都问是设计要的,不是重复**:
+
+	  1. 每次模型调用之前(紧接着 checkpoint 那一处)。上一轮的工具结果
+	     刚落定,正是模型要看新东西的时候。
+	  2. 模型没有再发工具调用、准备交最终答复的时候。它完全可能恰好在这
+	     最后一次调用之后到 —— 只查第一处的话,这份结果要等到用户下次
+	     提问才露面,而"结果自动送回来"正是后台执行的卖点。
+
+	**注入成功时它自己就是这一回合的检查点**,所以循环不再单独调 checkpoint
+	(见下面那两处):认领、写原始消息、存快照必须是一笔事务,而那一笔由
+	服务端那边(server._background)一次做完。
 	"""
 	# 放在函数里,不放模块顶上:context 反过来要 `from agent import call_api`
 	# (压缩器第 4 档要调模型),模块级导入就成了环 —— 而 tools 那个包又拽着
 	# tools.subagent,那边还要 `from agent import agent_loop`。函数里导入没这个
 	# 问题,代价只是一次 sys.modules 查表。
 	import context
+	from tools.background import take_claim
 
 	handlers = {t.name: t.handler for t in tools}
 	# 哪些工具有副作用 —— 只有它们值得在动手前多写一条标记,理由见
@@ -418,8 +437,30 @@ def agent_loop(messages: list, active_request: str, system: str, tools: list,
 		# 存,就要为它单开一个写入点 —— 而"两个地方各存一次"正是这一版要
 		# 收掉的东西。压没压过由 prepare 回报(见 _mark_compacted),存不存
 		# 由这里说了算。
-		if checkpoint is not None:
-			checkpoint(messages, {"rounds": rounds}, compacted_here[0])
+		if checkpoint is not None or background is not None:
+			loop_state = {"rounds": rounds}
+			# 后台完成结果在这儿注入,而且**它和检查点是同一个位置的两条路,
+			# 不是两次保存**。注入成功时那一笔事务里已经有快照了(认领 + 写
+			# 原始消息 + 存上下文,见 server._background),再存一次就是同一份
+			# 快照写两遍、version 白加两次;注入没发生才走原来那条。
+			#
+			# 排在 prepare 的后面,而不是它前面 —— 两条理由:
+			#
+			#   1. 这一回合的压缩刚刚跑完。放在它前面的话,刚到手的那条通知
+			#      会立刻被压进摘要,而模型先看见的是一句摘要、完整结果要再
+			#      recall 一次才拿得到。它是要马上看的东西。
+			#   2. 位置仍然是**完整回合边界**(prepare 返回的列表就是),
+			#      所以不会切在 tool_use 和它的 tool_result 之间。
+			#
+			# 注入这一下不能只靠"完成事件唤醒":下面有好几条出口(回合上限、
+			# 额度耗尽、max_tokens、API 错误)根本不经过这个位置,而 job 恰好
+			# 落在那些路径上完成就得等下一次用户提问。兜底在服务端那一侧
+			# (轮末重扫),这儿管的是"这一轮还活着"。
+			if background is not None and background(messages, loop_state,
+			                                          compacted_here[0]):
+				pass
+			elif checkpoint is not None:
+				checkpoint(messages, loop_state, compacted_here[0])
 
 		# 轮数快用完了,提前说一声。判据是"这一次之后还剩几次"(rounds 已自增
 		# 过):0 就是最后一次,那一次的提醒最要紧 —— 它必须让模型给出答复,
@@ -559,6 +600,20 @@ def agent_loop(messages: list, active_request: str, system: str, tools: list,
 				messages.append({"role": "user", "content": force})
 				record("control", "user", force)
 				continue
+			# 第二处检查:这一次模型不打算再调工具了,而后台结果完全可能恰好
+			# 在这最后一次调用之后到。注入进去就再跑一轮 —— 不注入的话这份
+			# 结果要等到用户下次提问才露面,而"跑完自动送回来"正是后台执行的
+			# 卖点。
+			#
+			# **注入了就一定继续循环,哪怕回合预算已经见底。** 那条结果此刻
+			# 已经写进上下文和快照了,不看一眼等于"通知了但没人看"。预算见底
+			# 时循环顶部会收尾,而收尾会把这份上下文存下去 —— 结果是"下一轮
+			# 模型看得到",不是"丢了"。
+			#
+			# compacted 传 False:这一处不是回合检查点,压缩是下一轮开头的事,
+			# 那一次 checkpoint 会带着真实的 compacted 再存一遍。
+			if background is not None and background(messages, loop_state, False):
+				continue
 			return TurnOutcome("completed", final_text(response))
 
 		results = []
@@ -619,8 +674,14 @@ def agent_loop(messages: list, active_request: str, system: str, tools: list,
 			# 号一旦拼上就**不该再被改写**:正文尾巴是它唯一的落脚点,而第
 			# 1~4 档压缩改写正文。第 1 档已经用 _split_marker 摘下来再拼回去,
 			# 2~4 档现在是注释掉的 —— 重开之前每一处都得补同样的处理。
+			#
+			# claim_job 是"模型主动读走了一份后台结果"那条路的认领(见
+			# tools/background.py 的 take_claim)。**取走这一步必须发生在这
+			# 儿** —— 认领要和这条 tool_result 的落库同一个事务;落在工具
+			# handler 里的话,模型拿到结果而这条记录还没落地的那个窗口里一崩,
+			# 那份结果就再也不会自动注入了。
 			row_id = record("tool_result", "user", [result],
-			                tool_use_id=block.id)
+			                tool_use_id=block.id, claim_job=take_claim())
 			if row_id is not None:
 				result["content"] = context.stamp_tag(output, f"m{row_id:05d}")
 			results.append(result)
